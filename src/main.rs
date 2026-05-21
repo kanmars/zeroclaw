@@ -247,6 +247,8 @@ mod skills;
 #[cfg(feature = "agent-runtime")]
 mod sop;
 #[cfg(feature = "agent-runtime")]
+mod time_display;
+#[cfg(feature = "agent-runtime")]
 mod tools;
 #[cfg(feature = "agent-runtime")]
 mod trust;
@@ -296,8 +298,17 @@ enum EstopLevelArg {
 #[derive(Parser, Debug)]
 #[command(name = "zeroclaw")]
 #[command(author = "theonlyhennygod")]
-#[command(version)]
-#[command(about = "The fastest, smallest AI assistant.", long_about = None)]
+#[command(version = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nbuild-time: ", env!("ZEROCLAW_BUILD_TIME"),
+    "\ngit-commit: ", env!("ZEROCLAW_GIT_COMMIT"),
+    "\nrustc:      ", env!("ZEROCLAW_RUSTC_VERSION"),
+))]
+#[command(about = concat!(
+    "The fastest, smallest AI assistant. (built ",
+    env!("ZEROCLAW_BUILD_TIME"),
+    ")"
+), long_about = None)]
 struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
@@ -1225,6 +1236,9 @@ fn apply_cmd_translations(cmd: clap::Command, prefix: &str) -> clap::Command {
 
     let about_key = format!("{prefix}-about");
     let cmd = match crate::i18n::get_cli_string(&about_key) {
+        Some(about) if prefix == "cli" => {
+            cmd.about(format!("{about} (built {})", env!("ZEROCLAW_BUILD_TIME")))
+        }
         Some(about) => cmd.about(about),
         None => cmd,
     };

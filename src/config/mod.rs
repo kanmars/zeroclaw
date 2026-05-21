@@ -14,7 +14,7 @@ pub use schema::{
     ClaudeCodeRunnerConfig, CloudOpsConfig, CodexCliConfig, ComposioConfig, Config,
     ConversationalAiConfig, CostConfig, CronJobDecl, CronScheduleDecl, DEFAULT_GWS_SERVICES,
     DataRetentionConfig, DeepgramSttConfig, DelegateToolConfig, DiscordConfig, DockerRuntimeConfig,
-    EmbeddingRouteConfig, EstopConfig, GatewayConfig, GeminiCliConfig, GoogleSttConfig,
+    EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig, GeminiCliConfig, GoogleSttConfig,
     GoogleWorkspaceAllowedOperation, GoogleWorkspaceConfig, HardwareConfig, HardwareTransport,
     HeartbeatConfig, HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
     ImageGenConfig, ImageProviderDalleConfig, ImageProviderFluxConfig, ImageProviderImagenConfig,
@@ -134,7 +134,30 @@ mod tests {
             port: None,
             proxy_url: None,
             excluded_tools: vec![],
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            approval_timeout_secs: 120,
+            inbound_prefix: true,
+            per_user_session: false,
         };
+        let feishu = FeishuConfig {
+            enabled: true,
+            app_id: "app-id".into(),
+            app_secret: "app-secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            mention_only: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            proxy_url: None,
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            approval_timeout_secs: 120,
+            inbound_prefix: true,
+            per_user_session: false,
+        };
+
         let nextcloud_talk = NextcloudTalkConfig {
             enabled: true,
             base_url: "https://cloud.example.com".into(),
@@ -150,6 +173,7 @@ mod tests {
         assert_eq!(telegram.bot_token, "token");
         assert_eq!(discord.guild_ids, vec!["123".to_string()]);
         assert_eq!(lark.app_id, "app-id");
+        assert_eq!(feishu.app_id, "app-id");
         assert_eq!(nextcloud_talk.base_url, "https://cloud.example.com");
     }
 }
