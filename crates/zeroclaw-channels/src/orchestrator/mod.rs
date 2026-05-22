@@ -2340,6 +2340,69 @@ fn parse_reply_intent(response: &str) -> AssistantChannelOutcome {
     AssistantChannelOutcome::Reply(String::new())
 }
 
+/// Resolve a per-agent `classifier_provider` ref to a (provider, model)
+/// pair for `classify_channel_reply_intent`. Returns `None` when the
+/// ref is empty or unresolvable; the caller MUST then fall back to the
+/// main agent's `active_model_provider` + `route.model`.
+///
+/// Per AGENTS.md SINGLE SOURCE OF TRUTH: this function reads the
+/// referenced `[providers.models.<type>.<alias>]` entry on every call
+/// (no field cache on `ChannelRuntimeContext`). The provider instance
+/// itself is deduped through the existing `provider_cache` LRU.
+///
+/// See `kanmars.req.20260522.001.plan.md` for rationale.
+async fn resolve_classifier_route(
+    ctx: &ChannelRuntimeContext,
+    provider_ref: &zeroclaw_config::providers::ModelProviderRef,
+) -> Option<(Arc<dyn ModelProvider>, String)> {
+    if provider_ref.is_empty() {
+        return None;
+    }
+
+    let provider_str = provider_ref.as_str();
+    let (type_key, alias_key) = provider_str.split_once('.')?;
+
+    // Source of truth lookup — re-read every call so a config hot-reload
+    // is reflected without a daemon restart.
+    let model_cfg = ctx
+        .prompt_config
+        .providers
+        .models
+        .find(type_key, alias_key)?;
+    let model = model_cfg.model.clone().unwrap_or_default();
+    if model.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"provider": provider_str})),
+            "classifier_provider points to a [providers.models] entry without a `model` field; falling back to main agent"
+        );
+        return None;
+    }
+
+    // Reuse the shared provider cache. `None` api_key means "use whatever
+    // is in the referenced ModelProviderConfig" — get_or_create_provider
+    // already handles that path identically to the main route.
+    let provider =
+        match get_or_create_provider(ctx, provider_str, model_cfg.api_key.as_deref()).await {
+            Ok(p) => p,
+            Err(e) => {
+                let safe_err = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"provider": provider_str, "error": safe_err})),
+                    "Failed to initialize classifier_provider; falling back to main agent provider"
+                );
+                return None;
+            }
+        };
+
+    Some((provider, model))
+}
+
 /// Build the `NoReply` outcome, with a narrow rubric-echo failsafe scoped to
 /// the `Informational` kind only. When the classifier emits `NO_REPLY[INFO]`
 /// with a reason that restates its own rubric (the only failure mode observed
@@ -3474,11 +3537,21 @@ async fn process_channel_message_body(
     }
 
     // ── Reply-intent precheck ────────────────────────────────────────
+    // Resolve the classifier route — per-agent override (Step 3 resolver)
+    // or fall back to the main agent's active route. The override lets
+    // operators point classification at a cheap/free small model while
+    // keeping the expensive answering model on the main route.
+    let (classifier_provider_arc, classifier_model_owned): (Arc<dyn ModelProvider>, String) =
+        match resolve_classifier_route(ctx.as_ref(), &ctx.agent_cfg.classifier_provider).await {
+            Some(pair) => pair,
+            None => (Arc::clone(&active_model_provider), route.model.clone()),
+        };
+
     let classifier_intent = classify_channel_reply_intent(
-        active_model_provider.as_ref(),
+        classifier_provider_arc.as_ref(),
         history[0].content.as_str(),
         &history,
-        route.model.as_str(),
+        classifier_model_owned.as_str(),
         runtime_defaults.temperature,
     )
     .await
@@ -8075,6 +8148,22 @@ mod tests {
             show_receipts_in_response: false,
             last_applied_config_stamp: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[tokio::test]
+    async fn resolve_classifier_route_returns_none_for_empty_ref() {
+        let ctx = router_test_ctx();
+        let empty = zeroclaw_config::providers::ModelProviderRef::default();
+        let result = resolve_classifier_route(ctx.as_ref(), &empty).await;
+        assert!(result.is_none(), "empty ref must fall back to main agent");
+    }
+
+    #[tokio::test]
+    async fn resolve_classifier_route_returns_none_for_unresolvable_ref() {
+        let ctx = router_test_ctx();
+        let bogus = zeroclaw_config::providers::ModelProviderRef::from("custom.does-not-exist");
+        let result = resolve_classifier_route(ctx.as_ref(), &bogus).await;
+        assert!(result.is_none(), "unresolvable ref must soft-fail to None");
     }
 
     #[test]
