@@ -3517,7 +3517,7 @@ pub async fn run(
                             Some(model_switch_callback.clone()),
                             &config.pacing,
                             agent.max_tool_result_chars,
-                            agent.max_context_tokens,
+                            agent.resolved_max_context_tokens(config.model_provider_for_agent(agent_alias)),
                             None, // shared_budget
                             None, // channel: CLI mode — uses prompt_cli
                             None, // receipt_generator
@@ -3901,7 +3901,7 @@ pub async fn run(
                                 Some(model_switch_callback.clone()),
                                 &config.pacing,
                                 agent.max_tool_result_chars,
-                                agent.max_context_tokens,
+                                agent.resolved_max_context_tokens(config.model_provider_for_agent(agent_alias)),
                                 None, // shared_budget
                                 None, // channel: interactive CLI — uses prompt_cli
                                 None, // receipt_generator
@@ -3969,7 +3969,7 @@ pub async fn run(
                                 let mut compressor =
                                     crate::agent::context_compressor::ContextCompressor::new(
                                         agent.context_compression.clone(),
-                                        agent.max_context_tokens,
+                                        agent.resolved_max_context_tokens(config.model_provider_for_agent(agent_alias)),
                                     )
                                     .with_memory(mem.clone());
                                 let error_msg = format!("{e}");
@@ -4039,7 +4039,7 @@ pub async fn run(
                 {
                     let compressor = crate::agent::context_compressor::ContextCompressor::new(
                         agent.context_compression.clone(),
-                        agent.max_context_tokens,
+                        agent.resolved_max_context_tokens(config.model_provider_for_agent(agent_alias)),
                     )
                     .with_memory(mem.clone());
                     match compressor

@@ -7464,7 +7464,7 @@ pub async fn start_channels(
             }),
             pacing: config.pacing.clone(),
             max_tool_result_chars: agent.max_tool_result_chars,
-            context_token_budget: agent.max_context_tokens,
+            context_token_budget: config.resolved_max_context_tokens_for_agent(agent_alias),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::from_millis(config.channels.debounce_ms),
             )),

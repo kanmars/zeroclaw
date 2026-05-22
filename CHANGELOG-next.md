@@ -48,6 +48,41 @@ v0.8.0 turns ZeroClaw from a single-agent daemon into a true multi-agent host. O
       model_provider      = "custom.default"
       classifier_provider = "custom.kimi-k2-5"
 
+- **providers/models**: Added `max_context_window: Option<usize>` field to
+  `ModelProviderConfig` documenting the model's input context window in tokens.
+  When the agent does not override, `agent.max_context_tokens` now inherits this
+  value. Common settings (operator must verify against provider docs):
+
+      [providers.models.deepseek.default]
+      max_context_window = 1000000   # DeepSeek V4 series
+
+      [providers.models.anthropic.default]
+      max_context_window = 200000    # Claude 3.5/4 family
+
+      [providers.models.openai.default]
+      max_context_window = 128000    # GPT-4o / GPT-4-Turbo
+
+### Changed
+
+- **agents**: `AliasedAgentConfig.max_context_tokens` is now
+  `Option<usize>` (was `usize` with default 32000). When unset (the new default),
+  the runtime inherits from the resolved model's `max_context_window`; if both
+  are unset, falls back to `DEFAULT_MAX_CONTEXT_TOKENS` (32K). Explicit values
+  (including `= 32000`) continue to take precedence over the model hint —
+  operators wanting strict cost capping can keep their existing values
+  unchanged.
+
+  Previously this field always read 32K when unwritten, ignoring the model's
+  real capacity (e.g. DeepSeek-V4 1M, Claude 200K). The result was unnecessary
+  context-compression cycles on long histories (gloria observed 26.7s
+  compression on a 19K-token history because 19K > 32K × 0.5 threshold).
+
+  **Backward compatibility**: All existing configs continue to work unchanged.
+  The new field's introduction is purely additive; the only behavior change is
+  for configs that combine `agent.max_context_tokens` unset + a new
+  `model.max_context_window` value (which is the intended use case of this
+  feature).
+
 ### Multi-Agent & Runtime
 
 The multi-agent epic (#6272) is the spine of this release:
