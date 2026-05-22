@@ -1,0 +1,17 @@
+{
+  "active_plan": "/home/admin/workspace-public/kanmars/zeroclaw/.sisyphus/plans/kanmars.req.20260516.004.plan.md",
+  "started_at": "2026-05-16T13:48:31.602Z",
+  "session_ids": [
+    "ses_1cf0b9495ffeeY5sKdJ44rvo8x"
+  ],
+  "plan_name": "kanmars.req.20260516.004.plan",
+  "status": "completed",
+  "session_origins": {
+    "ses_1cf0b9495ffeeY5sKdJ44rvo8x": "direct"
+  },
+  "task_sessions": {},
+  "active_work_id": "kanmars.req.20260516.004.plan-legacy",
+  "ended_at": "2026-05-16T14:04:40.003Z",
+  "elapsed_ms": 968401,
+  "updated_at": "2026-05-16T14:04:40.003Z"
+}

@@ -1,17 +1,37 @@
 {
-  "active_plan": "/home/admin/workspace-public/kanmars/zeroclaw/.sisyphus/plans/kanmars.req.20260516.004.plan.md",
-  "started_at": "2026-05-16T13:48:31.602Z",
+  "active_plan": "/Users/kanmars/workspace/kanmars_zeroclaw_github/.sisyphus/plans/kanmars.req.20260522.001.plan.md",
+  "started_at": "2026-05-22T15:47:05.063Z",
   "session_ids": [
-    "ses_1cf0b9495ffeeY5sKdJ44rvo8x"
+    "ses_1afe42dc8ffecTDB27IqREUtw4"
   ],
-  "plan_name": "kanmars.req.20260516.004.plan",
-  "status": "completed",
+  "plan_name": "kanmars.req.20260522.001.plan",
+  "status": "active",
   "session_origins": {
-    "ses_1cf0b9495ffeeY5sKdJ44rvo8x": "direct"
+    "ses_1afe42dc8ffecTDB27IqREUtw4": "start-work"
   },
   "task_sessions": {},
-  "active_work_id": "kanmars.req.20260516.004.plan-legacy",
-  "ended_at": "2026-05-16T14:04:40.003Z",
-  "elapsed_ms": 968401,
-  "updated_at": "2026-05-16T14:04:40.003Z"
+  "active_work_id": "kanmars.req.20260523.001.plan",
+  "active_plan": "/Users/kanmars/workspace/kanmars_zeroclaw_github/.sisyphus/plans/kanmars.req.20260523.001.plan.md",
+  "started_at": "2026-05-23T01:13:00.000Z",
+  "session_ids": [
+    "ses_1afe42dc8ffecTDB27IqREUtw4"
+  ],
+  "plan_name": "kanmars.req.20260523.001.plan",
+  "baseline_commit": "045b60ac67d7e24579b53985efe192e6baabe761",
+  "baseline_branch": "kanmars_main (post 0522.001 merge)",
+  "target_branch": "feat/model-context-window-inheritance",
+  "feature_commit": "c4540a489b07ef41954aa6b1aaecf2c13b6c29d1",
+  "pushed_to": "origin (github.com/kanmars/zeroclaw)",
+  "pr_creation_url": "https://github.com/kanmars/zeroclaw/pull/new/feat/model-context-window-inheritance",
+  "previous_plans_completed": [
+    {
+      "plan_name": "kanmars.req.20260522.001.plan",
+      "feature_commit": "045b60ac67d7e24579b53985efe192e6baabe761",
+      "merged_to_baseline": true,
+      "merged_at_approx": "2026-05-23 (manual merge by user)"
+    }
+  ],
+  "status": "completed",
+  "ended_at": "2026-05-23T01:55:00.000Z",
+  "updated_at": "2026-05-23T01:55:00.000Z"
 }
