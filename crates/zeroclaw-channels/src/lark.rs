@@ -381,6 +381,74 @@ fn build_resolved_approval_card(
     })
 }
 
+/// Build a sanitized copy of a `card.action.trigger` event payload that is
+/// safe to emit to structured logs / dashboards / persisted JSONL.
+///
+/// The raw inbound payload from Lark/Feishu carries tenant-specific
+/// identifiers and a callback verification token. These values are
+/// classified as PII / callback secrets by the project's privacy policy
+/// (see each fixture's `_fixture_note` under `tests/fixtures/lark/` for the
+/// authoritative list of fields that must be redacted before any
+/// persistence).
+///
+/// This function replaces the following with deterministic `REDACTED_*`
+/// placeholder strings:
+///
+/// - top-level `token` (Lark callback verification token)
+/// - `operator.open_id` / `union_id` / `user_id` / `tenant_key`
+/// - `context.open_chat_id` / `context.open_message_id`
+///
+/// Non-sensitive business fields (`action.*`, `host`, etc.) are preserved
+/// verbatim so DEBUG operators can still capture production payload shape
+/// for fixture collection.
+///
+/// The input is borrowed read-only; a fresh owned `Value` is returned. The
+/// regression test `sanitize_card_action_payload_redacts_sensitive_fields`
+/// is the gate that fails if any of those raw values can leak through this
+/// path.
+fn sanitize_card_action_payload(event_payload: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+
+    let mut sanitized = event_payload.clone();
+
+    // Top-level callback verification token.
+    if let Some(token) = sanitized.get_mut("token")
+        && !token.is_null()
+    {
+        *token = Value::String("REDACTED_TOKEN".to_string());
+    }
+
+    // operator.* identifiers — only overwrite keys that are actually present
+    // so the sanitized payload still reflects production shape (don't
+    // invent fields that the real event didn't carry).
+    if let Some(Value::Object(operator)) = sanitized.get_mut("operator") {
+        for (key, placeholder) in [
+            ("open_id", "REDACTED_OPERATOR_OPEN_ID"),
+            ("union_id", "REDACTED_OPERATOR_UNION_ID"),
+            ("user_id", "REDACTED_OPERATOR_USER_ID"),
+            ("tenant_key", "REDACTED_OPERATOR_TENANT_KEY"),
+        ] {
+            if operator.contains_key(key) {
+                operator.insert(key.to_string(), Value::String(placeholder.to_string()));
+            }
+        }
+    }
+
+    // context.open_* identifiers.
+    if let Some(Value::Object(context)) = sanitized.get_mut("context") {
+        for (key, placeholder) in [
+            ("open_chat_id", "REDACTED_OPEN_CHAT_ID"),
+            ("open_message_id", "REDACTED_OPEN_MESSAGE_ID"),
+        ] {
+            if context.contains_key(key) {
+                context.insert(key.to_string(), Value::String(placeholder.to_string()));
+            }
+        }
+    }
+
+    sanitized
+}
+
 /// Build the full message body for sending an interactive card message.
 fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::Value {
     serde_json::json!({
@@ -1269,9 +1337,12 @@ impl LarkChannel {
                             if let Err(e) = self.handle_card_action_event(&event.event).await {
                                 ::zeroclaw_log::record!(
                                     WARN,
-                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                        .with_attrs(::serde_json::json!({"err": format!("{e}")})),
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Dispatch
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
                                     "Lark WS: card action dispatch error"
                                 );
                             }
@@ -2725,10 +2796,13 @@ impl Channel for LarkChannel {
             .unwrap_or_else(|| {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"approval_id": approval_id})),
-                    "Lark: approval card sent but no data.message_id in response; post-click card update will be skipped"
+                    ::zeroclaw_log::Event::new(
+                        module_path!(),
+                        ::zeroclaw_log::Action::Note
+                    )
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"approval_id": approval_id})),
+                    "Lark: approval card sent but no data.message_id in response — post-click card update will be skipped"
                 );
                 String::new()
             });
@@ -3006,7 +3080,8 @@ impl LarkChannel {
 
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                 .with_attrs(::serde_json::json!({
                     "message_id": message_id,
                     "decision": format!("{decision:?}"),
@@ -3019,11 +3094,11 @@ impl LarkChannel {
             Err(e) => {
                 ::zeroclaw_log::record!(
                     WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({
                             "message_id": message_id,
-                            "err": format!("{e}"),
+                            "error": e.to_string(),
                         })),
                     "Lark: approval card PATCH transport error"
                 );
@@ -3038,12 +3113,15 @@ impl LarkChannel {
                     if should_refresh_lark_tenant_token(retry_status, &retry_response) {
                         ::zeroclaw_log::record!(
                             WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "message_id": message_id,
-                                    "body": retry_response,
-                                })),
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Send
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "body": retry_response.to_string(),
+                            })),
                             "Lark: approval card PATCH still unauthorized after token refresh"
                         );
                         return;
@@ -3053,11 +3131,11 @@ impl LarkChannel {
                 Err(e) => {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
                                 "message_id": message_id,
-                                "err": format!("{e}"),
+                                "error": e.to_string(),
                             })),
                         "Lark: approval card PATCH retry transport error"
                     );
@@ -3072,31 +3150,35 @@ impl LarkChannel {
         if code == LARK_DRAFT_RATE_LIMIT_CODE {
             ::zeroclaw_log::record!(
                 WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"message_id": message_id})),
-                "Lark: approval card PATCH rate-limited (code=230020)"
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "code": LARK_DRAFT_RATE_LIMIT_CODE,
+                    })),
+                "Lark: approval card PATCH rate-limited"
             );
         } else if code != 0 {
             ::zeroclaw_log::record!(
                 WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "message_id": message_id,
                         "code": code,
-                        "status": status.as_u16(),
-                        "body": final_body,
+                        "status": status.to_string(),
+                        "body": final_body.to_string(),
                     })),
                 "Lark: approval card PATCH soft-failed"
             );
         } else {
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
                         "message_id": message_id,
-                        "status": status.as_u16(),
+                        "status": status.to_string(),
                     })),
                 "Lark: approval card PATCH succeeded"
             );
@@ -3143,28 +3225,81 @@ impl LarkChannel {
     ) -> anyhow::Result<()> {
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
+        // Diagnostic: emit a SANITIZED copy of the inbound payload at DEBUG
+        // so operators can capture real Lark/Feishu `card.action.trigger`
+        // shape evidence for fixture collection WITHOUT leaking
+        // tenant-specific identifiers (token, operator.*, context.open_*)
+        // to runtime logs / dashboards / persisted JSONL.
+        //
+        // `sanitize_card_action_payload` replaces those fields with
+        // deterministic `REDACTED_*` placeholders before the value reaches
+        // `record!`. The regression test
+        // `sanitize_card_action_payload_redacts_sensitive_fields` will fail
+        // if any of those raw values can leak through this path again.
+        //
+        // Default production RUST_LOG (=info) leaves this off, so it costs
+        // nothing at runtime; opt in with:
+        //
+        //   RUST_LOG=info,zeroclaw_log_event=debug
+        //
+        // Captured payloads should land in
+        // `crates/zeroclaw-channels/tests/fixtures/lark/` and are replayed
+        // by the integration test in `tests/lark_approval_live_evidence.rs`.
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive).with_attrs(
+                ::serde_json::json!({
+                    "sanitized_payload": sanitize_card_action_payload(event_payload),
+                })
+            ),
+            "card.action.trigger sanitized payload"
+        );
+
         // Feishu Card 2.0 button click events MAY round-trip the button value at
-        // `event.action.behaviors[0].value` instead of `event.action.value` (the
-        // Card 1.0 path). Production click samples for Card 2.0 are unavailable
-        // at PR-cut time, so we accept either pointer to remain forward-compatible.
+        // `event.action.behaviors[0].value` instead of `event.action.value`
+        // (the Card 1.0 path). Both pointers are accepted for forward-compat;
+        // captured fixtures under `tests/fixtures/lark/` lock the shape that
+        // production currently emits.
         let value = event_payload
             .pointer("/action/value")
             .or_else(|| event_payload.pointer("/action/behaviors/0/value"))
             .ok_or_else(|| {
-                anyhow::anyhow!(
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
                     "card.action.trigger: missing event.action.value or event.action.behaviors[0].value"
+                );
+                anyhow::Error::msg(
+                    "card.action.trigger: missing event.action.value or event.action.behaviors[0].value",
                 )
             })?;
 
         let approval_id = value
             .get("approval_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("card.action.trigger: missing approval_id in value"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "card.action.trigger: missing approval_id in value"
+                );
+                anyhow::Error::msg("card.action.trigger: missing approval_id in value")
+            })?;
 
         let decision_str = value
             .get("decision")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("card.action.trigger: missing decision in value"))?;
+            .ok_or_else(|| {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                    "card.action.trigger: missing decision in value"
+                );
+                anyhow::Error::msg("card.action.trigger: missing decision in value")
+            })?;
 
         let decision = match decision_str {
             "approve" => ChannelApprovalResponse::Approve,
@@ -3175,8 +3310,8 @@ impl LarkChannel {
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"raw_decision": other})),
-                    "Lark: unknown approval decision; treating as deny"
+                        .with_attrs(::serde_json::json!({"decision_str": other})),
+                    "Lark: unknown approval decision — treating as deny"
                 );
                 ChannelApprovalResponse::Deny
             }
@@ -3187,6 +3322,7 @@ impl LarkChannel {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "approval_id": approval_id,
                         "decision": format!("{decision:?}"),
@@ -3198,7 +3334,8 @@ impl LarkChannel {
 
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "approval_id": approval_id,
                     "decision": format!("{decision:?}"),
@@ -3277,9 +3414,12 @@ impl LarkChannel {
                 if let Err(e) = state.channel.handle_card_action_event(inner).await {
                     ::zeroclaw_log::record!(
                         WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"err": format!("{e}")})),
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Dispatch
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                         "Lark webhook: card action dispatch error"
                     );
                 }
@@ -5451,45 +5591,6 @@ mod tests {
         // Case-sensitivity: Lark API is case-sensitive; "No" is correct, "NO" would be invalid.
         assert_ne!(unicode_to_lark_emoji_type("🚫"), Some("NO"));
     }
-
-    #[test]
-    fn inbound_prefix_format_matches_spec() {
-        let prefix = build_feishu_inbound_prefix("ou_abc123", 1_778_761_800);
-        assert!(
-            prefix.starts_with("本消息通过飞书渠道发送，发送人为 ou_abc123，"),
-            "unexpected prefix start: {prefix}"
-        );
-        assert!(
-            prefix.contains("北京时间 2026-05-14 20:30:00"),
-            "missing or wrong Beijing time in: {prefix}"
-        );
-        assert!(
-            prefix.ends_with("\n\n"),
-            "must end with blank line: {prefix:?}"
-        );
-        assert_eq!(
-            prefix.matches('\n').count(),
-            2,
-            "exactly two newlines (\\n\\n separator), got: {prefix:?}"
-        );
-    }
-
-    #[test]
-    fn inbound_prefix_handles_overflow_timestamp() {
-        let prefix = build_feishu_inbound_prefix("ou_xxx", u64::MAX);
-        assert!(prefix.contains("北京时间"));
-        assert!(prefix.starts_with("本消息通过飞书渠道发送，发送人为 ou_xxx，"));
-        assert!(prefix.ends_with("\n\n"));
-    }
-
-    #[test]
-    fn inbound_prefix_prepends_cleanly_to_user_text() {
-        let prefix = build_feishu_inbound_prefix("ou_abc123", 1_778_761_800);
-        let combined = format!("{prefix}你好世界");
-        assert!(combined.ends_with("你好世界"));
-        assert_eq!(combined.matches('\n').count(), 2);
-    }
-
     // ─────────────────────────────────────────────────────────────────────
     // Card 2.0 approval card tests
     // ─────────────────────────────────────────────────────────────────────
@@ -5556,7 +5657,7 @@ mod tests {
             send_schema, patch_schema,
             "send-time approval card and PATCH-time resolved card MUST use the same Card JSON schema; \
              Feishu's IM PATCH endpoint silently fails to re-render on the client when send/patch \
-             schema versions differ (see plan kanmars.req.20260516.004 §1.3)"
+             schema versions differ"
         );
         assert_eq!(send_schema, Some("2.0"));
     }
@@ -5588,6 +5689,133 @@ mod tests {
                 title.contains(expected_text_fragment),
                 "decision={decision:?} header title `{title}` should contain `{expected_text_fragment}`"
             );
+        }
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_redacts_sensitive_fields() {
+        let raw = serde_json::json!({
+            "action": {
+                "tag": "button",
+                "value": {
+                    "approval_id": "2ecbcc0f-59f0-4216-ba1c-5b6f4deaf7c7",
+                    "decision": "approve"
+                }
+            },
+            "context": {
+                "open_chat_id": "oc_real_chat_id_LEAKED",
+                "open_message_id": "om_real_msg_id_LEAKED"
+            },
+            "host": "im_message",
+            "operator": {
+                "open_id": "ou_real_user_id_LEAKED",
+                "tenant_key": "real_tenant_key_LEAKED",
+                "union_id": "on_real_union_id_LEAKED",
+                "user_id": "real_user_id_LEAKED"
+            },
+            "token": "c-real_callback_token_LEAKED"
+        });
+
+        let sanitized = sanitize_card_action_payload(&raw);
+        let dumped = serde_json::to_string(&sanitized).expect("sanitized must serialize");
+
+        for forbidden in [
+            "oc_real_chat_id_LEAKED",
+            "om_real_msg_id_LEAKED",
+            "ou_real_user_id_LEAKED",
+            "real_tenant_key_LEAKED",
+            "on_real_union_id_LEAKED",
+            "real_user_id_LEAKED",
+            "c-real_callback_token_LEAKED",
+        ] {
+            assert!(
+                !dumped.contains(forbidden),
+                "sanitized payload must not contain raw value {forbidden:?}; got {dumped}"
+            );
+        }
+
+        assert_eq!(sanitized["token"], "REDACTED_TOKEN");
+        assert_eq!(
+            sanitized["operator"]["open_id"],
+            "REDACTED_OPERATOR_OPEN_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["union_id"],
+            "REDACTED_OPERATOR_UNION_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["user_id"],
+            "REDACTED_OPERATOR_USER_ID"
+        );
+        assert_eq!(
+            sanitized["operator"]["tenant_key"],
+            "REDACTED_OPERATOR_TENANT_KEY"
+        );
+        assert_eq!(
+            sanitized["context"]["open_chat_id"],
+            "REDACTED_OPEN_CHAT_ID"
+        );
+        assert_eq!(
+            sanitized["context"]["open_message_id"],
+            "REDACTED_OPEN_MESSAGE_ID"
+        );
+
+        assert_eq!(
+            sanitized["action"]["value"]["approval_id"],
+            "2ecbcc0f-59f0-4216-ba1c-5b6f4deaf7c7"
+        );
+        assert_eq!(sanitized["action"]["value"]["decision"], "approve");
+        assert_eq!(sanitized["action"]["tag"], "button");
+        assert_eq!(sanitized["host"], "im_message");
+
+        assert_eq!(raw["token"], "c-real_callback_token_LEAKED");
+        assert_eq!(raw["operator"]["open_id"], "ou_real_user_id_LEAKED");
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_handles_missing_optional_fields() {
+        let raw = serde_json::json!({
+            "action": { "value": { "approval_id": "x", "decision": "approve" } }
+        });
+        let sanitized = sanitize_card_action_payload(&raw);
+        assert!(sanitized.get("token").is_none());
+        assert!(sanitized.get("operator").is_none());
+        assert!(sanitized.get("context").is_none());
+        assert_eq!(sanitized["action"]["value"]["decision"], "approve");
+    }
+
+    #[test]
+    fn sanitize_card_action_payload_redacts_committed_fixtures() {
+        let fixtures: [(&str, &str); 3] = [
+            (
+                "card_action_approve.json",
+                include_str!("../tests/fixtures/lark/card_action_approve.json"),
+            ),
+            (
+                "card_action_deny.json",
+                include_str!("../tests/fixtures/lark/card_action_deny.json"),
+            ),
+            (
+                "card_action_always.json",
+                include_str!("../tests/fixtures/lark/card_action_always.json"),
+            ),
+        ];
+        for (name, raw_text) in fixtures {
+            let raw: serde_json::Value = serde_json::from_str(raw_text)
+                .unwrap_or_else(|e| panic!("parse fixture {name}: {e}"));
+            let sanitized = sanitize_card_action_payload(&raw);
+            let dumped =
+                serde_json::to_string(&sanitized).expect("sanitized fixture must serialize");
+            for placeholder_field in [
+                "REDACTED_TOKEN",
+                "REDACTED_OPERATOR_OPEN_ID",
+                "REDACTED_OPEN_CHAT_ID",
+            ] {
+                assert!(
+                    dumped.contains(placeholder_field),
+                    "sanitizer output for {name} must contain {placeholder_field}; got {dumped}"
+                );
+            }
         }
     }
 
@@ -5671,6 +5899,44 @@ mod tests {
         ch.handle_card_action_event(&event)
             .await
             .expect("unknown approval id should not error");
+    }
+
+    #[test]
+    fn inbound_prefix_format_matches_spec() {
+        let prefix = build_feishu_inbound_prefix("ou_abc123", 1_778_761_800);
+        assert!(
+            prefix.starts_with("本消息通过飞书渠道发送，发送人为 ou_abc123，"),
+            "unexpected prefix start: {prefix}"
+        );
+        assert!(
+            prefix.contains("北京时间 2026-05-14 20:30:00"),
+            "missing or wrong Beijing time in: {prefix}"
+        );
+        assert!(
+            prefix.ends_with("\n\n"),
+            "must end with blank line: {prefix:?}"
+        );
+        assert_eq!(
+            prefix.matches('\n').count(),
+            2,
+            "exactly two newlines (\\n\\n separator), got: {prefix:?}"
+        );
+    }
+
+    #[test]
+    fn inbound_prefix_handles_overflow_timestamp() {
+        let prefix = build_feishu_inbound_prefix("ou_xxx", u64::MAX);
+        assert!(prefix.contains("北京时间"));
+        assert!(prefix.starts_with("本消息通过飞书渠道发送，发送人为 ou_xxx，"));
+        assert!(prefix.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn inbound_prefix_prepends_cleanly_to_user_text() {
+        let prefix = build_feishu_inbound_prefix("ou_abc123", 1_778_761_800);
+        let combined = format!("{prefix}你好世界");
+        assert!(combined.ends_with("你好世界"));
+        assert_eq!(combined.matches('\n').count(), 2);
     }
 
     #[test]
