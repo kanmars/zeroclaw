@@ -2408,10 +2408,10 @@ fn parse_reply_intent(response: &str) -> AssistantChannelOutcome {
     AssistantChannelOutcome::Reply(String::new())
 }
 
-/// Resolve a per-agent `classifier_provider` ref to a (provider, model)
-/// pair for `classify_channel_reply_intent`. Returns `None` when the
+/// Resolve a per-agent `classifier_provider` ref to a (provider, model, temperature)
+/// triple for `classify_channel_reply_intent`. Returns `None` when the
 /// ref is empty or unresolvable; the caller MUST then fall back to the
-/// main agent's `active_model_provider` + `route.model`.
+/// main agent's `active_model_provider` + `route.model` + `runtime_defaults.temperature`.
 ///
 /// Per AGENTS.md SINGLE SOURCE OF TRUTH: this function reads the
 /// referenced `[providers.models.<type>.<alias>]` entry on every call
@@ -2420,7 +2420,7 @@ fn parse_reply_intent(response: &str) -> AssistantChannelOutcome {
 async fn resolve_classifier_route(
     ctx: &ChannelRuntimeContext,
     provider_ref: &zeroclaw_config::providers::ModelProviderRef,
-) -> Option<(Arc<dyn ModelProvider>, String)> {
+) -> Option<(Arc<dyn ModelProvider>, String, Option<f64>)> {
     let provider_str = provider_ref.as_str().trim();
     if provider_str.is_empty() {
         return None;
@@ -2455,6 +2455,7 @@ async fn resolve_classifier_route(
     };
 
     let model = model_cfg.model.clone().unwrap_or_default();
+    let temperature = model_cfg.temperature;
     if model.is_empty() {
         ::zeroclaw_log::record!(
             WARN,
@@ -2490,7 +2491,7 @@ async fn resolve_classifier_route(
         "classifier_provider override active"
     );
 
-    Some((provider, model))
+    Some((provider, model, temperature))
 }
 
 /// Build the `NoReply` outcome, with a narrow rubric-echo failsafe scoped to
@@ -3677,17 +3678,17 @@ async fn process_channel_message_body(
     let classifier_intent = if explicit_channel_address {
         AssistantChannelOutcome::Reply(String::new())
     } else {
-        let (classifier_provider_arc, classifier_model_owned): (Arc<dyn ModelProvider>, String) =
+        let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (Arc<dyn ModelProvider>, String, Option<f64>) =
             resolve_classifier_route(ctx.as_ref(), &ctx.agent_cfg.classifier_provider)
                 .await
-                .unwrap_or_else(|| (Arc::clone(&active_model_provider), route.model.clone()));
+                .unwrap_or_else(|| (Arc::clone(&active_model_provider), route.model.clone(), None));
 
         classify_channel_reply_intent(
             classifier_provider_arc.as_ref(),
             history[0].content.as_str(),
             &history,
             classifier_model_owned.as_str(),
-            runtime_defaults.temperature,
+            classifier_temperature.or(runtime_defaults.temperature),
         )
         .await
         .unwrap_or(AssistantChannelOutcome::Reply(String::new()))
@@ -8798,6 +8799,38 @@ mod tests {
         let bogus = zeroclaw_config::providers::ModelProviderRef::from("custom.does-not-exist");
         let result = resolve_classifier_route(ctx.as_ref(), &bogus).await;
         assert!(result.is_none(), "unresolvable ref must soft-fail to None");
+    }
+
+    #[tokio::test]
+    async fn resolve_classifier_route_returns_alias_temperature() {
+        // Build a config where `openai.my-classifier` has `temperature = 0.0`.
+        let mut cfg = zeroclaw_config::schema::Config::default();
+        cfg.providers.models.openai.insert(
+            "my-classifier".to_string(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    temperature: Some(0.0),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let base_ctx = (*router_test_ctx()).clone();
+        let ctx = Arc::new(ChannelRuntimeContext {
+            prompt_config: Arc::new(cfg),
+            ..base_ctx
+        });
+
+        let alias_ref = zeroclaw_config::providers::ModelProviderRef::from("openai.my-classifier");
+        let result = resolve_classifier_route(ctx.as_ref(), &alias_ref).await;
+
+        let (_, _, temp) = result.expect("must resolve to alias");
+        assert_eq!(
+            temp,
+            Some(0.0),
+            "alias temperature must be returned, not runtime_defaults.temperature"
+        );
     }
 
     #[test]
