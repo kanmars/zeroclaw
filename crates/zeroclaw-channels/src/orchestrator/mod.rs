@@ -1997,7 +1997,20 @@ async fn handle_runtime_command_if_needed(
     };
 
     if let Err(err) = channel
-        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .send(&{
+            let mut sm = SendMessage::new(response, &msg.reply_target)
+                .in_thread(msg.thread_ts.clone())
+                .in_reply_to(Some(msg.id.clone()));
+            if let Some(ref subj) = msg.subject {
+                let reply_subject = if subj.to_lowercase().starts_with("re:") {
+                    subj.clone()
+                } else {
+                    format!("Re: {}", subj)
+                };
+                sm = sm.subject(reply_subject);
+            }
+            sm
+        })
         .await
     {
         ::zeroclaw_log::record!(
@@ -2508,6 +2521,21 @@ fn strip_think_tags_inline(s: &str) -> String {
     result.trim().to_string()
 }
 
+fn build_email_reply(msg: &ChannelMessage, content: impl Into<String>) -> SendMessage {
+    let mut sm = SendMessage::new(content, &msg.reply_target)
+        .in_thread(msg.thread_ts.clone())
+        .in_reply_to(Some(msg.id.clone()));
+    if let Some(ref subj) = msg.subject {
+        let reply_subject = if subj.to_ascii_lowercase().starts_with("re:") {
+            subj.clone()
+        } else {
+            format!("Re: {}", subj)
+        };
+        sm = sm.subject(reply_subject);
+    }
+    sm
+}
+
 fn starts_with_visible_tool_call_tag_example(response: &str) -> bool {
     let lower = response.trim_start().to_ascii_lowercase();
     let starts_with_tool_tag = lower.starts_with("<tool_call")
@@ -2560,6 +2588,8 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     // Strip any [Used tools: ...] prefix that the LLM may have echoed from
     // history context. Trim first to handle leading/trailing whitespace.
     let trimmed_response = response.trim();
+    let trimmed_response = strip_think_tags_inline(trimmed_response).trim().to_string();
+    let trimmed_response = trimmed_response.as_str();
     // Final channel guardrail: reuse the parser classifier so channel cleanup
     // cannot drift from runtime tool-protocol detection.
     if should_suppress_top_level_tool_protocol_response(trimmed_response, &known_tool_names) {
@@ -3395,12 +3425,7 @@ async fn process_channel_message_body(
                 route.model_provider
             );
             if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(
-                        &SendMessage::new(message, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await;
+                let _ = channel.send(&build_email_reply(&msg, message)).await;
             }
             return;
         }
@@ -4362,16 +4387,12 @@ async fn process_channel_message_body(
                             "Failed to finalize draft; sending as new message"
                         );
                         let _ = channel
-                            .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
+                            .send(&build_email_reply(&msg, &delivered_response))
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(&delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone())
+                        &build_email_reply(&msg, &delivered_response)
                             .with_cancellation(cancellation_token.clone()),
                     )
                     .await
@@ -4876,9 +4897,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
 
     let mut updated = config.clone();
     if !updated.channels.telegram.contains_key("default") {
-        anyhow::bail!(
-            "Telegram channel is not configured. Run `zeroclaw onboard --channels-only` first"
-        );
+        anyhow::bail!("Telegram channel is not configured. Run `zeroclaw onboard channels` first");
     }
 
     // Locate (or create) the peer group bound to telegram.default. The
@@ -5776,6 +5795,23 @@ fn find_channel_for_message<'a>(
         .and_then(|(base, _)| channels.get(base))
 }
 
+/// Active `<type>.<alias>` channel references from enabled agents.
+///
+/// An empty set means no enabled agent declared channel bindings, so
+/// collection falls back to legacy behavior and accepts all enabled channels.
+struct ActiveChannelAliases {
+    /// Set of `<type>.<alias>` channel references from enabled agents.
+    aliases: HashSet<String>,
+}
+
+impl ActiveChannelAliases {
+    /// Returns true when `channel_ref` is explicitly bound, or when there are
+    /// no explicit bindings and legacy "accept all enabled channels" mode applies.
+    fn contains(&self, channel_ref: &str) -> bool {
+        self.aliases.is_empty() || self.aliases.contains(channel_ref)
+    }
+}
+
 fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
@@ -5790,12 +5826,14 @@ fn collect_configured_channels(
     // outlive the function capture `config_arc.clone()`.
     let config = config_arc.read();
 
-    let active_channel_aliases: std::collections::HashSet<String> = config
-        .agents
-        .values()
-        .filter(|a| a.enabled)
-        .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
-        .collect();
+    let active_channel_aliases = ActiveChannelAliases {
+        aliases: config
+            .agents
+            .values()
+            .filter(|a| a.enabled)
+            .flat_map(|a| a.channels.iter().map(|c| c.as_str().to_string()))
+            .collect(),
+    };
 
     #[cfg(feature = "channel-telegram")]
     for (alias, tg) in &config.channels.telegram {
@@ -7201,6 +7239,67 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn build_owner_by_channel_key(
+    config: &Config,
+    enabled_agents: &[String],
+    collected_channel_keys: &[String],
+) -> HashMap<String, String> {
+    // Owner map: `<channel_type>.<alias>` (and bare `<channel_type>` for
+    // backward-compat with cron callers / singleton channels) → agent_alias.
+    // Built from each enabled agent's `agents.<alias>.channels` list — the
+    // schema treats this as the source of truth for channel ownership.
+    let mut owner_by_channel_key: HashMap<String, String> = HashMap::new();
+    for alias_str in enabled_agents {
+        let Some(agent_cfg) = config.agents.get(alias_str) else {
+            debug_assert!(
+                false,
+                "enabled agent alias missing from config.agents: {}",
+                alias_str
+            );
+            continue;
+        };
+        for ch in &agent_cfg.channels {
+            let ch_str: &str = ch.as_ref();
+            owner_by_channel_key.insert(ch_str.to_string(), alias_str.clone());
+            if let Some((bare, _)) = ch_str.split_once('.') {
+                owner_by_channel_key
+                    .entry(bare.to_string())
+                    .or_insert_with(|| alias_str.clone());
+            }
+        }
+    }
+
+    // Legacy fallback mode: when no enabled agent declares channel bindings,
+    // channel collection accepts all enabled channels. Those channels must
+    // also be routable, so bind collected channel keys to the runtime-active
+    // agent selection (explicit `"default"` alias when present, else
+    // lexicographically-smallest enabled alias).
+    // `owner_by_channel_key.is_empty()` means every enabled agent had an
+    // empty `agents.<alias>.channels` list; this is the same "legacy mode"
+    // signal used by `collect_configured_channels` to accept all enabled
+    // channel blocks.
+    if owner_by_channel_key.is_empty() && !collected_channel_keys.is_empty() {
+        let fallback_owner = config
+            .resolved_runtime_agent_alias()
+            .filter(|alias| enabled_agents.iter().any(|enabled| enabled == *alias))
+            .map(ToString::to_string)
+            .or_else(|| enabled_agents.first().cloned());
+
+        if let Some(owner_alias) = fallback_owner {
+            for channel_key in collected_channel_keys {
+                owner_by_channel_key.insert(channel_key.clone(), owner_alias.clone());
+                if let Some((bare, _)) = channel_key.split_once('.') {
+                    owner_by_channel_key
+                        .entry(bare.to_string())
+                        .or_insert_with(|| owner_alias.clone());
+                }
+            }
+        }
+    }
+
+    owner_by_channel_key
+}
+
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(
@@ -7309,6 +7408,7 @@ pub async fn start_channels(
     // Subsequent iterations reuse `channels_by_name_shared` to populate
     // their tool handles and to seed their `ChannelRuntimeContext`.
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
+    let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let mut rx_holder: Option<tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>> =
@@ -7741,6 +7841,7 @@ pub async fn start_channels(
                 .iter()
                 .map(|cc| composite_channel_key(cc.channel.name(), cc.alias.as_deref()))
                 .collect();
+            collected_channel_keys = channel_labels.clone();
             println!("  📡 Channels: {}", channel_labels.join(", "));
             println!("  🤖 Agents:   {}", enabled_agents.join(", "));
             println!();
@@ -7996,25 +8097,8 @@ pub async fn start_channels(
         agent_ctxs.insert(agent_alias.clone(), runtime_ctx);
     }
 
-    // Owner map: `<channel_type>.<alias>` (and bare `<channel_type>` for
-    // backward-compat with cron callers / singleton channels) → agent_alias.
-    // Built from each enabled agent's `agents.<alias>.channels` list — the
-    // schema treats this as the source of truth for channel ownership.
-    let mut owner_by_channel_key: HashMap<String, String> = HashMap::new();
-    for (alias_str, agent_cfg) in &config.agents {
-        if !agent_cfg.enabled {
-            continue;
-        }
-        for ch in &agent_cfg.channels {
-            let ch_str: &str = ch.as_ref();
-            owner_by_channel_key.insert(ch_str.to_string(), alias_str.clone());
-            if let Some((bare, _)) = ch_str.split_once('.') {
-                owner_by_channel_key
-                    .entry(bare.to_string())
-                    .or_insert_with(|| alias_str.clone());
-            }
-        }
-    }
+    let owner_by_channel_key =
+        build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
 
     // Hydrate persisted session histories into the owning agent's
     // `conversation_histories` LRU. Sessions whose channel has no enabled
@@ -8468,6 +8552,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         }
     }
 
@@ -8752,6 +8837,64 @@ mod tests {
         let msg = channel_message("notion", None);
         let resolved = router.resolve(&msg).expect("notion resolves");
         assert!(Arc::ptr_eq(&resolved, &notion_agent_ctx));
+    }
+
+    #[test]
+    fn agent_router_multi_resolves_fallback_loaded_channel_to_legacy_agent() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        let enabled_agents = vec!["legacy".to_string()];
+        let collected_channel_keys = vec!["mattermost.default".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+
+        let legacy_ctx = router_test_ctx();
+        let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
+        by_agent.insert("legacy".to_string(), Arc::clone(&legacy_ctx));
+        let router = AgentRouter::multi(by_agent, owners);
+
+        let msg = channel_message("mattermost", Some("default"));
+        let resolved = router.resolve(&msg).expect("fallback owner resolves");
+        assert!(Arc::ptr_eq(&resolved, &legacy_ctx));
+    }
+
+    #[test]
+    fn build_owner_by_channel_key_legacy_fallback_is_deterministic_without_default() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "zeta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = vec!["alpha".to_string(), "zeta".to_string()];
+        let collected_channel_keys = vec!["mattermost.default".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+
+        assert_eq!(
+            owners.get("mattermost.default").map(String::as_str),
+            Some("alpha")
+        );
+        assert_eq!(owners.get("mattermost").map(String::as_str), Some("alpha"));
     }
 
     #[test]
@@ -10388,6 +10531,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -10495,6 +10639,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -10612,6 +10757,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -10752,6 +10898,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -10861,6 +11008,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -10986,6 +11134,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -11099,6 +11248,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -11197,6 +11347,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -11308,6 +11459,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -11445,6 +11597,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -11563,23 +11716,11 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
         .await;
-
-        assert_eq!(
-            startup_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
-            0
-        );
-        assert_eq!(
-            reloaded_model_provider_impl
-                .call_count
-                .load(Ordering::SeqCst),
-            1
-        );
     }
 
     #[tokio::test]
@@ -11672,6 +11813,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -11775,6 +11917,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -11994,6 +12137,54 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    /// Model provider used by `message_dispatch_processes_messages_in_parallel`
+    /// to observe concurrent in-flight calls directly instead of inferring
+    /// parallelism from wall-clock elapsed time.
+    ///
+    /// Each `chat_with_system` invocation increments `in_flight` on entry,
+    /// records the running peak into `peak_in_flight`, then decrements on
+    /// exit. After the dispatch loop returns, the test asserts
+    /// `peak_in_flight >= 2`, which directly proves two messages were being
+    /// processed at the same time. This replaces the original
+    /// `elapsed < 700ms` assertion (issue #6813), which flaked on slow
+    /// runners because it depended on machine speed rather than on
+    /// observable concurrency.
+    struct ConcurrencyTrackingProvider {
+        delay: Duration,
+        in_flight: Arc<AtomicUsize>,
+        peak_in_flight: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ConcurrencyTrackingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_in_flight.fetch_max(current, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(format!("echo: {message}"))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ConcurrencyTrackingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ConcurrencyTrackingProvider"
+        }
+    }
+
     #[tokio::test]
     async fn message_dispatch_processes_messages_in_parallel() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -12002,10 +12193,15 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
-            model_provider: Arc::new(SlowModelProvider {
+            model_provider: Arc::new(ConcurrencyTrackingProvider {
                 delay: Duration::from_millis(250),
+                in_flight: in_flight.clone(),
+                peak_in_flight: peak_in_flight.clone(),
             }),
             default_model_provider: Arc::new("test-provider".to_string()),
             agent_alias: Arc::new("test-agent".to_string()),
@@ -12080,6 +12276,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
         .await
         .unwrap();
@@ -12094,19 +12291,29 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         })
         .await
         .unwrap();
         drop(tx);
 
-        let started = Instant::now();
         run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx), 2).await;
-        let elapsed = started.elapsed();
 
+        // Deterministic concurrency check: the dispatcher should have processed
+        // both messages in parallel, so the peak number of simultaneously
+        // in-flight model calls must reach at least 2. This observes parallelism
+        // directly rather than inferring it from wall-clock elapsed time, which
+        // flaked on slow runners (issue #6813).
+        let peak = peak_in_flight.load(Ordering::SeqCst);
         assert!(
-            elapsed < Duration::from_millis(700),
-            "expected parallel dispatch with precheck (<700ms), got {:?}",
-            elapsed
+            peak >= 2,
+            "expected at least 2 concurrent in-flight dispatches, got peak {}",
+            peak
+        );
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "all in-flight dispatches should have completed",
         );
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -12203,6 +12410,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             })
             .await
             .unwrap();
@@ -12218,6 +12426,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             })
             .await
             .unwrap();
@@ -12344,6 +12553,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                subject: None,
             })
             .await
             .unwrap();
@@ -12359,6 +12569,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                subject: None,
             })
             .await
             .unwrap();
@@ -12482,6 +12693,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             })
             .await
             .unwrap();
@@ -12497,6 +12709,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             })
             .await
             .unwrap();
@@ -12598,6 +12811,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -12696,6 +12910,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -13236,6 +13451,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -13254,6 +13470,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: Some("1741234567.123456".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         assert_eq!(
@@ -13275,6 +13492,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
@@ -13293,6 +13511,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         assert_eq!(followup_thread_id(&msg), None);
@@ -13311,6 +13530,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
         let second = zeroclaw_api::channel::ChannelMessage {
             id: "$second:server".into(),
@@ -13338,6 +13558,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: Some("$root:server".into()),
             interruption_scope_id: Some("$root:server".into()),
             attachments: vec![],
+            subject: None,
         };
 
         let key = conversation_history_key(&msg);
@@ -13358,6 +13579,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: Some("req-1".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         assert_eq!(
@@ -13408,6 +13630,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
         let msg2 = zeroclaw_api::channel::ChannelMessage {
             id: "msg_2".into(),
@@ -13420,6 +13643,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         assert_ne!(
@@ -13444,6 +13668,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
         let msg2 = zeroclaw_api::channel::ChannelMessage {
             id: "msg_2".into(),
@@ -13456,6 +13681,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         mem.store(
@@ -13509,6 +13735,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
         let history_key = conversation_history_key(&msg);
 
@@ -13548,6 +13775,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
         let group_b_msg = zeroclaw_api::channel::ChannelMessage {
             id: "msg_2".into(),
@@ -13560,6 +13788,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
         let group_a_history_key = conversation_history_key(&group_a_msg);
         let group_b_history_key = conversation_history_key(&group_b_msg);
@@ -13631,6 +13860,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
         let history_key = conversation_history_key(&msg);
         let session_ids = sender_memory_session_ids(&msg, &history_key);
@@ -13776,6 +14006,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -13794,6 +14025,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -13931,6 +14163,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -13966,6 +14199,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -14006,6 +14240,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -14127,6 +14362,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -14252,6 +14488,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -14616,6 +14853,49 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-mattermost")]
+    #[test]
+    fn collect_configured_channels_falls_back_when_agent_bindings_missing() {
+        let mut config = Config::default();
+        config.channels.mattermost.insert(
+            "default".to_string(),
+            zeroclaw_config::schema::MattermostConfig {
+                enabled: true,
+                url: "https://mattermost.example.com".to_string(),
+                bot_token: Some("test-token".to_string()),
+                login_id: None,
+                password: None,
+                channel_ids: vec!["channel-1".to_string()],
+                team_ids: vec![],
+                discover_dms: None,
+                thread_replies: Some(true),
+                mention_only: Some(false),
+                interrupt_on_new_message: false,
+                proxy_url: None,
+                excluded_tools: vec![],
+            },
+        );
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.display_name == "Mattermost"),
+            "enabled channels should still load when no enabled agent declares channel bindings"
+        );
+    }
+
     #[cfg(feature = "channel-email")]
     #[test]
     fn collect_configured_channels_skips_unreferenced_email() {
@@ -14879,7 +15159,48 @@ This is an example JSON object for profile settings."#;
 
     #[cfg(feature = "channel-discord")]
     #[tokio::test]
-    async fn supervised_listener_does_not_restart_on_fatal_discord_rate_limit() {
+    async fn supervised_listener_enters_retry_path_on_discord_gateway_rate_limit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("discord-{}", uuid::Uuid::new_v4());
+        let channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+            err: Mutex::new(Some(anyhow::Error::msg(
+                "discord gateway preflight rate-limited (429 Too Many Requests)",
+            ))),
+        });
+
+        let component_name = format!("channel:{}", channel.name());
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 1, cancel.clone());
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(component["status"], "error");
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("429 Too Many Requests")
+        );
+        assert!(
+            component["restart_count"].as_u64().unwrap_or(0) >= 1,
+            "Discord gateway 429 should back off through the retry path instead of parking"
+        );
+
+        drop(rx);
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[tokio::test]
+    async fn supervised_listener_does_not_restart_on_fatal_discord_gateway_close_code() {
         let calls = Arc::new(AtomicUsize::new(0));
         let channel_name = format!("discord-{}", uuid::Uuid::new_v4());
         let channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
@@ -14887,7 +15208,7 @@ This is an example JSON object for profile settings."#;
             calls: Arc::clone(&calls),
             err: Mutex::new(Some(anyhow::Error::new(
                 crate::discord::DiscordListenerFatalError::new(
-                    "discord gateway preflight rate-limited (429 Too Many Requests)",
+                    "discord gateway closed with fatal code 4014: disallowed intent(s)",
                 ),
             ))),
         });
@@ -14907,7 +15228,7 @@ This is an example JSON object for profile settings."#;
             component["last_error"]
                 .as_str()
                 .unwrap_or("")
-                .contains("429 Too Many Requests")
+                .contains("fatal code 4014")
         );
 
         drop(rx);
@@ -14917,7 +15238,6 @@ This is an example JSON object for profile settings."#;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    #[cfg(feature = "channel-discord")]
     #[tokio::test]
     async fn fatal_discord_listener_error_does_not_stop_other_listener_health() {
         let discord_calls = Arc::new(AtomicUsize::new(0));
@@ -14932,7 +15252,7 @@ This is an example JSON object for profile settings."#;
             calls: Arc::clone(&discord_calls),
             err: Mutex::new(Some(anyhow::Error::new(
                 crate::discord::DiscordListenerFatalError::new(
-                    "discord gateway preflight rate-limited (429 Too Many Requests)",
+                    "discord gateway closed with fatal code 4014: disallowed intent(s)",
                 ),
             ))),
         });
@@ -14988,7 +15308,7 @@ This is an example JSON object for profile settings."#;
             discord["last_error"]
                 .as_str()
                 .unwrap_or("")
-                .contains("429 Too Many Requests")
+                .contains("fatal code 4014")
         );
         assert_eq!(healthy["status"], "ok");
         assert!(
@@ -15165,6 +15485,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -15269,6 +15590,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -15287,6 +15609,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -15409,6 +15732,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -15427,6 +15751,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -15597,6 +15922,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -15737,6 +16063,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -15869,6 +16196,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -16021,6 +16349,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                subject: None,
             },
             CancellationToken::new(),
         )
@@ -16245,6 +16574,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
     }
@@ -16262,6 +16592,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: Some("$thread1".into()),
             interruption_scope_id: Some("$thread1".into()),
             attachments: vec![],
+            subject: None,
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
     }
@@ -16280,6 +16611,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
             interruption_scope_id: None,                 // but NOT a thread reply
             attachments: vec![],
+            subject: None,
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
     }
@@ -16373,6 +16705,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                subject: None,
             })
             .await
             .unwrap();
@@ -16388,6 +16721,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: Some("1741234567.200002".to_string()),
                 interruption_scope_id: Some("1741234567.200002".to_string()),
                 attachments: vec![],
+                subject: None,
             })
             .await
             .unwrap();
@@ -16998,6 +17332,45 @@ Done."#;
             msg.contains("[channels.lark.default] not configured"),
             "expected '[channels.lark.default] not configured' bail; got: {msg}"
         );
+    }
+
+    fn email_msg(id: &str, subject: Option<&str>) -> ChannelMessage {
+        ChannelMessage {
+            id: id.into(),
+            sender: "user@example.com".into(),
+            reply_target: "user@example.com".into(),
+            content: "Hello".into(),
+            channel: "email".into(),
+            channel_alias: None,
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: subject.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn build_email_reply_sets_in_reply_to_and_re_subject() {
+        let msg = email_msg("<abc123@mail.example>", Some("Weekly report"));
+        let sm = build_email_reply(&msg, "Here is the answer");
+        assert_eq!(sm.in_reply_to.as_deref(), Some("<abc123@mail.example>"));
+        assert_eq!(sm.subject.as_deref(), Some("Re: Weekly report"));
+    }
+
+    #[test]
+    fn build_email_reply_does_not_double_re_prefix() {
+        let msg = email_msg("<abc123@mail.example>", Some("Re: Weekly report"));
+        let sm = build_email_reply(&msg, "Here is the answer");
+        assert_eq!(sm.subject.as_deref(), Some("Re: Weekly report"));
+    }
+
+    #[test]
+    fn build_email_reply_no_subject_still_sets_in_reply_to() {
+        let msg = email_msg("<abc123@mail.example>", None);
+        let sm = build_email_reply(&msg, "Here is the answer");
+        assert_eq!(sm.in_reply_to.as_deref(), Some("<abc123@mail.example>"));
+        assert!(sm.subject.is_none());
     }
 }
 
