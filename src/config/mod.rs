@@ -102,6 +102,7 @@ mod tests {
             proxy_url: None,
             approval_timeout_secs: 120,
             excluded_tools: vec![],
+            default_target: None,
         };
 
         let discord = DiscordConfig {
@@ -120,6 +121,7 @@ mod tests {
             stall_timeout_secs: 0,
             approval_timeout_secs: 300,
             excluded_tools: vec![],
+            default_target: None,
         };
 
         let lark = LarkConfig {
@@ -139,6 +141,7 @@ mod tests {
             approval_timeout_secs: 120,
             inbound_prefix: true,
             per_user_session: false,
+            default_target: None,
         };
         let feishu = FeishuConfig {
             enabled: true,

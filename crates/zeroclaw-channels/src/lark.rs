@@ -4371,6 +4371,7 @@ mod tests {
             approval_timeout_secs: 120,
             inbound_prefix: true,
             per_user_session: false,
+            default_target: None,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -4399,6 +4400,7 @@ mod tests {
             approval_timeout_secs: 120,
             inbound_prefix: true,
             per_user_session: false,
+            default_target: None,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -4438,6 +4440,7 @@ mod tests {
             approval_timeout_secs: 120,
             inbound_prefix: true,
             per_user_session: false,
+            default_target: None,
         };
 
         let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]));
@@ -4469,6 +4472,7 @@ mod tests {
             approval_timeout_secs: 120,
             inbound_prefix: true,
             per_user_session: false,
+            default_target: None,
         };
 
         let ch =
@@ -4955,6 +4959,7 @@ mod tests {
             approval_timeout_secs: 120,
             inbound_prefix: true,
             per_user_session: false,
+            default_target: None,
         };
         let ch_feishu = LarkChannel::from_config(
             &feishu_cfg,
