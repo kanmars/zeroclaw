@@ -1,11 +1,26 @@
 {
   "active_plan": "/home/admin/workspace-public/kanmars/zeroclaw/.sisyphus/plans/kanmars.req.20260601.001.plan.md",
   "started_at": "2026-06-03T16:38:30.983Z",
+  "ended_at": "2026-06-04T01:30:00.000Z",
+  "elapsed_ms": 31889017,
   "session_ids": [
     "ses_17d7738baffeJMYqm6OuPk6VEZ"
   ],
   "plan_name": "kanmars.req.20260601.001.plan",
-  "status": "active",
+  "status": "completed",
+  "completion_summary": {
+    "tasks_total": 18,
+    "tasks_completed": 18,
+    "commits": ["be34225d", "ddf35809"],
+    "branch": "chore/consolidate-lark-feishu-to-upstream-schema",
+    "tests_passed": 1969,
+    "tests_failed": 0,
+    "lines_added": 1432,
+    "lines_deleted": 650,
+    "subagents_spawned": 7,
+    "pushed": false,
+    "next_action": "user-decides-push-vs-fast-forward"
+  },
   "session_origins": {
     "ses_17d7738baffeJMYqm6OuPk6VEZ": "direct"
   },
@@ -61,9 +76,11 @@
       "work_id": "kanmars-req-20260601-001-plan-5ecb5839",
       "active_plan": "/home/admin/workspace-public/kanmars/zeroclaw/.sisyphus/plans/kanmars.req.20260601.001.plan.md",
       "plan_name": "kanmars.req.20260601.001.plan",
-      "status": "active",
+      "status": "completed",
       "started_at": "2026-06-03T16:38:30.983Z",
-      "updated_at": "2026-06-03T16:58:28.454Z",
+      "ended_at": "2026-06-04T01:30:00.000Z",
+      "elapsed_ms": 31889017,
+      "updated_at": "2026-06-04T01:30:00.000Z",
       "session_ids": [
         "ses_17d7738baffeJMYqm6OuPk6VEZ"
       ],

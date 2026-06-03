@@ -418,3 +418,27 @@ The 5 parallel cleanup subagents missed `src/config/mod.rs` because plan §3 sco
 - Note: full `cargo check --features agent-runtime` fails on PRE-EXISTING `zeroclaw-channels` orchestrator feature-gating bugs (unconditional `pub use crate::{wati,webhook,wecom};` referencing `#[cfg(feature="...")]` modules). These are unrelated to Feishu cleanup and outside scope.
 
 **Lesson**: Future binary↔library refactor plans must enumerate `src/` re-export shims explicitly when deleting library types; "delete X" subagents that scan only `crates/` will leave binary-side re-exports as dangling references.
+
+---
+
+## T13 Execution Record (2026-06-04)
+
+Two atomic commits created on `chore/consolidate-lark-feishu-to-upstream-schema`, **NOT pushed** (per plan §0 — awaiting user sign-off after diff review).
+
+| Commit | Hash | Scope | Files | Net |
+|---|---|---|---|---|
+| A | `be34225d` | sisyphus state (plan + notepad + boulder) | 4 | +1373/-17 |
+| B | `ddf35809` | source consolidation (Lark/Feishu unification) | 7 | +59/-633 |
+
+**Commit B file list** (explicit, no `git add -A`):
+- `crates/zeroclaw-config/src/schema.rs` (−219)
+- `crates/zeroclaw-channels/src/lark.rs` (−287)
+- `crates/zeroclaw-channels/src/orchestrator/mod.rs` (−125)
+- `crates/zeroclaw-runtime/src/agent/loop_.rs` (cargo fmt only, +16/-16 churn)
+- `src/config/mod.rs` (+21)
+- `Cargo.toml` (−1, removed unused dep)
+- `CHANGELOG-next.md` (+23)
+
+**Verification**: `git status --porcelain` empty; `git log --oneline -3` shows both new commits on top of `167751c1` (previous HEAD). Pre-commit hooks ran normally (no `--no-verify` bypass).
+
+**Next**: gloria/atlas operator + reviewer +1 → `git push -u origin chore/consolidate-lark-feishu-to-upstream-schema` → open PR.
