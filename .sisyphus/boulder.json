@@ -1,22 +1,28 @@
 {
-  "active_plan": "/Users/kanmars/workspace/kanmars_zeroclaw_github/.sisyphus/plans/kanmars.req.20260522.001.plan.md",
-  "started_at": "2026-05-22T15:47:05.063Z",
+  "active_plan": "/home/admin/workspace-public/kanmars/zeroclaw/.sisyphus/plans/kanmars.req.20260601.001.plan.md",
+  "started_at": "2026-06-03T16:38:30.983Z",
   "session_ids": [
-    "ses_1afe42dc8ffecTDB27IqREUtw4"
+    "ses_17d7738baffeJMYqm6OuPk6VEZ"
   ],
-  "plan_name": "kanmars.req.20260522.001.plan",
+  "plan_name": "kanmars.req.20260601.001.plan",
   "status": "active",
   "session_origins": {
-    "ses_1afe42dc8ffecTDB27IqREUtw4": "start-work"
+    "ses_17d7738baffeJMYqm6OuPk6VEZ": "direct"
   },
-  "task_sessions": {},
-  "active_work_id": "kanmars.req.20260523.001.plan",
-  "active_plan": "/Users/kanmars/workspace/kanmars_zeroclaw_github/.sisyphus/plans/kanmars.req.20260523.001.plan.md",
-  "started_at": "2026-05-23T01:13:00.000Z",
-  "session_ids": [
-    "ses_1afe42dc8ffecTDB27IqREUtw4"
-  ],
-  "plan_name": "kanmars.req.20260523.001.plan",
+  "task_sessions": {
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "**Lark/Feishu schema consolidation**: `[channels.feishu.<alias>]` removed as V3 first-class; folds to `[channels.lark.<alias>]` with `use_feishu = true` via existing V2→V3 migration",
+      "session_id": "ses_17194d800ffeI5jK2ess5hZ6Pf",
+      "agent": "Sisyphus-Junior",
+      "category": "writing",
+      "updated_at": "2026-06-03T16:58:28.454Z",
+      "started_at": "2026-06-03T16:58:28.454Z",
+      "status": "running"
+    }
+  },
+  "active_work_id": "kanmars-req-20260601-001-plan-5ecb5839",
   "baseline_commit": "045b60ac67d7e24579b53985efe192e6baabe761",
   "baseline_branch": "kanmars_main (post 0522.001 merge)",
   "target_branch": "feat/model-context-window-inheritance",
@@ -31,7 +37,53 @@
       "merged_at_approx": "2026-05-23 (manual merge by user)"
     }
   ],
-  "status": "completed",
-  "ended_at": "2026-05-23T01:55:00.000Z",
-  "updated_at": "2026-05-23T01:55:00.000Z"
+  "updated_at": "2026-06-03T16:58:28.454Z",
+  "agent": "atlas",
+  "schema_version": 2,
+  "works": {
+    "kanmars.req.20260523.001.plan-legacy": {
+      "work_id": "kanmars.req.20260523.001.plan-legacy",
+      "active_plan": "/Users/kanmars/workspace/kanmars_zeroclaw_github/.sisyphus/plans/kanmars.req.20260523.001.plan.md",
+      "plan_name": "kanmars.req.20260523.001.plan",
+      "status": "completed",
+      "started_at": "2026-05-23T01:13:00.000Z",
+      "ended_at": "2026-05-23T01:55:00.000Z",
+      "updated_at": "2026-05-23T01:55:00.000Z",
+      "session_ids": [
+        "ses_1afe42dc8ffecTDB27IqREUtw4"
+      ],
+      "session_origins": {
+        "ses_1afe42dc8ffecTDB27IqREUtw4": "direct"
+      },
+      "task_sessions": {}
+    },
+    "kanmars-req-20260601-001-plan-5ecb5839": {
+      "work_id": "kanmars-req-20260601-001-plan-5ecb5839",
+      "active_plan": "/home/admin/workspace-public/kanmars/zeroclaw/.sisyphus/plans/kanmars.req.20260601.001.plan.md",
+      "plan_name": "kanmars.req.20260601.001.plan",
+      "status": "active",
+      "started_at": "2026-06-03T16:38:30.983Z",
+      "updated_at": "2026-06-03T16:58:28.454Z",
+      "session_ids": [
+        "ses_17d7738baffeJMYqm6OuPk6VEZ"
+      ],
+      "session_origins": {
+        "ses_17d7738baffeJMYqm6OuPk6VEZ": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "**Lark/Feishu schema consolidation**: `[channels.feishu.<alias>]` removed as V3 first-class; folds to `[channels.lark.<alias>]` with `use_feishu = true` via existing V2→V3 migration",
+          "session_id": "ses_17194d800ffeI5jK2ess5hZ6Pf",
+          "agent": "Sisyphus-Junior",
+          "category": "writing",
+          "updated_at": "2026-06-03T16:58:28.454Z",
+          "started_at": "2026-06-03T16:58:28.454Z",
+          "status": "running"
+        }
+      }
+    }
+  }
 }
