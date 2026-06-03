@@ -640,10 +640,10 @@ pub struct LarkChannel {
     /// per-chat sessions. When `true`, [`Self::resolve_sender`] returns the
     /// sender's `open_id` (falling back to `chat_id` when absent or empty)
     /// so the agent loop keys session state on the human, not the room.
-    /// Constructor default: `false`. Lifted to `LarkConfig`/`FeishuConfig`
+    /// Constructor default: `false`. Lifted to `LarkConfig`
     /// in C20 via the [`Self::with_per_user_session`] builder; the
     /// orchestrator chains `.with_per_user_session(cfg.per_user_session)`
-    /// after [`Self::from_lark_config`] / [`Self::from_feishu_config`].
+    /// after [`Self::from_config`].
     per_user_session: bool,
     /// Controls whether the 3 inbound message handler sites prepend the
     /// Chinese metadata prefix ("本消息通过飞书渠道发送...") to the user's
@@ -651,10 +651,10 @@ pub struct LarkChannel {
     /// is `true` (matches the historical always-on runtime behavior); set
     /// `false` to deliver raw inbound text to the agent loop.
     ///
-    /// Lifted to `LarkConfig`/`FeishuConfig` in C20 via the
+    /// Lifted to `LarkConfig` in C20 via the
     /// [`Self::with_inbound_prefix`] builder; the orchestrator chains
     /// `.with_inbound_prefix(cfg.inbound_prefix)` after the from-config
-    /// constructors.
+    /// constructor.
     inbound_prefix: bool,
     /// In-flight approval requests keyed by `approval_id` (UUID v4).
     /// Populated by `request_approval`, drained by `handle_card_action_event`.
@@ -797,7 +797,7 @@ impl LarkChannel {
 
     /// Configure the approval-card timeout (seconds) before auto-deny.
     ///
-    /// `LarkConfig`/`FeishuConfig` exposed this via the C20 schema lift; the
+    /// `LarkConfig` exposes this via the C20 schema lift; the
     /// builder is the canonical injection point for the orchestrator. Mirrors
     /// the `TelegramChannel::with_approval_timeout_secs` pattern.
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
@@ -817,7 +817,7 @@ impl LarkChannel {
     /// Configure whether group-chat sessions key on sender open_id (per-user)
     /// or on chat_id (shared). No effect on 1-on-1 chats (where chat_id is
     /// already unique per user-bot pair). The runtime field exists since C17;
-    /// C20 lifts it to `LarkConfig`/`FeishuConfig` and adds this builder.
+    /// C20 lifts it to `LarkConfig` and adds this builder.
     pub fn with_per_user_session(mut self, enabled: bool) -> Self {
         self.per_user_session = enabled;
         self
@@ -828,8 +828,7 @@ impl LarkChannel {
     /// on every call (SINGLE SOURCE OF TRUTH for authorized senders;
     /// reloading `Config` reflects in the next inbound message without a
     /// daemon restart). Used by the orchestrator after
-    /// [`Self::from_feishu_config`] / [`Self::from_lark_config`] which
-    /// default to `("", empty resolver)`.
+    /// [`Self::from_config`] which defaults to `("", empty resolver)`.
     pub fn with_peer_resolver(
         mut self,
         alias: impl Into<String>,
@@ -865,48 +864,6 @@ impl LarkChannel {
         ch.receive_mode = config.receive_mode.clone();
         ch.proxy_url = config.proxy_url.clone();
         ch
-    }
-
-    /// Constructor-only build from `LarkConfig`.
-    ///
-    /// Deliberately ignores the C20 schema fields (`stream_mode`,
-    /// `draft_update_interval_ms`, `approval_timeout_secs`, `inbound_prefix`,
-    /// `per_user_session`) so the orchestrator's builder chain
-    /// (`.with_streaming(...)`, `.with_approval_timeout_secs(...)`, etc.)
-    /// remains the single source of truth for those runtime overrides.
-    pub fn from_lark_config(config: &zeroclaw_config::schema::LarkConfig) -> Self {
-        let platform = if config.use_feishu {
-            LarkPlatform::Feishu
-        } else {
-            LarkPlatform::Lark
-        };
-        Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            String::new(),
-            Arc::new(|| Vec::new()),
-            config.mention_only,
-            platform,
-        )
-    }
-
-    /// Constructor-only build from `FeishuConfig`. Mirror of
-    /// [`from_lark_config`] for the dedicated Feishu schema entry; same
-    /// constructor-default contract for the C20 schema fields (orchestrator
-    /// owns the runtime override via builder chain).
-    pub fn from_feishu_config(config: &zeroclaw_config::schema::FeishuConfig) -> Self {
-        Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            String::new(),
-            Arc::new(|| Vec::new()),
-            config.mention_only,
-            LarkPlatform::Feishu,
-        )
     }
 
     pub fn with_transcription(
@@ -1593,11 +1550,7 @@ impl LarkChannel {
     }
 
     /// Download an image from the Lark API and return an `[IMAGE:data:...]` marker string.
-    async fn download_image_as_marker(
-        &self,
-        message_id: &str,
-        image_key: &str,
-    ) -> Option<String> {
+    async fn download_image_as_marker(&self, message_id: &str, image_key: &str) -> Option<String> {
         let url = self.image_resource_url(message_id, image_key);
         let mut retried_token = false;
 
@@ -4484,151 +4437,6 @@ mod tests {
     }
 
     #[test]
-    fn lark_from_feishu_config_sets_feishu_platform() {
-        use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
-
-        let cfg = FeishuConfig {
-            enabled: true,
-            app_id: "cli_feishu_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
-            mention_only: false,
-            receive_mode: LarkReceiveMode::Webhook,
-            port: Some(9898),
-            proxy_url: None,
-            stream_mode: StreamMode::Off,
-            draft_update_interval_ms: 1000,
-            approval_timeout_secs: 120,
-            inbound_prefix: true,
-            per_user_session: false,
-        };
-
-        let ch = LarkChannel::from_feishu_config(&cfg);
-
-        assert_eq!(ch.api_base(), FEISHU_BASE_URL);
-        assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
-        assert_eq!(ch.name(), "feishu");
-    }
-
-    #[test]
-    fn lark_from_feishu_config_propagates_mention_only() {
-        use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
-
-        let cfg_true = FeishuConfig {
-            enabled: true,
-            app_id: "cli_feishu_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
-            mention_only: true,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-            stream_mode: StreamMode::Off,
-            draft_update_interval_ms: 1000,
-            approval_timeout_secs: 120,
-            inbound_prefix: true,
-            per_user_session: false,
-        };
-
-        let cfg_false = FeishuConfig {
-            mention_only: false,
-            ..cfg_true.clone()
-        };
-
-        let ch_true = LarkChannel::from_feishu_config(&cfg_true);
-        let ch_false = LarkChannel::from_feishu_config(&cfg_false);
-
-        assert!(
-            ch_true.mention_only,
-            "mention_only = true must propagate through from_feishu_config"
-        );
-        assert!(
-            !ch_false.mention_only,
-            "mention_only = false must propagate through from_feishu_config"
-        );
-    }
-
-    /// C20 lifted `per_user_session` into `LarkConfig`, but
-    /// `from_lark_config` deliberately does NOT read it — the orchestrator
-    /// chains `.with_per_user_session(cfg.per_user_session)` after the
-    /// constructor as the single source of truth (mirrors `with_streaming`
-    /// and `with_approval_timeout_secs` ownership). This test pins down
-    /// that contract so a future refactor can't silently start reading the
-    /// new schema field from inside `from_lark_config` (which would
-    /// double-apply when the orchestrator also calls the builder).
-    #[test]
-    fn lark_per_user_session_propagates_from_lark_config() {
-        use zeroclaw_config::schema::{LarkConfig, LarkReceiveMode};
-
-        let cfg = LarkConfig {
-            enabled: true,
-            app_id: "cli_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            mention_only: false,
-            use_feishu: false,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-            excluded_tools: vec![],
-            stream_mode: StreamMode::Off,
-            draft_update_interval_ms: 1000,
-            approval_timeout_secs: 120,
-            inbound_prefix: true,
-            per_user_session: false,
-        };
-
-        let ch = LarkChannel::from_lark_config(&cfg);
-        assert!(
-            !ch.per_user_session,
-            "from_lark_config must NOT read per_user_session from cfg; the orchestrator \
-             chains .with_per_user_session(cfg.per_user_session) as the single source \
-             of truth (see C20 design intent)"
-        );
-    }
-
-    /// Companion to [`lark_per_user_session_propagates_from_lark_config`]
-    /// for the `FeishuConfig` constructor path. Same constructor-defaults
-    /// contract: `from_feishu_config` ignores the C20 schema field; the
-    /// orchestrator's `.with_per_user_session(fs.per_user_session)` chain
-    /// owns the override.
-    #[test]
-    fn lark_per_user_session_propagates_from_feishu_config() {
-        use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
-
-        let cfg = FeishuConfig {
-            enabled: true,
-            app_id: "cli_feishu_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
-            mention_only: false,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-            stream_mode: StreamMode::Off,
-            draft_update_interval_ms: 1000,
-            approval_timeout_secs: 120,
-            inbound_prefix: true,
-            per_user_session: false,
-        };
-
-        let ch = LarkChannel::from_feishu_config(&cfg);
-        assert!(
-            !ch.per_user_session,
-            "from_feishu_config must NOT read per_user_session from cfg; the orchestrator \
-             chains .with_per_user_session(cfg.per_user_session) as the single source \
-             of truth (see C20 design intent)"
-        );
-    }
-
-    #[test]
     fn lark_resolve_sender_respects_per_user_session_flag() {
         let mut ch = LarkChannel::new(
             "a".into(),
@@ -4657,7 +4465,7 @@ mod tests {
 
     // C20: with_approval_timeout_secs builder overrides the 120-second
     // constructor default. The orchestrator chains this after the
-    // from-config constructor with the value from `FeishuConfig`/`LarkConfig`.
+    // from-config constructor with the value from `LarkConfig`.
     #[test]
     fn lark_with_approval_timeout_secs_propagates_value() {
         let ch = make_channel().with_approval_timeout_secs(300);
@@ -4686,49 +4494,6 @@ mod tests {
         assert!(ch.per_user_session);
         let ch_off = make_channel().with_per_user_session(false);
         assert!(!ch_off.per_user_session);
-    }
-
-    // C20: `from_feishu_config` alone does NOT read the 5 new schema
-    // fields — it relies on `new_with_platform` constructor defaults so
-    // the orchestrator's builder chain remains the single source of truth
-    // for runtime overrides. This test pins down the constructor-default
-    // contract so future refactors can't silently start reading the config
-    // from inside `from_feishu_config` (which would double-apply when the
-    // orchestrator also calls the builders).
-    #[test]
-    fn lark_from_feishu_config_initializes_5_new_fields_to_constructor_defaults() {
-        use zeroclaw_config::schema::{FeishuConfig, LarkReceiveMode};
-
-        // Even when the FeishuConfig carries non-default values for the 5
-        // new schema fields, `from_feishu_config` ignores them. The orchestrator
-        // is responsible for chaining `.with_streaming(...)`, `.with_approval_*()`,
-        // `.with_inbound_prefix(...)`, `.with_per_user_session(...)`.
-        let cfg = FeishuConfig {
-            enabled: true,
-            app_id: "cli_feishu_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
-            mention_only: false,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-            stream_mode: StreamMode::Partial,
-            draft_update_interval_ms: 250,
-            approval_timeout_secs: 600,
-            inbound_prefix: false,
-            per_user_session: true,
-        };
-
-        let ch = LarkChannel::from_feishu_config(&cfg);
-
-        // All 5 fields must read from the constructor (not from `cfg`):
-        assert_eq!(ch.stream_mode, StreamMode::Off);
-        assert_eq!(ch.draft_update_interval_ms, 1000);
-        assert_eq!(ch.approval_timeout_secs, 120);
-        assert!(ch.inbound_prefix);
-        assert!(!ch.per_user_session);
     }
 
     // C20: structural check that `with_inbound_prefix(false)` flips the
@@ -4969,40 +4734,6 @@ mod tests {
         assert_eq!(
             ch_feishu.message_reaction_url("om_test_message_id"),
             "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/reactions"
-        );
-    }
-
-    #[test]
-    fn lark_image_resource_url_matches_region() {
-        // International (Lark)
-        let ch_lark = make_channel();
-        assert_eq!(
-            ch_lark.image_resource_url("om_test_msg", "img_abc123"),
-            "https://open.larksuite.com/open-apis/im/v1/messages/om_test_msg/resources/img_abc123?type=image"
-        );
-
-        // China (Feishu) — mirror lark_reaction_url_matches_region pattern
-        let feishu_cfg = zeroclaw_config::schema::FeishuConfig {
-            enabled: true,
-            app_id: "cli_app123".into(),
-            app_secret: "secret456".into(),
-            encrypt_key: None,
-            verification_token: Some("vtoken789".into()),
-            allowed_users: vec!["*".into()],
-            mention_only: false,
-            receive_mode: zeroclaw_config::schema::LarkReceiveMode::Webhook,
-            port: Some(9898),
-            proxy_url: None,
-            stream_mode: StreamMode::Off,
-            draft_update_interval_ms: 1000,
-            approval_timeout_secs: 120,
-            inbound_prefix: true,
-            per_user_session: false,
-        };
-        let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
-        assert_eq!(
-            ch_feishu.image_resource_url("om_test_msg", "img_abc123"),
-            "https://open.feishu.cn/open-apis/im/v1/messages/om_test_msg/resources/img_abc123?type=image"
         );
     }
 

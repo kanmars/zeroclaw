@@ -83,6 +83,29 @@ v0.8.0 turns ZeroClaw from a single-agent daemon into a true multi-agent host. O
   `model.max_context_window` value (which is the intended use case of this
   feature).
 
+- **channels/lark**: Consolidated Lark and Feishu onto the unified
+  `[channels.lark.<alias>]` schema. The fork-private `[channels.feishu.<alias>]`
+  block is no longer a V3 first-class entry; existing `config.toml` files
+  containing it are auto-folded to `[channels.lark.<alias>]` with
+  `use_feishu = true` by the existing V2→V3 migration (a `.toml.backup-<ts>`
+  is written when committed via `zeroclaw config migrate`). **Operator action
+  required: none.** The 5 fork-added LarkChannel features (`stream_mode`,
+  `draft_update_interval_ms`, `approval_timeout_secs`, `inbound_prefix`,
+  `per_user_session`) remain available on `LarkConfig` and continue to be
+  configured under `[channels.lark.<alias>]`.
+
+  **Silent default change**: `LarkConfig.approval_timeout_secs` default value
+  shifts from `120` (the Feishu-specific historical value) to `300` (the
+  channel-wide default). Operators relying on the previous 2-minute window
+  must set `approval_timeout_secs = 120` explicitly.
+
+  **Silent bugfix**: `receive_mode` and `proxy_url` were previously ignored
+  for Lark/Feishu channels because the `from_feishu_config` and
+  `from_lark_config` wrappers used in the orchestrator dispatch path
+  silently dropped both fields. Consolidating onto the unified `from_config`
+  constructor honors them; operator-set values for these two fields now take
+  effect for the first time.
+
 ### Multi-Agent & Runtime
 
 The multi-agent epic (#6272) is the spine of this release:

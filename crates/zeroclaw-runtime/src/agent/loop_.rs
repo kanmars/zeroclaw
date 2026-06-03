@@ -3786,7 +3786,9 @@ pub async fn run(
                                 &config.pacing,
                                 agent.strict_tool_parsing,
                                 agent.max_tool_result_chars,
-                                agent.resolved_max_context_tokens(config.model_provider_for_agent(agent_alias)),
+                                agent.resolved_max_context_tokens(
+                                    config.model_provider_for_agent(agent_alias),
+                                ),
                                 None, // shared_budget
                                 None, // channel: CLI mode — uses prompt_cli
                                 None, // receipt_generator
@@ -4186,7 +4188,9 @@ pub async fn run(
                                     &config.pacing,
                                     agent.strict_tool_parsing,
                                     agent.max_tool_result_chars,
-                                    agent.resolved_max_context_tokens(config.model_provider_for_agent(agent_alias)),
+                                    agent.resolved_max_context_tokens(
+                                        config.model_provider_for_agent(agent_alias),
+                                    ),
                                     None, // shared_budget
                                     None, // channel: interactive CLI — uses prompt_cli
                                     None, // receipt_generator
@@ -4264,7 +4268,9 @@ pub async fn run(
                                 let mut compressor =
                                     crate::agent::context_compressor::ContextCompressor::new(
                                         agent.context_compression.clone(),
-                                        agent.resolved_max_context_tokens(config.model_provider_for_agent(agent_alias)),
+                                        agent.resolved_max_context_tokens(
+                                            config.model_provider_for_agent(agent_alias),
+                                        ),
                                     )
                                     .with_memory(mem.clone());
                                 let error_msg = format!("{e}");
@@ -4334,7 +4340,9 @@ pub async fn run(
                 {
                     let compressor = crate::agent::context_compressor::ContextCompressor::new(
                         agent.context_compression.clone(),
-                        agent.resolved_max_context_tokens(config.model_provider_for_agent(agent_alias)),
+                        agent.resolved_max_context_tokens(
+                            config.model_provider_for_agent(agent_alias),
+                        ),
                     )
                     .with_memory(mem.clone());
                     match compressor

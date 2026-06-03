@@ -5448,48 +5448,6 @@ fn build_channel_by_id(
                 anyhow::bail!("Lark channel requires the `channel-lark` feature");
             }
         }
-        "feishu" => {
-            #[cfg(feature = "channel-lark")]
-            {
-                let alias = "default".to_string();
-                let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                    let cfg_arc = config_arc.clone();
-                    let alias = alias.clone();
-                    Arc::new(move || cfg_arc.read().channel_external_peers("feishu", &alias))
-                };
-                if let Some(fs) = config.channels.feishu.get("default") {
-                    return Ok(Arc::new(
-                        LarkChannel::from_feishu_config(fs)
-                            .with_peer_resolver(alias, peer_resolver)
-                            .with_streaming(fs.stream_mode, fs.draft_update_interval_ms)
-                            .with_approval_timeout_secs(fs.approval_timeout_secs)
-                            .with_inbound_prefix(fs.inbound_prefix)
-                            .with_per_user_session(fs.per_user_session),
-                    ));
-                }
-                // Legacy: [channels.lark.default] with use_feishu = true.
-                let lk = config
-                    .channels
-                    .lark
-                    .get("default")
-                    .context("Feishu channel is not configured")?;
-                let lark_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                    let cfg_arc = config_arc.clone();
-                    Arc::new(move || cfg_arc.read().channel_external_peers("lark", "default"))
-                };
-                Ok(Arc::new(
-                    LarkChannel::from_config(lk, "default".to_string(), lark_peer_resolver)
-                        .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
-                        .with_approval_timeout_secs(lk.approval_timeout_secs)
-                        .with_inbound_prefix(lk.inbound_prefix)
-                        .with_per_user_session(lk.per_user_session),
-                ))
-            }
-            #[cfg(not(feature = "channel-lark"))]
-            {
-                anyhow::bail!("Feishu channel requires the `channel-lark` feature");
-            }
-        }
         "dingtalk" => {
             let dt = config
                 .channels
@@ -5849,7 +5807,7 @@ fn build_channel_by_id(
         }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, \
-            matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
+            matrix, whatsapp, qq, lark, dingtalk, wecom, wecom_ws, nextcloud_talk, wati, linq, \
             email, gmail_push, irc, twitter, mochat, imessage, line, voice-call"
         ),
     }
@@ -6740,36 +6698,8 @@ fn collect_configured_channels(
         });
     }
 
-    #[cfg(feature = "channel-lark")]
-    for (alias, fs) in &config.channels.feishu {
-        if !active_channel_aliases.contains(&format!("feishu.{alias}")) {
-            continue;
-        }
-        if !fs.enabled {
-            continue;
-        }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("feishu", &alias))
-        };
-        channels.push(ConfiguredChannel {
-            display_name: "Feishu",
-            alias: Some(alias.clone()),
-            channel: Arc::new(
-                LarkChannel::from_feishu_config(fs)
-                    .with_peer_resolver(alias.clone(), peer_resolver)
-                    .with_streaming(fs.stream_mode, fs.draft_update_interval_ms)
-                    .with_approval_timeout_secs(fs.approval_timeout_secs)
-                    .with_inbound_prefix(fs.inbound_prefix)
-                    .with_per_user_session(fs.per_user_session)
-                    .with_transcription(config.transcription.clone()),
-            ),
-        });
-    }
-
     #[cfg(not(feature = "channel-lark"))]
-    if !config.channels.lark.is_empty() || !config.channels.feishu.is_empty() {
+    if !config.channels.lark.is_empty() {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -8614,39 +8544,23 @@ pub async fn deliver_announcement(
         }
         #[cfg(feature = "channel-lark")]
         "lark" => {
-            let lk = config
-                .channels
-                .lark
-                .get(alias)
-                .ok_or_else(not_configured)?;
+            let lk = config.channels.lark.get(alias).ok_or_else(not_configured)?;
             // Q2=B: chain C20 builders so cron delivery honors per-deployment
             // stream_mode / approval_timeout / inbound_prefix / per_user_session.
             // Cron output is one-shot so most of these are no-ops today, but
             // wiring them now means future builder additions don't silently
             // miss this path (Atlas decision per gloria operator request).
-            let ch = LarkChannel::from_lark_config(lk)
+            let peer_resolver: std::sync::Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                std::sync::Arc::new(Vec::new);
+            let ch = LarkChannel::from_config(lk, alias.to_string(), peer_resolver)
                 .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                 .with_approval_timeout_secs(lk.approval_timeout_secs)
                 .with_inbound_prefix(lk.inbound_prefix)
                 .with_per_user_session(lk.per_user_session);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
-        #[cfg(feature = "channel-lark")]
-        "feishu" => {
-            let fs = config
-                .channels
-                .feishu
-                .get(alias)
-                .ok_or_else(not_configured)?;
-            let ch = LarkChannel::from_feishu_config(fs)
-                .with_streaming(fs.stream_mode, fs.draft_update_interval_ms)
-                .with_approval_timeout_secs(fs.approval_timeout_secs)
-                .with_inbound_prefix(fs.inbound_prefix)
-                .with_per_user_session(fs.per_user_session);
-            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
-        }
         #[cfg(not(feature = "channel-lark"))]
-        "lark" | "feishu" => {
+        "lark" => {
             anyhow::bail!("Lark/Feishu channel requires the `channel-lark` feature");
         }
         "wecom_ws" | "wecom-ws" => {
@@ -9048,7 +8962,6 @@ mod tests {
             "alias temperature must be returned, not runtime_defaults.temperature"
         );
     }
-
 
     #[test]
     fn agent_router_multi_routes_each_alias_to_its_owning_agent() {
@@ -17989,30 +17902,8 @@ Done."#;
 
     #[tokio::test]
     #[cfg(feature = "channel-lark")]
-    async fn deliver_announcement_routes_feishu_to_feishu_arm() {
-        // C22: Verify the "feishu.<alias>" channel string is routed to the
-        // feishu match arm (which bails with "[channels.feishu.<alias>] not
-        // configured" when no entry exists) and NOT to the `other =>
-        // bail!("unsupported delivery channel: ...")` fallthrough.
-        let config = zeroclaw_config::schema::Config::default();
-        let err = deliver_announcement(&config, "feishu.default", "oc_test_chat", None, "hi")
-            .await
-            .expect_err("expected feishu arm to bail because channel is not configured");
-        let msg = format!("{err:#}");
-        assert!(
-            !msg.contains("unsupported delivery channel"),
-            "feishu must route to feishu arm, not fall through; got: {msg}"
-        );
-        assert!(
-            msg.contains("[channels.feishu.default] not configured"),
-            "expected '[channels.feishu.default] not configured' bail; got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "channel-lark")]
     async fn deliver_announcement_routes_lark_to_lark_arm() {
-        // C22: Mirror of feishu test for "lark.<alias>" channel string.
+        // C22: Verify "lark.<alias>" channel string is routed to the lark arm.
         let config = zeroclaw_config::schema::Config::default();
         let err = deliver_announcement(&config, "lark.default", "oc_test_chat", None, "hi")
             .await

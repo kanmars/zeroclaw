@@ -3040,10 +3040,7 @@ impl AliasedAgentConfig {
     /// Returns the effective `max_context_tokens` for this agent.
     /// Priority: explicit `self.max_context_tokens` > `model_cfg.max_context_window` > `DEFAULT_MAX_CONTEXT_TOKENS` (32K).
     #[must_use]
-    pub fn resolved_max_context_tokens(
-        &self,
-        model_cfg: Option<&ModelProviderConfig>,
-    ) -> usize {
+    pub fn resolved_max_context_tokens(&self, model_cfg: Option<&ModelProviderConfig>) -> usize {
         if let Some(explicit) = self.max_context_tokens {
             return explicit;
         }
@@ -3195,10 +3192,7 @@ impl Config {
     /// `AliasedAgentConfig::resolved_max_context_tokens`. Returns
     /// `DEFAULT_MAX_CONTEXT_TOKENS` (32K) when the agent does not exist.
     #[must_use]
-    pub fn resolved_max_context_tokens_for_agent(
-        &self,
-        agent_alias: &str,
-    ) -> usize {
+    pub fn resolved_max_context_tokens_for_agent(&self, agent_alias: &str) -> usize {
         let Some(agent) = self.agents.get(agent_alias) else {
             return DEFAULT_MAX_CONTEXT_TOKENS;
         };
@@ -10223,10 +10217,6 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub lark: HashMap<String, LarkConfig>,
-    /// Feishu channel instances (`[channels.feishu.<alias>]`).
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    #[nested]
-    pub feishu: HashMap<String, FeishuConfig>,
     /// LINE Messaging API channel instances (`[channels.line.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -10527,7 +10517,6 @@ impl Default for ChannelsConfig {
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
             lark: HashMap::new(),
-            feishu: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
@@ -10584,16 +10573,6 @@ fn default_telegram_approval_timeout_secs() -> u64 {
 
 fn default_channel_approval_timeout_secs() -> u64 {
     300
-}
-
-/// Default approval-card timeout (seconds) for Lark/Feishu channels.
-///
-/// Matches the historical hard-coded value in `LarkChannel::new_with_platform`
-/// so existing deployments that omit `approval_timeout_secs` see byte-identical
-/// behavior. Operators wanting longer windows (e.g., 300s for asynchronous
-/// approval workflows) can override per channel.
-fn default_feishu_approval_timeout_secs() -> u64 {
-    120
 }
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
@@ -11760,9 +11739,10 @@ pub struct LarkConfig {
     /// Tuned to stay within Feishu's 5 QPS-per-message edit cap.
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
-    /// Approval card timeout in seconds before auto-deny. Default: `120`.
-    /// Matches the prior hard-coded value in `LarkChannel::new_with_platform`.
-    #[serde(default = "default_feishu_approval_timeout_secs")]
+    /// Approval card timeout in seconds before auto-deny. Default: `300`
+    /// (channel-wide default; previously `120` in the deprecated Feishu fork).
+    /// Operators wanting the prior 2-minute window must set `approval_timeout_secs = 120`.
+    #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
     /// When `false`, skip the Chinese inbound metadata prefix injection
     /// ("本消息通过飞书渠道发送...") at the 3 inbound message handler sites.
@@ -11885,84 +11865,6 @@ impl ChannelConfig for LineConfig {
     }
     fn desc() -> &'static str {
         "connect your LINE bot"
-    }
-}
-
-/// Feishu configuration for messaging integration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.feishu"]
-pub struct FeishuConfig {
-    /// Whether this channel is active (must be explicitly enabled). Default: false.
-    #[serde(default)]
-    pub enabled: bool,
-    /// App ID from Feishu developer console
-    pub app_id: String,
-    /// App Secret from Feishu developer console
-    #[secret]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub app_secret: String,
-    /// Encrypt key for webhook message decryption (optional)
-    #[serde(default)]
-    #[secret]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub encrypt_key: Option<String>,
-    /// Verification token for webhook validation (optional)
-    #[serde(default)]
-    #[secret]
-    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub verification_token: Option<String>,
-    /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
-    #[serde(default)]
-    pub allowed_users: Vec<String>,
-    /// When true, only respond to messages that @-mention the bot in groups.
-    /// Direct messages are always processed.
-    #[serde(default)]
-    pub mention_only: bool,
-    /// Event receive mode: "websocket" (default) or "webhook"
-    #[serde(default)]
-    pub receive_mode: LarkReceiveMode,
-    /// HTTP port for webhook mode only. Must be set when receive_mode = "webhook".
-    /// Not required (and ignored) for websocket mode.
-    #[serde(default)]
-    pub port: Option<u16>,
-    /// Per-channel proxy URL (http, https, socks5, socks5h).
-    /// Overrides the global `[proxy]` setting for this channel only.
-    #[serde(default)]
-    pub proxy_url: Option<String>,
-    /// Streaming mode for progressive draft updates. Default: `Off`.
-    /// Set to `"partial"` to enable incremental message editing as the LLM
-    /// streams tokens (mirrors `TelegramConfig.stream_mode`).
-    #[serde(default)]
-    pub stream_mode: StreamMode,
-    /// Minimum interval (ms) between draft message PATCH edits. Default: `1000`.
-    /// Tuned to stay within Feishu's 5 QPS-per-message edit cap.
-    #[serde(default = "default_draft_update_interval_ms")]
-    pub draft_update_interval_ms: u64,
-    /// Approval card timeout in seconds before auto-deny. Default: `120`.
-    /// Matches the prior hard-coded value in `LarkChannel::new_with_platform`.
-    #[serde(default = "default_feishu_approval_timeout_secs")]
-    pub approval_timeout_secs: u64,
-    /// When `false`, skip the Chinese inbound metadata prefix injection
-    /// ("本消息通过飞书渠道发送...") at the 3 inbound message handler sites.
-    /// Default: `true` (matches current always-on runtime behavior so existing
-    /// deployments don't see a behavior change).
-    #[serde(default = "default_true")]
-    pub inbound_prefix: bool,
-    /// When `true`, group-chat sessions key on sender open_id (per-user isolation).
-    /// When `false` (default), group-chat sessions share one conversation keyed
-    /// on chat_id. Has no effect on 1-on-1 chats (where chat_id is already
-    /// unique per user-bot pair).
-    #[serde(default)]
-    pub per_user_session: bool,
-}
-
-impl ChannelConfig for FeishuConfig {
-    fn name() -> &'static str {
-        "Feishu"
-    }
-    fn desc() -> &'static str {
-        "Feishu Bot"
     }
 }
 
@@ -16813,7 +16715,6 @@ auto_save = true
                 gmail_push: HashMap::new(),
                 irc: HashMap::new(),
                 lark: HashMap::new(),
-                feishu: HashMap::new(),
                 line: HashMap::new(),
                 dingtalk: HashMap::new(),
                 wecom: HashMap::new(),
@@ -17585,26 +17486,6 @@ default_temperature = 0.7
                 default_target: None,
             },
         );
-        config.channels.feishu.insert(
-            "default".to_string(),
-            FeishuConfig {
-                enabled: true,
-                app_id: "cli_feishu_123".into(),
-                app_secret: "feishu-secret".into(),
-                encrypt_key: Some("feishu-encrypt".into()),
-                verification_token: Some("feishu-verify".into()),
-                allowed_users: vec!["*".into()],
-                mention_only: false,
-                receive_mode: LarkReceiveMode::Websocket,
-                port: None,
-                proxy_url: None,
-                stream_mode: StreamMode::Off,
-                draft_update_interval_ms: 1000,
-                approval_timeout_secs: 120,
-                inbound_prefix: true,
-                per_user_session: false,
-            },
-        );
 
         config.providers.models.openrouter.insert(
             "worker".into(),
@@ -18149,7 +18030,6 @@ allowed_users = ["@u:matrix.org"]
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
             lark: HashMap::new(),
-            feishu: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
@@ -18577,7 +18457,6 @@ allowed_numbers = ["+1", "+2"]
             gmail_push: HashMap::new(),
             irc: HashMap::new(),
             lark: HashMap::new(),
-            feishu: HashMap::new(),
             line: HashMap::new(),
             dingtalk: HashMap::new(),
             wecom: HashMap::new(),
@@ -19671,26 +19550,6 @@ default_model = "legacy-model"
                 default_target: None,
             },
         );
-        config.channels.feishu.insert(
-            "default".to_string(),
-            FeishuConfig {
-                enabled: true,
-                app_id: "cli_feishu_123".into(),
-                app_secret: "feishu-secret".into(),
-                encrypt_key: Some("feishu-encrypt".into()),
-                verification_token: Some("feishu-verify".into()),
-                allowed_users: vec!["*".into()],
-                mention_only: false,
-                receive_mode: LarkReceiveMode::Websocket,
-                port: None,
-                proxy_url: None,
-                stream_mode: StreamMode::Off,
-                draft_update_interval_ms: 1000,
-                approval_timeout_secs: 120,
-                inbound_prefix: true,
-                per_user_session: false,
-            },
-        );
         config.save().await.unwrap();
 
         let loaded = Box::pin(Config::load_or_init()).await.unwrap();
@@ -20244,72 +20103,6 @@ allowed_users = ["user_alpha", "user_beta"]
         assert_eq!(group.channel, "lark");
         let usernames: Vec<&str> = group.external_peers.iter().map(|p| p.as_str()).collect();
         assert_eq!(usernames, vec!["user_alpha", "user_beta"]);
-    }
-
-    #[test]
-    async fn feishu_config_serde() {
-        let fc = FeishuConfig {
-            enabled: true,
-            app_id: "cli_feishu_123".into(),
-            app_secret: "secret_abc".into(),
-            encrypt_key: Some("encrypt_key".into()),
-            verification_token: Some("verify_token".into()),
-            allowed_users: vec!["user_123".into(), "user_456".into()],
-            mention_only: false,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            proxy_url: None,
-            stream_mode: StreamMode::Off,
-            draft_update_interval_ms: 1000,
-            approval_timeout_secs: 120,
-            inbound_prefix: true,
-            per_user_session: false,
-        };
-        let json = serde_json::to_string(&fc).unwrap();
-        let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.app_id, "cli_feishu_123");
-        assert_eq!(parsed.app_secret, "secret_abc");
-        assert_eq!(parsed.encrypt_key.as_deref(), Some("encrypt_key"));
-        assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
-        assert_eq!(parsed.allowed_users.len(), 2);
-    }
-
-    #[test]
-    async fn feishu_config_toml_roundtrip() {
-        let fc = FeishuConfig {
-            enabled: true,
-            app_id: "cli_feishu_123".into(),
-            app_secret: "secret_abc".into(),
-            encrypt_key: Some("encrypt_key".into()),
-            verification_token: Some("verify_token".into()),
-            allowed_users: vec!["*".into()],
-            mention_only: false,
-            receive_mode: LarkReceiveMode::Webhook,
-            port: Some(9898),
-            proxy_url: None,
-            stream_mode: StreamMode::Off,
-            draft_update_interval_ms: 1000,
-            approval_timeout_secs: 120,
-            inbound_prefix: true,
-            per_user_session: false,
-        };
-        let toml_str = toml::to_string(&fc).unwrap();
-        let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(parsed.app_id, "cli_feishu_123");
-        assert_eq!(parsed.app_secret, "secret_abc");
-        assert_eq!(parsed.receive_mode, LarkReceiveMode::Webhook);
-        assert_eq!(parsed.port, Some(9898));
-    }
-
-    #[test]
-    async fn feishu_config_deserializes_without_optional_fields() {
-        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
-        let parsed: FeishuConfig = serde_json::from_str(json).unwrap();
-        assert!(parsed.encrypt_key.is_none());
-        assert!(parsed.verification_token.is_none());
-        assert!(parsed.allowed_users.is_empty());
-        assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
-        assert!(parsed.port.is_none());
     }
 
     // ── LINE ──────────────────────────────────────────────────
