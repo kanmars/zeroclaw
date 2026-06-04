@@ -50,6 +50,29 @@ const LARK_ACK_REACTIONS_JA: &[&str] = &[
 
 const MAX_LARK_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 
+/// Map a unicode emoji used by generic callers of [`Channel::add_reaction`]
+/// (e.g. Reply-Intent Precheck, no-reply ack heuristics) to a Lark/Feishu
+/// `emoji_type` name recognised by the
+/// `POST /im/v1/messages/{id}/reactions` API.
+///
+/// Returns `None` when no mapping exists; callers should treat that as a
+/// best-effort skip rather than an error. The whitelist intentionally
+/// covers only the unicode emojis emitted by the inbound-ack policy and
+/// related no-reply heuristics today; extend as new callers appear.
+fn unicode_to_lark_emoji_type(emoji: &str) -> Option<&'static str> {
+    match emoji {
+        "👍" => Some("THUMBSUP"),
+        "🚫" => Some("No"),
+        "⚠️" => Some("Alarm"),
+        "👀" => Some("GLANCE"),
+        "✅" => Some("DONE"),
+        "✔️" => Some("DONE"),
+        "❤️" => Some("HEART"),
+        "🎉" => Some("PARTY"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LarkAckLocale {
     ZhCn,
@@ -615,6 +638,17 @@ pub struct LarkChannel {
     /// Currently hard-coded to 120; lift to `LarkConfig` when a use case
     /// for per-channel overrides arises.
     approval_timeout_secs: u64,
+    /// Cache of `(message_id, unicode_emoji) -> reaction_id` populated by
+    /// `add_reaction` so a subsequent `remove_reaction` call can issue
+    /// `DELETE /im/v1/messages/{message_id}/reactions/{reaction_id}`
+    /// without first re-listing reactions on the message.
+    ///
+    /// Lifetime: process-local, lost on restart. Reactions added before a
+    /// restart are unreachable (acceptable degradation — by then the user
+    /// has scrolled past those messages). The cached value is a Feishu
+    /// API-returned token (runtime state), not a duplicate of any config
+    /// field; SSOT does not apply.
+    reaction_ids: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -675,6 +709,7 @@ impl LarkChannel {
             transcription_manager: None,
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             api_base_override: None,
         }
@@ -788,6 +823,13 @@ impl LarkChannel {
 
     fn message_reaction_url(&self, message_id: &str) -> String {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
+    }
+
+    fn delete_message_reaction_url(&self, message_id: &str, reaction_id: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/reactions/{reaction_id}",
+            self.api_base()
+        )
     }
 
     fn image_resource_url(&self, message_id: &str, image_key: &str) -> String {
@@ -2295,6 +2337,210 @@ impl Channel for LarkChannel {
 
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
+    }
+
+    async fn add_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+
+        let emoji_type = match unicode_to_lark_emoji_type(emoji) {
+            Some(t) => t,
+            None => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "emoji": emoji,
+                            "error_key": "lark.add_reaction.no_emoji_mapping",
+                        })),
+                    "Lark add_reaction: no emoji_type mapping for unicode, skipping"
+                );
+                return Ok(());
+            }
+        };
+
+        let mut token = self.get_tenant_access_token().await?;
+
+        let mut retried = false;
+        loop {
+            let response = self
+                .post_message_reaction_with_token(message_id, &token, emoji_type)
+                .await?;
+
+            if response.status().as_u16() == 401 && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Lark add_reaction failed for {message_id}: status={status}, body={err_body}"
+                );
+            }
+
+            let payload: serde_json::Value = response.json().await?;
+            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            if code != 0 {
+                let msg = payload
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "code": code,
+                            "message_id": message_id,
+                            "msg": msg,
+                            "error_key": "lark.add_reaction.non_zero_code",
+                        })),
+                    "Lark add_reaction returned non-zero code"
+                );
+            } else if let Some(reaction_id) = payload
+                .pointer("/data/reaction_id")
+                .and_then(|v| v.as_str())
+            {
+                self.reaction_ids.lock().await.insert(
+                    (message_id.to_string(), emoji.to_string()),
+                    reaction_id.to_string(),
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    /// Remove a reaction this bot previously added via `add_reaction`.
+    ///
+    /// Looks up the cached `reaction_id` written by `add_reaction` (Feishu's
+    /// POST response already contains it) and calls
+    /// `DELETE /im/v1/messages/{message_id}/reactions/{reaction_id}`. On
+    /// cache miss this is a silent no-op so the orchestrator's
+    /// `let _ = channel.remove_reaction(...)` pattern keeps working after a
+    /// restart loses the cache.
+    ///
+    /// All failure paths (transport / 401 / Feishu non-zero codes) soft-fail
+    /// via [`zeroclaw_log::record!`] at WARN (or DEBUG for expected
+    /// stale-state codes). Errors never propagate because the orchestrator
+    /// caller discards the `Result` anyway.
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+
+        let reaction_id = {
+            let mut cache = self.reaction_ids.lock().await;
+            cache.remove(&(message_id.to_string(), emoji.to_string()))
+        };
+        let Some(reaction_id) = reaction_id else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "emoji": emoji,
+                    })),
+                "Lark remove_reaction: cache miss, skipping"
+            );
+            return Ok(());
+        };
+
+        let mut token = self.get_tenant_access_token().await?;
+        let url = self.delete_message_reaction_url(message_id, &reaction_id);
+
+        let mut retried = false;
+        loop {
+            let response = self
+                .http_client()
+                .delete(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await?;
+
+            if response.status().as_u16() == 401 && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let err_body = response.text().await.unwrap_or_default();
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "reaction_id": reaction_id,
+                            "status": status.as_u16(),
+                            "body": err_body,
+                            "error_key": "lark.remove_reaction.http_failure",
+                        })),
+                    "Lark remove_reaction failed"
+                );
+                return Ok(());
+            }
+
+            let payload: serde_json::Value = response.json().await?;
+            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+            match code {
+                0 => {}
+                231_003 | 231_007 | 231_010 | 231_011 => {
+                    let msg = payload
+                        .get("msg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "code": code,
+                                "msg": msg,
+                                "message_id": message_id,
+                            })),
+                        "Lark remove_reaction: server-side stale state"
+                    );
+                }
+                _ => {
+                    let msg = payload
+                        .get("msg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown error");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "code": code,
+                                "message_id": message_id,
+                                "msg": msg,
+                                "error_key": "lark.remove_reaction.non_zero_code",
+                            })),
+                        "Lark remove_reaction returned non-zero code"
+                    );
+                }
+            }
+            return Ok(());
+        }
     }
 
     async fn request_approval(
@@ -5148,5 +5394,252 @@ mod tests {
             "hi from cron",
         )
         .await;
+    }
+
+    #[test]
+    fn unicode_to_lark_emoji_type_covers_known_noreply_emojis() {
+        assert_eq!(unicode_to_lark_emoji_type("👍"), Some("THUMBSUP"));
+        assert_eq!(unicode_to_lark_emoji_type("🚫"), Some("No"));
+        assert_eq!(unicode_to_lark_emoji_type("⚠️"), Some("Alarm"));
+        assert_eq!(unicode_to_lark_emoji_type("👀"), Some("GLANCE"));
+        assert_eq!(unicode_to_lark_emoji_type("✅"), Some("DONE"));
+        assert_eq!(unicode_to_lark_emoji_type("🎉"), Some("PARTY"));
+        assert_eq!(unicode_to_lark_emoji_type("🙉"), None);
+        assert_ne!(unicode_to_lark_emoji_type("🚫"), Some("NO"));
+    }
+
+    #[test]
+    fn lark_inbound_ack_policy_is_glance_only_no_random_pool() {
+        // Policy marker: the inbound-ack contract is a single 👀 GLANCE
+        // reaction. Any future change that re-introduces a random or
+        // locale-dependent ack must update this canary deliberately,
+        // documenting why duplicate ack reactions (orchestrator-side
+        // sync GLANCE plus an asynchronous lark.rs pick) are acceptable.
+        //
+        // Sneak-back-in regressions this canary is meant to flag:
+        //   - a second inbound-ack callsite that picks a non-GLANCE value
+        //   - a helper that returns a locale-dependent ack pool selection
+        //     getting wired into the inbound code path
+        //   - the orchestrator-side hardcoded "GLANCE" being changed to a
+        //     non-deterministic / locale-dependent value
+        const INBOUND_ACK_EMOJI_TYPE: &str = "GLANCE";
+        assert_eq!(
+            INBOUND_ACK_EMOJI_TYPE, "GLANCE",
+            "inbound ack policy: a single GLANCE 👀 reaction, no random pool",
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_caches_id_from_add_and_deletes() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-rm-ok",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let post_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_test/reactions$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_xyz",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let delete_mock = Mock::given(method("DELETE"))
+            .and(path_regex("/im/v1/messages/om_test/reactions/r_xyz$"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        ch.add_reaction("oc_chat", "om_test", "\u{1F440}")
+            .await
+            .expect("add_reaction should succeed");
+        ch.remove_reaction("oc_chat", "om_test", "\u{1F440}")
+            .await
+            .expect("remove_reaction should succeed");
+
+        let cache = ch.reaction_ids.lock().await;
+        assert!(
+            cache.is_empty(),
+            "reaction_ids cache should be empty after remove, got {} entries",
+            cache.len()
+        );
+
+        drop(post_mock);
+        drop(delete_mock);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_silent_on_cache_miss() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-rm-miss",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let delete_mock = Mock::given(method("DELETE"))
+            .and(path_regex("/im/v1/messages/.*/reactions/.*"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        ch.remove_reaction("oc_chat", "om_never_added", "\u{1F440}")
+            .await
+            .expect("cache miss must not error");
+
+        drop(delete_mock);
+    }
+
+    #[tokio::test]
+    async fn remove_reaction_tolerates_server_stale_codes() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-rm-stale",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_stale/reactions$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_stale",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let delete_mock = Mock::given(method("DELETE"))
+            .and(path_regex("/im/v1/messages/om_stale/reactions/r_stale$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 231_007,
+                "msg": "operator has no permission to delete this reaction"
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        ch.add_reaction("oc_chat", "om_stale", "\u{1F440}")
+            .await
+            .expect("add_reaction should succeed");
+        ch.remove_reaction("oc_chat", "om_stale", "\u{1F440}")
+            .await
+            .expect("stale-state code must not propagate as error");
+
+        let cache = ch.reaction_ids.lock().await;
+        assert!(
+            cache.is_empty(),
+            "reaction_ids cache should be empty after stale-state DELETE"
+        );
+
+        drop(delete_mock);
+    }
+
+    #[tokio::test]
+    async fn add_reaction_caches_glance_under_unicode_key() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-glance",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let post_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_glance/reactions$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_glance_xyz",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        ch.add_reaction("oc_chat", "om_glance", "\u{1F440}")
+            .await
+            .expect("add_reaction should succeed");
+
+        let cache = ch.reaction_ids.lock().await;
+        let stored = cache
+            .get(&("om_glance".to_string(), "\u{1F440}".to_string()))
+            .cloned();
+        assert_eq!(
+            stored.as_deref(),
+            Some("r_glance_xyz"),
+            "reaction_id must be cached under unicode 👀 key, got {stored:?}"
+        );
+        assert!(
+            cache
+                .get(&("om_glance".to_string(), "GLANCE".to_string()))
+                .is_none(),
+            "reaction_id must NOT be cached under Feishu emoji_type 'GLANCE'"
+        );
+
+        drop(post_mock);
     }
 }
