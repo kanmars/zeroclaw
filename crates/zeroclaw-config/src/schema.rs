@@ -12117,6 +12117,22 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub per_user_session: bool,
+
+    /// Streaming mode for the LLM response: `off` (default) routes every
+    /// response through `send()`; `partial` opens a Feishu interactive
+    /// card and edits it incrementally via `update_draft` /
+    /// `finalize_draft`; `multi_message` is rejected for Lark (Feishu has
+    /// no equivalent surface — falls back to `off` with a warning).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+
+    /// Minimum interval between consecutive `update_draft` PATCH calls in
+    /// milliseconds. Default 1000 ms tunes to Feishu's 5 QPS-per-message
+    /// edit cap; raise on enterprise plans with higher quotas.
+    #[tab(Behavior)]
+    #[serde(default = "default_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -17998,6 +18014,8 @@ default_temperature = 0.7
                 excluded_tools: vec![],
                 approval_timeout_secs: 300,
                 per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
 
@@ -20139,6 +20157,8 @@ default_model = "legacy-model"
                 excluded_tools: vec![],
                 approval_timeout_secs: 300,
                 per_user_session: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: default_draft_update_interval_ms(),
             },
         );
         config.save().await.unwrap();
@@ -20611,6 +20631,8 @@ api_token = "tok"
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -20637,6 +20659,8 @@ api_token = "tok"
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: default_draft_update_interval_ms(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();

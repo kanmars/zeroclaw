@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::schema::StreamMode;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -479,6 +480,32 @@ fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::V
     })
 }
 
+/// Truncate streaming-draft markdown to fit `LARK_CARD_MARKDOWN_MAX_BYTES`.
+///
+/// When the accumulated content is small, returns it unchanged. When it
+/// exceeds the budget we cut at the last UTF-8 boundary that still leaves
+/// room for an `…_(updating)_` suffix, so the user sees a visible signal
+/// that the card was clipped while updates continue.
+fn truncate_card_markdown(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let suffix = "\n\n…_(updating)_";
+    let budget = max_bytes.saturating_sub(suffix.len());
+    let mut end = 0;
+    for (idx, ch) in text.char_indices() {
+        let next = idx + ch.len_utf8();
+        if next > budget {
+            break;
+        }
+        end = next;
+    }
+    let mut out = String::with_capacity(end + suffix.len());
+    out.push_str(&text[..end]);
+    out.push_str(suffix);
+    out
+}
+
 /// Split markdown content into chunks that fit within the card size limit.
 /// Splits on line boundaries to avoid breaking markdown syntax.
 fn split_markdown_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
@@ -655,6 +682,23 @@ pub struct LarkChannel {
     /// API-returned token (runtime state), not a duplicate of any config
     /// field; SSOT does not apply.
     reaction_ids: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
+    /// Controls progressive draft-card streaming. `Off` (default) routes
+    /// every response through `send()`; `Partial` opens a draft card and
+    /// edits it incrementally via `update_draft` / `finalize_draft`.
+    /// Set by the orchestrator from `[channels.lark.<alias>].stream_mode`
+    /// via [`Self::with_streaming`].
+    stream_mode: StreamMode,
+    /// Minimum interval between consecutive PATCH edits of the same draft
+    /// card. Tunes to Feishu's 5 QPS per-message cap. Set by the
+    /// orchestrator from `[channels.lark.<alias>].draft_update_interval_ms`
+    /// via [`Self::with_streaming`].
+    draft_update_interval_ms: u64,
+    /// Per-`message_id` timestamp of the last successful PATCH. Reads /
+    /// writes are guarded by an async mutex so concurrent token streams
+    /// cooperate on the same draft without racing the rate-limit window.
+    /// Runtime state (not a config duplicate per SSOT) — bounded by the
+    /// number of in-flight drafts; entries are removed by `finalize_draft`.
+    last_draft_edit: Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -717,6 +761,9 @@ impl LarkChannel {
             approval_timeout_secs: 120,
             per_user_session: false,
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            last_draft_edit: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             api_base_override: None,
         }
@@ -762,6 +809,23 @@ impl LarkChannel {
     /// Set by the orchestrator from `[channels.lark.<alias>].per_user_session`.
     pub fn with_per_user_session(mut self, enabled: bool) -> Self {
         self.per_user_session = enabled;
+        self
+    }
+
+    /// Configure progressive draft-card streaming. `stream_mode = Off`
+    /// (default) keeps the existing behavior; `Partial` opens a Feishu
+    /// interactive card via `send_draft`, edits it via `update_draft`
+    /// (rate-limited to `draft_update_interval_ms`), and commits via
+    /// `finalize_draft`. Mirrors the `TelegramChannel::with_streaming`
+    /// builder pattern; set by the orchestrator from
+    /// `[channels.lark.<alias>].{stream_mode, draft_update_interval_ms}`.
+    pub fn with_streaming(
+        mut self,
+        stream_mode: StreamMode,
+        draft_update_interval_ms: u64,
+    ) -> Self {
+        self.stream_mode = stream_mode;
+        self.draft_update_interval_ms = draft_update_interval_ms;
         self
     }
 
@@ -2651,6 +2715,228 @@ impl Channel for LarkChannel {
 
         Ok(Some(self.wait_for_decision(rx, &approval_id).await))
     }
+
+    fn supports_draft_updates(&self) -> bool {
+        !matches!(self.stream_mode, StreamMode::Off)
+    }
+
+    /// Open a streaming draft card. Returns `Ok(None)` (caller must
+    /// degrade to `send()`) when streaming is disabled, the initial POST
+    /// fails, or Feishu replies with non-zero `code`. The returned
+    /// `String` is the Feishu `message_id` used by subsequent
+    /// `update_draft` / `finalize_draft` PATCH calls.
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if matches!(self.stream_mode, StreamMode::Off) {
+            return Ok(None);
+        }
+
+        let placeholder = truncate_card_markdown(
+            if message.content.is_empty() {
+                "_processing…_"
+            } else {
+                message.content.as_str()
+            },
+            LARK_CARD_MARKDOWN_MAX_BYTES,
+        );
+        let body = build_interactive_card_body(&message.recipient, &placeholder);
+        let url = self.send_message_url();
+
+        let (status, response) = match self.patch_or_send_once(&url, &body, false).await {
+            Ok(r) => r,
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"err": format!("{err}")})),
+                    "Lark: send_draft failed, falling back to send()"
+                );
+                return Ok(None);
+            }
+        };
+
+        if !status.is_success() || extract_lark_response_code(&response).unwrap_or(0) != 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "status": status.as_u16(),
+                        "body": response,
+                    })),
+                "Lark: send_draft non-success, falling back to send()"
+            );
+            return Ok(None);
+        }
+
+        let message_id = response
+            .pointer("/data/message_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        Ok(message_id)
+    }
+
+    /// Edit a previously-opened draft card with the latest accumulated
+    /// content. Per-`message_id` rate-limited via `last_draft_edit` so we
+    /// stay under Feishu's 5 QPS PATCH cap; calls inside the cooldown window
+    /// are silently dropped (the next caller will catch up). Soft-fails on
+    /// transport / token-refresh / 230020 rate-limit code so streaming token
+    /// loops never abort because of a single edit hiccup.
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let mut guard = self.last_draft_edit.lock().await;
+            if let Some(last) = guard.get(message_id) {
+                let elapsed_ms = u64::try_from(last.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed_ms < self.draft_update_interval_ms {
+                    return Ok(());
+                }
+            }
+            guard.insert(message_id.to_string(), Instant::now());
+        }
+
+        let rendered = truncate_card_markdown(text, LARK_CARD_MARKDOWN_MAX_BYTES);
+        self.patch_card_content(message_id, &rendered).await
+    }
+
+    /// Same wire shape as `update_draft`; kept as a separate trait method so
+    /// callers can later distinguish progress chrome from response content
+    /// without changing the calling sites.
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.update_draft(recipient, message_id, text).await
+    }
+
+    /// Commit the final response into the draft card. The first chunk is
+    /// PATCH-applied to the existing message_id; any overflow chunks are
+    /// posted as fresh interactive cards (with a single token-refresh retry
+    /// each) so long responses still land in full.
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        if message_id.is_empty() {
+            return self.send(&SendMessage::new(text, recipient)).await;
+        }
+
+        self.last_draft_edit.lock().await.remove(message_id);
+
+        let chunks = split_markdown_chunks(text, LARK_CARD_MARKDOWN_MAX_BYTES);
+        let first = chunks.first().copied().unwrap_or("");
+        self.patch_card_content(message_id, first).await?;
+
+        if chunks.len() > 1 {
+            let token = self.get_tenant_access_token().await?;
+            let url = self.send_message_url();
+            for chunk in &chunks[1..] {
+                let body = build_interactive_card_body(recipient, chunk);
+                let (status, response) = self.send_text_once(&url, &token, &body).await?;
+                if should_refresh_lark_tenant_token(status, &response) {
+                    self.invalidate_token().await;
+                    let new_token = self.get_tenant_access_token().await?;
+                    let (retry_status, retry_response) =
+                        self.send_text_once(&url, &new_token, &body).await?;
+                    ensure_lark_send_success(
+                        retry_status,
+                        &retry_response,
+                        "after token refresh (finalize_draft)",
+                    )?;
+                } else {
+                    ensure_lark_send_success(status, &response, "finalize_draft chunk")?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Replace the draft body with a "cancelled" marker. Feishu does not
+    /// expose an official "delete-draft" endpoint, so the closest faithful
+    /// signal is a one-line PATCH that overwrites the card content.
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.update_draft(recipient, message_id, "_(cancelled)_")
+            .await
+    }
+}
+
+impl LarkChannel {
+    /// PATCH the draft card body with new markdown content.
+    ///
+    /// Used by both `update_draft` (per-token streaming) and
+    /// `finalize_draft` (last-chunk commit). Soft-fails on every error
+    /// path — transport, token-refresh-still-401, the explicit 230020
+    /// frequency-limit code, and any other non-zero Feishu business code —
+    /// because the streaming caller cannot meaningfully recover from a
+    /// single missed edit and dropping the error keeps the token loop alive.
+    async fn patch_card_content(&self, message_id: &str, markdown: &str) -> anyhow::Result<()> {
+        let url = self.patch_message_url(message_id);
+        let body = serde_json::json!({
+            "content": build_card_content(markdown),
+        });
+
+        let (status, response) = self.patch_or_send_once(&url, &body, true).await?;
+
+        let body_for_inspect = if should_refresh_lark_tenant_token(status, &response) {
+            self.invalidate_token().await;
+            let (retry_status, retry_response) = self.patch_or_send_once(&url, &body, true).await?;
+            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "body": retry_response,
+                        })),
+                    "Lark: draft PATCH still unauthorized after token refresh"
+                );
+                return Ok(());
+            }
+            retry_response
+        } else {
+            response
+        };
+
+        let code = extract_lark_response_code(&body_for_inspect).unwrap_or(0);
+        if code == LARK_DRAFT_RATE_LIMIT_CODE {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"message_id": message_id})),
+                "Lark: draft PATCH rate-limited (code=230020)"
+            );
+            return Ok(());
+        }
+        if code != 0 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "code": code,
+                        "body": body_for_inspect,
+                    })),
+                "Lark: draft PATCH soft-failed"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl LarkChannel {
@@ -4163,6 +4449,8 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -4188,6 +4476,8 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -4224,6 +4514,8 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
         let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]));
@@ -4252,6 +4544,8 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
         let ch =
@@ -4280,6 +4574,8 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 456,
             per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
 
         let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]))
@@ -4294,6 +4590,93 @@ mod tests {
         assert!(ch_on.per_user_session);
         let ch_off = make_channel().with_per_user_session(false);
         assert!(!ch_off.per_user_session);
+    }
+
+    #[test]
+    fn supports_draft_updates_reflects_stream_mode() {
+        let off = make_channel();
+        assert!(!off.supports_draft_updates());
+
+        let partial = make_channel().with_streaming(StreamMode::Partial, 500);
+        assert!(partial.supports_draft_updates());
+    }
+
+    #[tokio::test]
+    async fn update_draft_rate_limits_within_interval() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-rate",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let patch_mock = Mock::given(method("PATCH"))
+            .and(path_regex("/im/v1/messages/om_draft_rl"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 5_000);
+        ch.api_base_override = Some(server.uri());
+
+        ch.update_draft("oc_chat1", "om_draft_rl", "first")
+            .await
+            .expect("first update_draft ok");
+        ch.update_draft("oc_chat1", "om_draft_rl", "second")
+            .await
+            .expect("second update_draft ok");
+
+        drop(patch_mock);
+    }
+
+    #[tokio::test]
+    async fn update_draft_proceeds_after_interval() {
+        use std::time::Duration as StdDuration;
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-proceed",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        let patch_mock = Mock::given(method("PATCH"))
+            .and(path_regex("/im/v1/messages/om_draft_go"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(2)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel().with_streaming(StreamMode::Partial, 50);
+        ch.api_base_override = Some(server.uri());
+
+        ch.update_draft("oc_chat1", "om_draft_go", "first")
+            .await
+            .expect("first update_draft ok");
+        tokio::time::sleep(StdDuration::from_millis(80)).await;
+        ch.update_draft("oc_chat1", "om_draft_go", "second")
+            .await
+            .expect("second update_draft ok");
+
+        drop(patch_mock);
     }
 
     #[test]
@@ -4510,6 +4893,8 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
         let ch_feishu = LarkChannel::from_config(
             &feishu_cfg,

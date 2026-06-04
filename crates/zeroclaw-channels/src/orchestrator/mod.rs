@@ -5438,7 +5438,8 @@ fn build_channel_by_id(
                 Ok(Arc::new(
                     LarkChannel::from_config(lk, alias, peer_resolver)
                         .with_approval_timeout_secs(lk.approval_timeout_secs)
-                        .with_per_user_session(lk.per_user_session),
+                        .with_per_user_session(lk.per_user_session)
+                        .with_streaming(lk.stream_mode, lk.draft_update_interval_ms),
                 ))
             }
             #[cfg(not(feature = "channel-lark"))]
@@ -6740,6 +6741,7 @@ fn collect_configured_channels(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
                     .with_approval_timeout_secs(lk.approval_timeout_secs)
                     .with_per_user_session(lk.per_user_session)
+                    .with_streaming(lk.stream_mode, lk.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone()),
             ),
         });
@@ -8686,7 +8688,8 @@ pub async fn deliver_announcement(
                 Arc::new(move || peers.clone());
             let ch = LarkChannel::from_config(lk, alias, peer_resolver)
                 .with_approval_timeout_secs(lk.approval_timeout_secs)
-                .with_per_user_session(lk.per_user_session);
+                .with_per_user_session(lk.per_user_session)
+                .with_streaming(lk.stream_mode, lk.draft_update_interval_ms);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-lark"))]

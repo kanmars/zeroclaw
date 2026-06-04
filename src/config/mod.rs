@@ -136,6 +136,8 @@ mod tests {
             excluded_tools: vec![],
             approval_timeout_secs: 300,
             per_user_session: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
         };
         let nextcloud_talk = NextcloudTalkConfig {
             enabled: true,
