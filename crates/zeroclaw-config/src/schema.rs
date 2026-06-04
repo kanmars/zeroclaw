@@ -12109,6 +12109,14 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default = "default_channel_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
+    /// When `true`, group-chat sessions key on the sender's open_id, so
+    /// distinct members of the same group chat don't share conversation
+    /// context. When `false` (default), all members of a group share one
+    /// session keyed on chat_id (matches the existing behavior). 1-on-1
+    /// chats are unaffected (chat_id is already unique per user-bot pair).
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub per_user_session: bool,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -17989,6 +17997,7 @@ default_temperature = 0.7
                 proxy_url: None,
                 excluded_tools: vec![],
                 approval_timeout_secs: 300,
+                per_user_session: false,
             },
         );
 
@@ -20129,6 +20138,7 @@ default_model = "legacy-model"
                 proxy_url: None,
                 excluded_tools: vec![],
                 approval_timeout_secs: 300,
+                per_user_session: false,
             },
         );
         config.save().await.unwrap();
@@ -20600,6 +20610,7 @@ api_token = "tok"
             proxy_url: None,
             excluded_tools: vec![],
             approval_timeout_secs: 300,
+            per_user_session: false,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -20625,6 +20636,7 @@ api_token = "tok"
             proxy_url: None,
             excluded_tools: vec![],
             approval_timeout_secs: 300,
+            per_user_session: false,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();

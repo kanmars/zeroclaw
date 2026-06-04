@@ -638,6 +638,12 @@ pub struct LarkChannel {
     /// Currently hard-coded to 120; lift to `LarkConfig` when a use case
     /// for per-channel overrides arises.
     approval_timeout_secs: u64,
+    /// When `true`, [`Self::resolve_sender`] keys group-chat sessions on the
+    /// sending user's `open_id` instead of the group's `chat_id`. Default
+    /// `false` preserves the existing shared-session behavior. Set via
+    /// [`Self::with_per_user_session`] from
+    /// `[channels.lark.<alias>].per_user_session`.
+    per_user_session: bool,
     /// Cache of `(message_id, unicode_emoji) -> reaction_id` populated by
     /// `add_reaction` so a subsequent `remove_reaction` call can issue
     /// `DELETE /im/v1/messages/{message_id}/reactions/{reaction_id}`
@@ -709,6 +715,7 @@ impl LarkChannel {
             transcription_manager: None,
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            per_user_session: false,
             reaction_ids: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(test)]
             api_base_override: None,
@@ -747,6 +754,34 @@ impl LarkChannel {
     pub fn with_approval_timeout_secs(mut self, secs: u64) -> Self {
         self.approval_timeout_secs = secs;
         self
+    }
+
+    /// Configure whether group-chat sessions key on the sender's `open_id`
+    /// (per-user isolation) or on `chat_id` (shared session). No effect on
+    /// 1-on-1 chats (where `chat_id` is already unique per user-bot pair).
+    /// Set by the orchestrator from `[channels.lark.<alias>].per_user_session`.
+    pub fn with_per_user_session(mut self, enabled: bool) -> Self {
+        self.per_user_session = enabled;
+        self
+    }
+
+    /// Decide which key to use as the [`ChannelMessage::sender`] field for
+    /// an inbound message. When `per_user_session = true`, returns the
+    /// sender's `open_id`, falling back to `chat_id` whenever the platform
+    /// omits the `open_id` (e.g. composer / edit events) or passes an empty
+    /// string. When `per_user_session = false` (default), always returns
+    /// `chat_id`, so every message in a chat shares the same agent session.
+    /// Pure function: no I/O, lifetime-bound to the inputs so callers can
+    /// avoid an extra `to_string()` until the final assembly.
+    fn resolve_sender<'a>(&self, chat_id: &'a str, sender_open_id: Option<&'a str>) -> &'a str {
+        if self.per_user_session {
+            match sender_open_id {
+                Some(oid) if !oid.is_empty() => oid,
+                _ => chat_id,
+            }
+        } else {
+            chat_id
+        }
     }
 
     pub fn with_transcription(
@@ -1323,7 +1358,9 @@ impl LarkChannel {
 
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
-                        sender: lark_msg.chat_id.clone(),
+                        sender: self
+                            .resolve_sender(&lark_msg.chat_id, Some(sender_open_id))
+                            .to_string(),
                         reply_target: lark_msg.chat_id.clone(),
                         content: text,
                         channel: self.channel_name().to_string(),
@@ -2005,7 +2042,7 @@ impl LarkChannel {
 
         vec![ChannelMessage {
             id: Uuid::new_v4().to_string(),
-            sender: chat_id.to_string(),
+            sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
             reply_target: chat_id.to_string(),
             content: text,
             channel: self.channel_name().to_string(),
@@ -2271,7 +2308,7 @@ impl LarkChannel {
 
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
-            sender: chat_id.to_string(),
+            sender: self.resolve_sender(chat_id, Some(open_id)).to_string(),
             reply_target: chat_id.to_string(),
             content: text,
             channel: self.channel_name().to_string(),
@@ -4125,6 +4162,7 @@ mod tests {
             proxy_url: None,
             excluded_tools: vec![],
             approval_timeout_secs: 300,
+            per_user_session: false,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -4149,6 +4187,7 @@ mod tests {
             proxy_url: None,
             excluded_tools: vec![],
             approval_timeout_secs: 300,
+            per_user_session: false,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -4184,6 +4223,7 @@ mod tests {
             proxy_url: None,
             excluded_tools: vec![],
             approval_timeout_secs: 300,
+            per_user_session: false,
         };
 
         let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]));
@@ -4211,6 +4251,7 @@ mod tests {
             proxy_url: None,
             excluded_tools: vec![],
             approval_timeout_secs: 300,
+            per_user_session: false,
         };
 
         let ch =
@@ -4238,12 +4279,36 @@ mod tests {
             proxy_url: None,
             excluded_tools: vec![],
             approval_timeout_secs: 456,
+            per_user_session: false,
         };
 
         let ch = LarkChannel::from_config(&cfg, "lark_test_alias", resolver_from(vec!["*".into()]))
             .with_approval_timeout_secs(cfg.approval_timeout_secs);
 
         assert_eq!(ch.approval_timeout_secs, 456);
+    }
+
+    #[test]
+    fn lark_with_per_user_session_propagates_value() {
+        let ch_on = make_channel().with_per_user_session(true);
+        assert!(ch_on.per_user_session);
+        let ch_off = make_channel().with_per_user_session(false);
+        assert!(!ch_off.per_user_session);
+    }
+
+    #[test]
+    fn lark_resolve_sender_respects_per_user_session_flag() {
+        let mut ch = make_channel();
+
+        assert!(!ch.per_user_session);
+        assert_eq!(ch.resolve_sender("oc_chat", Some("ou_user")), "oc_chat");
+        assert_eq!(ch.resolve_sender("oc_chat", None), "oc_chat");
+        assert_eq!(ch.resolve_sender("oc_chat", Some("")), "oc_chat");
+
+        ch.per_user_session = true;
+        assert_eq!(ch.resolve_sender("oc_chat", Some("ou_user")), "ou_user");
+        assert_eq!(ch.resolve_sender("oc_chat", None), "oc_chat");
+        assert_eq!(ch.resolve_sender("oc_chat", Some("")), "oc_chat");
     }
 
     #[tokio::test]
@@ -4444,6 +4509,7 @@ mod tests {
             proxy_url: None,
             excluded_tools: vec![],
             approval_timeout_secs: 300,
+            per_user_session: false,
         };
         let ch_feishu = LarkChannel::from_config(
             &feishu_cfg,
