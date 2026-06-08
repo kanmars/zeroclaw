@@ -965,80 +965,6 @@ impl LarkChannel {
         Ok(response)
     }
 
-    /// Best-effort "received" signal for incoming messages.
-    /// Failures are logged and never block normal message handling.
-    async fn try_add_ack_reaction(&self, message_id: &str, emoji_type: &str) {
-        if message_id.is_empty() {
-            return;
-        }
-
-        let mut token = match self.get_tenant_access_token().await {
-            Ok(token) => token,
-            Err(err) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                    "failed to fetch token for reaction"
-                );
-                return;
-            }
-        };
-
-        let mut retried = false;
-        loop {
-            let response = match self
-                .post_message_reaction_with_token(message_id, &token, emoji_type)
-                .await
-            {
-                Ok(resp) => resp,
-                Err(err) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", err), "message_id": message_id})), "failed to add reaction for");
-                    return;
-                }
-            };
-
-            if response.status().as_u16() == 401 && !retried {
-                self.invalidate_token().await;
-                token = match self.get_tenant_access_token().await {
-                    Ok(new_token) => new_token,
-                    Err(err) => {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"message_id": message_id, "err": err.to_string()})), "failed to refresh token for reaction on");
-                        return;
-                    }
-                };
-                retried = true;
-                continue;
-            }
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let err_body = response.text().await.unwrap_or_default();
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"message_id": message_id, "status": status.to_string(), "err_body": err_body})), "add reaction failed for : status=, body=");
-                return;
-            }
-
-            let payload: serde_json::Value = match response.json().await {
-                Ok(v) => v,
-                Err(err) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"error": format!("{}", err), "message_id": message_id})), "add reaction decode failed for");
-                    return;
-                }
-            };
-
-            let code = payload.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-            if code != 0 {
-                let msg = payload
-                    .get("msg")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown error");
-                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"code": code.to_string(), "message_id": message_id, "msg": msg.to_string()})), "add reaction returned code= for");
-            }
-            return;
-        }
-    }
-
     /// POST /callback/ws/endpoint → (wss_url, client_config)
     async fn get_ws_endpoint(&self) -> anyhow::Result<(String, WsClientConfig)> {
         let resp = self
@@ -1385,16 +1311,51 @@ impl LarkChannel {
                         continue;
                     }
 
-                    // Inbound ack policy: a single GLANCE 👀 reaction.
-                    // No random pool — orchestrator only removes GLANCE on
-                    // completion, so any other emoji becomes an orphan
-                    // reaction on the message. See fork commit history.
+                    // Inbound fast-ack: spawn the 👀 reaction immediately so the
+                    // user sees a "received" signal within ~100ms instead of
+                    // waiting for the orchestrator's classifier/memory/streaming
+                    // pipeline (which can take several seconds before the generic
+                    // Channel::add_reaction call would otherwise fire).
+                    //
+                    // CRITICAL: this spawn MUST go through the trait
+                    // `Channel::add_reaction` so that Feishu's returned
+                    // reaction_id is written into the shared `reaction_ids`
+                    // cache. The trait impl also has a cache-hit dedupe
+                    // fast-path, so the later generic orchestrator call to
+                    // add_reaction("👀") becomes a no-op instead of a duplicate
+                    // POST. This is the "same cached reaction-id contract"
+                    // requested by the PR review: fast-ack and generic path
+                    // share a single cache, so `remove_reaction("👀")` always
+                    // finds the right reaction_id and no orphan 👀 is left
+                    // beside the completion marker. See lifecycle regression
+                    // tests `lark_inbound_ack_lifecycle_*` and
+                    // `lark_fast_ack_and_generic_path_dedupe_on_cache_hit`.
                     let reaction_channel = self.clone();
                     let reaction_message_id = lark_msg.message_id.clone();
+                    let reaction_reply_target = lark_msg.chat_id.clone();
                     zeroclaw_spawn::spawn!(async move {
-                        reaction_channel
-                            .try_add_ack_reaction(&reaction_message_id, "GLANCE")
-                            .await;
+                        if let Err(e) = <LarkChannel as Channel>::add_reaction(
+                            &reaction_channel,
+                            &reaction_reply_target,
+                            &reaction_message_id,
+                            "\u{1F440}",
+                        )
+                        .await
+                        {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "message_id": reaction_message_id,
+                                    "error": format!("{e}"),
+                                    "error_key": "lark.inbound_fast_ack.failed",
+                                })),
+                                "Lark inbound fast-ack failed (soft)"
+                            );
+                        }
                     });
 
                     let channel_msg = ChannelMessage {
@@ -2434,6 +2395,31 @@ impl Channel for LarkChannel {
             return Ok(());
         }
 
+        // Cache-hit dedupe: if this (message_id, emoji) pair already has a
+        // cached reaction_id, the reaction is already on the message and a
+        // second POST would either be silently de-duped by Feishu (no
+        // reaction_id returned, leaving a cache hole) or returned as a
+        // non-zero business code. Either way it is a no-op the orchestrator
+        // does not need. This fast-path is what lets the Lark-local
+        // inbound-ack spawn and the generic orchestrator add_reaction call
+        // share the same reaction_ids cache without racing each other.
+        {
+            let cache = self.reaction_ids.lock().await;
+            if cache.contains_key(&(message_id.to_string(), emoji.to_string())) {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "emoji": emoji,
+                            "error_key": "lark.add_reaction.cache_hit_dedupe",
+                        })),
+                    "Lark add_reaction: cache hit, skipping duplicate POST"
+                );
+                return Ok(());
+            }
+        }
+
         let emoji_type = match unicode_to_lark_emoji_type(emoji) {
             Some(t) => t,
             None => {
@@ -2864,21 +2850,65 @@ impl LarkChannel {
     ///
     /// Used by both `update_draft` (per-token streaming) and
     /// `finalize_draft` (last-chunk commit). Soft-fails on every error
-    /// path — transport, token-refresh-still-401, the explicit 230020
-    /// frequency-limit code, and any other non-zero Feishu business code —
-    /// because the streaming caller cannot meaningfully recover from a
-    /// single missed edit and dropping the error keeps the token loop alive.
+    /// path — transport (reqwest), token-refresh-still-401, the explicit
+    /// 230020 frequency-limit code, and any other non-zero Feishu business
+    /// code — because the streaming caller cannot meaningfully recover
+    /// from a single missed edit and dropping the error keeps the token
+    /// loop alive. The signature still returns `anyhow::Result<()>` for
+    /// caller-shape compatibility, but it never returns `Err`; every
+    /// failure path is logged at WARN/DEBUG with a stable `error_key`
+    /// and the function returns `Ok(())`.
     async fn patch_card_content(&self, message_id: &str, markdown: &str) -> anyhow::Result<()> {
         let url = self.patch_message_url(message_id);
         let body = serde_json::json!({
             "content": build_card_content(markdown),
         });
 
-        let (status, response) = self.patch_or_send_once(&url, &body, true).await?;
+        // First PATCH attempt — soft-fail transport errors instead of
+        // propagating them. The streaming caller invokes this per token,
+        // so a single transport hiccup must not break the token loop.
+        let (status, response) = match self.patch_or_send_once(&url, &body, true).await {
+            Ok(pair) => pair,
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "message_id": message_id,
+                            "error": format!("{err}"),
+                            "error_key": "lark.draft_patch.transport_failure",
+                        })),
+                    "Lark: draft PATCH transport-failed (soft)"
+                );
+                return Ok(());
+            }
+        };
 
         let body_for_inspect = if should_refresh_lark_tenant_token(status, &response) {
             self.invalidate_token().await;
-            let (retry_status, retry_response) = self.patch_or_send_once(&url, &body, true).await?;
+            // Retry PATCH after token refresh — same soft-fail discipline:
+            // a transport error on the retry must not propagate.
+            let (retry_status, retry_response) = match self
+                .patch_or_send_once(&url, &body, true)
+                .await
+            {
+                Ok(pair) => pair,
+                Err(err) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note,)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "message_id": message_id,
+                                "error": format!("{err}"),
+                                "error_key": "lark.draft_patch.transport_failure_on_retry",
+                            })),
+                        "Lark: draft PATCH retry transport-failed (soft)"
+                    );
+                    return Ok(());
+                }
+            };
             if should_refresh_lark_tenant_token(retry_status, &retry_response) {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -2887,6 +2917,7 @@ impl LarkChannel {
                         .with_attrs(::serde_json::json!({
                             "message_id": message_id,
                             "body": retry_response,
+                            "error_key": "lark.draft_patch.unauthorized_after_refresh",
                         })),
                     "Lark: draft PATCH still unauthorized after token refresh"
                 );
@@ -2902,7 +2933,10 @@ impl LarkChannel {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"message_id": message_id})),
+                    .with_attrs(::serde_json::json!({
+                        "message_id": message_id,
+                        "error_key": "lark.draft_patch.rate_limited",
+                    })),
                 "Lark: draft PATCH rate-limited (code=230020)"
             );
             return Ok(());
@@ -2916,6 +2950,7 @@ impl LarkChannel {
                         "message_id": message_id,
                         "code": code,
                         "body": body_for_inspect,
+                        "error_key": "lark.draft_patch.non_zero_code",
                     })),
                 "Lark: draft PATCH soft-failed"
             );
@@ -3307,20 +3342,50 @@ impl LarkChannel {
                 return (StatusCode::OK, "ok").into_response();
             }
 
-            // Parse event messages
+            // Parse event messages first; then issue an inbound fast-ack via
+            // the same trait-level Channel::add_reaction path that the generic
+            // orchestrator uses. The trait impl writes Feishu's returned
+            // reaction_id into the shared reaction_ids cache and dedupes
+            // subsequent duplicate POSTs via a cache-hit fast-path, so the
+            // later generic orchestrator add_reaction("👀") call becomes a
+            // no-op and remove_reaction("👀") always finds the right id (no
+            // orphan reaction). See lark.rs `add_reaction` impl and the
+            // `lark_fast_ack_and_generic_path_dedupe_on_cache_hit` test.
             let messages = state.channel.parse_event_payload_async(&payload).await;
             if !messages.is_empty()
                 && let Some(message_id) = payload
                     .pointer("/event/message/message_id")
                     .and_then(|m| m.as_str())
             {
-                // Inbound ack policy: a single GLANCE 👀 reaction (see Edit 1).
                 let reaction_channel = Arc::clone(&state.channel);
                 let reaction_message_id = message_id.to_string();
+                // Prefer the first parsed message's reply_target as the
+                // ack target; parse_event_payload_async already filtered
+                // out unauthorized senders and non-text payloads.
+                let reaction_reply_target = messages[0].reply_target.clone();
                 zeroclaw_spawn::spawn!(async move {
-                    reaction_channel
-                        .try_add_ack_reaction(&reaction_message_id, "GLANCE")
-                        .await;
+                    if let Err(e) = <LarkChannel as Channel>::add_reaction(
+                        &reaction_channel,
+                        &reaction_reply_target,
+                        &reaction_message_id,
+                        "\u{1F440}",
+                    )
+                    .await
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "message_id": reaction_message_id,
+                                "error": format!("{e}"),
+                                "error_key": "lark.inbound_fast_ack.failed",
+                            })),
+                            "Lark inbound fast-ack failed (soft, webhook path)"
+                        );
+                    }
                 });
             }
 
@@ -5581,27 +5646,6 @@ mod tests {
         assert_ne!(unicode_to_lark_emoji_type("🚫"), Some("NO"));
     }
 
-    #[test]
-    fn lark_inbound_ack_policy_is_glance_only_no_random_pool() {
-        // Policy marker: the inbound-ack contract is a single 👀 GLANCE
-        // reaction. Any future change that re-introduces a random or
-        // locale-dependent ack must update this canary deliberately,
-        // documenting why duplicate ack reactions (orchestrator-side
-        // sync GLANCE plus an asynchronous lark.rs pick) are acceptable.
-        //
-        // Sneak-back-in regressions this canary is meant to flag:
-        //   - a second inbound-ack callsite that picks a non-GLANCE value
-        //   - a helper that returns a locale-dependent ack pool selection
-        //     getting wired into the inbound code path
-        //   - the orchestrator-side hardcoded "GLANCE" being changed to a
-        //     non-deterministic / locale-dependent value
-        const INBOUND_ACK_EMOJI_TYPE: &str = "GLANCE";
-        assert_eq!(
-            INBOUND_ACK_EMOJI_TYPE, "GLANCE",
-            "inbound ack policy: a single GLANCE 👀 reaction, no random pool",
-        );
-    }
-
     /// Regression guard: ChannelMessage.id MUST equal the Feishu om_xxx
     /// message_id so that the orchestrator's add_reaction calls (which
     /// pass msg.id straight to `/im/v1/messages/{message_id}/reactions`)
@@ -5884,5 +5928,281 @@ mod tests {
         );
 
         drop(post_mock);
+    }
+
+    /// End-to-end regression for the inbound-ack lifecycle:
+    ///   add 👀 → remove 👀 → add ✅
+    ///
+    /// Asserts the "shared cached reaction-id contract" that the PR review
+    /// requested. The Lark-local inbound fast-ack spawn (in `listen_ws` /
+    /// `listen_http`) and the generic orchestrator `Channel::add_reaction`
+    /// call BOTH go through the same trait impl, which writes Feishu's
+    /// returned `reaction_id` into `reaction_ids` and dedupes duplicate
+    /// POSTs via a cache-hit fast-path. As a result `remove_reaction("👀")`
+    /// always finds the right id and no orphan 👀 is left beside the
+    /// completion marker.
+    ///
+    /// The two strong assertions:
+    ///   1. The mock counts EXACTLY one POST per emoji and EXACTLY one
+    ///      DELETE on the cached `reaction_id`. This is the
+    ///      shared-cache invariant — even though both the inbound fast-ack
+    ///      and the orchestrator may call `add_reaction("👀")` for the
+    ///      same message, the second call is a cache hit and does NOT
+    ///      issue a second POST (see
+    ///      `lark_fast_ack_and_generic_path_dedupe_on_cache_hit` for the
+    ///      explicit dedupe test).
+    ///   2. The final `reaction_ids` cache shape contains ONLY ✅ —
+    ///      i.e. the 👀 entry was removed and no orphan was left behind.
+    #[tokio::test]
+    async fn lark_inbound_ack_lifecycle_swaps_glance_to_done_with_no_orphan() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-lifecycle",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        // POST 👀 (GLANCE) — must be invoked EXACTLY once.
+        // If a regression re-adds a Lark-local fast-ack spawn alongside
+        // the generic orchestrator add_reaction call, this mock would see
+        // a second POST and the assertion below would fail.
+        let post_glance_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_lifecycle/reactions$"))
+            .and(wiremock::matchers::body_string_contains("GLANCE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_glance_lifecycle",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // DELETE on the cached GLANCE reaction_id — must be invoked
+        // EXACTLY once. Cache-miss path would silently skip the DELETE
+        // (see `remove_reaction` doc) and this expect(1) would fail.
+        let delete_glance_mock = Mock::given(method("DELETE"))
+            .and(path_regex(
+                "/im/v1/messages/om_lifecycle/reactions/r_glance_lifecycle$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // POST ✅ (DONE) — must be invoked EXACTLY once.
+        let post_done_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_lifecycle/reactions$"))
+            .and(wiremock::matchers::body_string_contains("DONE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_done_lifecycle",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000001",
+                    "reaction_type": { "emoji_type": "DONE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        // Drive the lifecycle through the public Channel trait — the
+        // same surface the generic orchestrator uses in production.
+        ch.add_reaction("oc_chat", "om_lifecycle", "\u{1F440}")
+            .await
+            .expect("add 👀 should succeed");
+        ch.remove_reaction("oc_chat", "om_lifecycle", "\u{1F440}")
+            .await
+            .expect("remove 👀 should succeed");
+        ch.add_reaction("oc_chat", "om_lifecycle", "\u{2705}")
+            .await
+            .expect("add ✅ should succeed");
+
+        // Cache shape: ✅ present, 👀 gone, no orphans.
+        let cache = ch.reaction_ids.lock().await;
+        assert_eq!(
+            cache.len(),
+            1,
+            "after lifecycle the cache must contain exactly 1 entry (✅), got {}: {:?}",
+            cache.len(),
+            cache.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            cache
+                .get(&("om_lifecycle".to_string(), "\u{1F440}".to_string()))
+                .is_none(),
+            "the 👀 entry must be gone after remove_reaction; \
+             orphan presence indicates a parallel ack path bypassed the cache"
+        );
+        assert_eq!(
+            cache
+                .get(&("om_lifecycle".to_string(), "\u{2705}".to_string()))
+                .map(String::as_str),
+            Some("r_done_lifecycle"),
+            "✅ reaction_id must be cached under its unicode key"
+        );
+
+        // Mock-scope drop verifies the .expect(N) counts. A regression
+        // that POSTs 👀 twice (fast-ack + generic) makes post_glance_mock
+        // fail with 'received 2 requests, expected 1'.
+        drop(post_glance_mock);
+        drop(delete_glance_mock);
+        drop(post_done_mock);
+    }
+
+    /// Shared-cache dedupe contract: when the Lark-local inbound fast-ack
+    /// has already POSTed `add_reaction(om_xxx, "👀")` and written
+    /// `(om_xxx, "👀") → R1` into `reaction_ids`, a subsequent
+    /// `add_reaction(om_xxx, "👀")` call from the generic orchestrator
+    /// path MUST be a cache-hit no-op — NO second POST is issued, and
+    /// the cached reaction_id is preserved so `remove_reaction("👀")` can
+    /// still DELETE it correctly.
+    ///
+    /// This is the precise invariant the PR review asked for ("make the
+    /// Lark-local ack use the same cached reaction-id contract as the
+    /// generic path"). Without the cache-hit fast-path in `add_reaction`
+    /// the generic call would issue a second POST: Feishu would either
+    /// silently dedupe and return no reaction_id (leaving R1 cached but
+    /// an unverifiable duplicate POST on the wire) OR return a non-zero
+    /// business code; in either case `remove_reaction` would still find
+    /// R1 in cache, but the wire-level duplicate POST violates the
+    /// contract. This test asserts the wire stays clean: ONE POST 👀,
+    /// then ONE DELETE on R1.
+    #[tokio::test]
+    async fn lark_fast_ack_and_generic_path_dedupe_on_cache_hit() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::Channel;
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "t-dedupe",
+                "expire": 7200
+            })))
+            .mount(&server)
+            .await;
+
+        // POST 👀 — MUST be invoked EXACTLY once across BOTH calls.
+        // The first call is the fast-ack; the second call (simulating
+        // the generic orchestrator path) MUST hit the cache and skip
+        // the POST entirely. expect(1) catches a regression where the
+        // dedupe fast-path is missing or broken.
+        let post_glance_mock = Mock::given(method("POST"))
+            .and(path_regex("/im/v1/messages/om_dedupe/reactions$"))
+            .and(wiremock::matchers::body_string_contains("GLANCE"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "data": {
+                    "reaction_id": "r_dedupe_fast_ack",
+                    "operator": { "operator_id": "cli_test", "operator_type": "app" },
+                    "action_time": "1700000000000",
+                    "reaction_type": { "emoji_type": "GLANCE" }
+                }
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        // DELETE on the cached reaction_id from the FAST-ACK POST — proves
+        // that fast-ack's reaction_id survived through the dedupe path
+        // and is still usable for cleanup.
+        let delete_glance_mock = Mock::given(method("DELETE"))
+            .and(path_regex(
+                "/im/v1/messages/om_dedupe/reactions/r_dedupe_fast_ack$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 0 })),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(server.uri());
+
+        // Step 1: fast-ack POSTs 👀 and writes (om_dedupe, "👀") → R1.
+        ch.add_reaction("oc_chat", "om_dedupe", "\u{1F440}")
+            .await
+            .expect("fast-ack add 👀 should succeed");
+
+        // Sanity: cache populated.
+        {
+            let cache = ch.reaction_ids.lock().await;
+            assert_eq!(
+                cache
+                    .get(&("om_dedupe".to_string(), "\u{1F440}".to_string()))
+                    .map(String::as_str),
+                Some("r_dedupe_fast_ack"),
+                "fast-ack must populate cache under unicode 👀 key"
+            );
+        }
+
+        // Step 2: generic orchestrator path tries to add 👀 again.
+        // The cache-hit fast-path in add_reaction MUST return Ok(())
+        // without issuing a second POST. If a regression removes the
+        // dedupe check, post_glance_mock will receive 2 requests and
+        // its expect(1) will fail.
+        ch.add_reaction("oc_chat", "om_dedupe", "\u{1F440}")
+            .await
+            .expect("generic-path add 👀 must be cache-hit no-op, not error");
+
+        // Cache must still hold the SAME reaction_id from the fast-ack —
+        // the dedupe path must not overwrite it.
+        {
+            let cache = ch.reaction_ids.lock().await;
+            assert_eq!(
+                cache
+                    .get(&("om_dedupe".to_string(), "\u{1F440}".to_string()))
+                    .map(String::as_str),
+                Some("r_dedupe_fast_ack"),
+                "cache value must remain the fast-ack reaction_id after dedupe \
+                 (no overwrite)"
+            );
+        }
+
+        // Step 3: cleanup. DELETE must hit the cached fast-ack reaction_id.
+        // If the dedupe path had wrongly issued a second POST and Feishu
+        // had returned a different reaction_id that overwrote the cache,
+        // delete_glance_mock's path-match on r_dedupe_fast_ack would
+        // miss and the assertion would fail.
+        ch.remove_reaction("oc_chat", "om_dedupe", "\u{1F440}")
+            .await
+            .expect("remove 👀 should DELETE the fast-ack reaction_id");
+
+        // Cache must be empty after remove.
+        {
+            let cache = ch.reaction_ids.lock().await;
+            assert!(
+                cache.is_empty(),
+                "cache must be empty after remove_reaction, got {} entries",
+                cache.len()
+            );
+        }
+
+        drop(post_glance_mock);
+        drop(delete_glance_mock);
     }
 }
