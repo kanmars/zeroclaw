@@ -44,7 +44,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data
 <a href=#42 id=42 data-nosnippet>42</a><span class="attr">#[cfg(feature = <span class="string">"agent-runtime"</span>)]
 <a href=#43 id=43 data-nosnippet>43</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">mod </span>approval;
 <a href=#44 id=44 data-nosnippet>44</a><span class="attr">#[cfg(feature = <span class="string">"agent-runtime"</span>)]
-<a href=#45 id=45 data-nosnippet>45</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">mod </span>auth;
+<a href=#45 id=45 data-nosnippet>45</a></span><span class="kw">pub mod </span>auth;
 <a href=#46 id=46 data-nosnippet>46</a><span class="attr">#[cfg(feature = <span class="string">"agent-runtime"</span>)]
 <a href=#47 id=47 data-nosnippet>47</a></span><span class="kw">pub mod </span>channels;
 <a href=#48 id=48 data-nosnippet>48</a><span class="kw">pub mod </span>commands;
@@ -182,7 +182,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data
 <a href=#180 id=180 data-nosnippet>180</a>leak when you do not know which token was compromised; every client \
 <a href=#181 id=181 data-nosnippet>181</a>must re-pair.
 <a href=#182 id=182 data-nosnippet>182</a>
-<a href=#183 id=183 data-nosnippet>183</a>With --rotate-device &lt;id&gt;, revokes just that device's bearer token \
+<a href=#183 id=183 data-nosnippet>183</a>With --rotate-device ID, revokes just that device's bearer token \
 <a href=#184 id=184 data-nosnippet>184</a>and issues a fresh code for re-pairing that one device.
 <a href=#185 id=185 data-nosnippet>185</a>
 <a href=#186 id=186 data-nosnippet>186</a>Examples:
@@ -325,7 +325,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data
 <a href=#323 id=323 data-nosnippet>323</a>    <span class="doccomment">/// Scaffold a new skill from scratch (canonical SKILL.md + optional subdirs)
 <a href=#324 id=324 data-nosnippet>324</a>    </span><span class="comment">// i18n-exempt: clap derive help — framework requires a compile-time literal
 <a href=#325 id=325 data-nosnippet>325</a>    </span><span class="attr">#[command(long_about = <span class="string">"\
-<a href=#326 id=326 data-nosnippet>326</a>Scaffold a new skill under a skill bundle. Writes &lt;bundle.directory&gt;/&lt;name&gt;/SKILL.md \
+<a href=#326 id=326 data-nosnippet>326</a>Scaffold a new skill under a skill bundle. Writes `&lt;bundle.directory&gt;`/`&lt;name&gt;`/SKILL.md \
 <a href=#327 id=327 data-nosnippet>327</a>plus the canonical optional subdirs (scripts/, references/, assets/). \
 <a href=#328 id=328 data-nosnippet>328</a>Name must be lowercase + hyphens; description is required (prompted on TTY if omitted).
 <a href=#329 id=329 data-nosnippet>329</a>
@@ -411,7 +411,7 @@ data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../" data
 <a href=#409 id=409 data-nosnippet>409</a></span><span class="kw">pub enum </span>SkillBundleCommands {
 <a href=#410 id=410 data-nosnippet>410</a>    <span class="doccomment">/// List configured skill bundles and their resolved directories
 <a href=#411 id=411 data-nosnippet>411</a>    </span>List,
-<a href=#412 id=412 data-nosnippet>412</a>    <span class="doccomment">/// Add a new skill bundle. Directory defaults to shared/skills/&lt;alias&gt;/.
+<a href=#412 id=412 data-nosnippet>412</a>    <span class="doccomment">/// Add a new skill bundle. Directory defaults to shared/skills/`&lt;alias&gt;`/.
 <a href=#413 id=413 data-nosnippet>413</a>    </span>Add {
 <a href=#414 id=414 data-nosnippet>414</a>        <span class="doccomment">/// Bundle alias (lowercase + hyphens; same convention as agents/channels)
 <a href=#415 id=415 data-nosnippet>415</a>        </span>alias: String,
