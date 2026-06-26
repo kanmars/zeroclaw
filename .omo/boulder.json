@@ -1,0 +1,106 @@
+{
+  "active_plan": "/home/admin/workspace-public/kanmars/zeroclaw/.sisyphus/plans/kanmars.req.20260601.001.plan.md",
+  "started_at": "2026-06-03T16:38:30.983Z",
+  "ended_at": "2026-06-04T01:30:00.000Z",
+  "elapsed_ms": 31889017,
+  "session_ids": [
+    "ses_17d7738baffeJMYqm6OuPk6VEZ"
+  ],
+  "plan_name": "kanmars.req.20260601.001.plan",
+  "status": "completed",
+  "completion_summary": {
+    "tasks_total": 18,
+    "tasks_completed": 18,
+    "commits": ["be34225d", "ddf35809"],
+    "branch": "chore/consolidate-lark-feishu-to-upstream-schema",
+    "tests_passed": 1969,
+    "tests_failed": 0,
+    "lines_added": 1432,
+    "lines_deleted": 650,
+    "subagents_spawned": 7,
+    "pushed": false,
+    "next_action": "user-decides-push-vs-fast-forward"
+  },
+  "session_origins": {
+    "ses_17d7738baffeJMYqm6OuPk6VEZ": "direct"
+  },
+  "task_sessions": {
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "**Lark/Feishu schema consolidation**: `[channels.feishu.<alias>]` removed as V3 first-class; folds to `[channels.lark.<alias>]` with `use_feishu = true` via existing V2→V3 migration",
+      "session_id": "ses_17194d800ffeI5jK2ess5hZ6Pf",
+      "agent": "Sisyphus-Junior",
+      "category": "writing",
+      "updated_at": "2026-06-03T16:58:28.454Z",
+      "started_at": "2026-06-03T16:58:28.454Z",
+      "status": "running"
+    }
+  },
+  "active_work_id": "kanmars-req-20260601-001-plan-5ecb5839",
+  "baseline_commit": "045b60ac67d7e24579b53985efe192e6baabe761",
+  "baseline_branch": "kanmars_main (post 0522.001 merge)",
+  "target_branch": "feat/model-context-window-inheritance",
+  "feature_commit": "c4540a489b07ef41954aa6b1aaecf2c13b6c29d1",
+  "pushed_to": "origin (github.com/kanmars/zeroclaw)",
+  "pr_creation_url": "https://github.com/kanmars/zeroclaw/pull/new/feat/model-context-window-inheritance",
+  "previous_plans_completed": [
+    {
+      "plan_name": "kanmars.req.20260522.001.plan",
+      "feature_commit": "045b60ac67d7e24579b53985efe192e6baabe761",
+      "merged_to_baseline": true,
+      "merged_at_approx": "2026-05-23 (manual merge by user)"
+    }
+  ],
+  "updated_at": "2026-06-03T16:58:28.454Z",
+  "agent": "atlas",
+  "schema_version": 2,
+  "works": {
+    "kanmars.req.20260523.001.plan-legacy": {
+      "work_id": "kanmars.req.20260523.001.plan-legacy",
+      "active_plan": "/Users/kanmars/workspace/kanmars_zeroclaw_github/.sisyphus/plans/kanmars.req.20260523.001.plan.md",
+      "plan_name": "kanmars.req.20260523.001.plan",
+      "status": "completed",
+      "started_at": "2026-05-23T01:13:00.000Z",
+      "ended_at": "2026-05-23T01:55:00.000Z",
+      "updated_at": "2026-05-23T01:55:00.000Z",
+      "session_ids": [
+        "ses_1afe42dc8ffecTDB27IqREUtw4"
+      ],
+      "session_origins": {
+        "ses_1afe42dc8ffecTDB27IqREUtw4": "direct"
+      },
+      "task_sessions": {}
+    },
+    "kanmars-req-20260601-001-plan-5ecb5839": {
+      "work_id": "kanmars-req-20260601-001-plan-5ecb5839",
+      "active_plan": "/home/admin/workspace-public/kanmars/zeroclaw/.sisyphus/plans/kanmars.req.20260601.001.plan.md",
+      "plan_name": "kanmars.req.20260601.001.plan",
+      "status": "completed",
+      "started_at": "2026-06-03T16:38:30.983Z",
+      "ended_at": "2026-06-04T01:30:00.000Z",
+      "elapsed_ms": 31889017,
+      "updated_at": "2026-06-04T01:30:00.000Z",
+      "session_ids": [
+        "ses_17d7738baffeJMYqm6OuPk6VEZ"
+      ],
+      "session_origins": {
+        "ses_17d7738baffeJMYqm6OuPk6VEZ": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "**Lark/Feishu schema consolidation**: `[channels.feishu.<alias>]` removed as V3 first-class; folds to `[channels.lark.<alias>]` with `use_feishu = true` via existing V2→V3 migration",
+          "session_id": "ses_17194d800ffeI5jK2ess5hZ6Pf",
+          "agent": "Sisyphus-Junior",
+          "category": "writing",
+          "updated_at": "2026-06-03T16:58:28.454Z",
+          "started_at": "2026-06-03T16:58:28.454Z",
+          "status": "running"
+        }
+      }
+    }
+  }
+}

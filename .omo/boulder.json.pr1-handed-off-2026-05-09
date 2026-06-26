@@ -1,0 +1,12 @@
+{
+  "active_plan": "/home/admin/workspace-public/kanmars/zeroclaw/.sisyphus/plans/kanmars.req.20260509.001.plan.md",
+  "started_at": "2026-05-09T12:53:56.639Z",
+  "session_ids": [
+    "ses_1f3ad599effewPwpmtlwpMhmk1"
+  ],
+  "session_origins": {
+    "ses_1f3ad599effewPwpmtlwpMhmk1": "direct"
+  },
+  "plan_name": "kanmars.req.20260509.001.plan",
+  "agent": "atlas"
+}

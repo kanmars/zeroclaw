@@ -1,5 +1,6 @@
 zc-pane-dashboard = Dashboard
 zc-pane-config = Config
+zc-pane-doctor = Doctor
 zc-pane-code = Code
 zc-pane-chat = Chat
 zc-pane-logs = Logs
@@ -22,6 +23,7 @@ zc-app-quit-prompt = Quit zerocode?
 zc-app-quit-explainer = The TUI closes. The daemon keeps running; reconnect anytime.
 zc-app-reload-status-signalled = Daemon reload signalled — reconnecting…
 zc-app-reload-confirm-row = { $confirm_chord } = reload   { $cancel_chord } = cancel
+zc-error-daemon-version-mismatch = Version mismatch: zerocode is { $client_version } but the daemon is { $server_version }. Rebuild and restart the daemon from the same checkout as zerocode.
 
 zc-zerocode-tab-theme = Theme
 zc-zerocode-tab-agent-theme = Agent Themes
@@ -40,13 +42,13 @@ zc-zerocode-conn-edit-text = Enter to save, Esc to cancel.
 zc-zerocode-conn-edit-bool = Enter toggles; this field saves on toggle.
 zc-zerocode-conn-edit-routes = One route per line. Enter for a new line, Ctrl+S to save, Esc to cancel.
 zc-zerocode-locale-loading = loading locales…
-zc-zerocode-locale-download = ⬇ Download locale file
-zc-zerocode-locale-set = Locale set to { $locale }. Restart to apply.
+zc-zerocode-locale-download = ⬇ Download selected locale file
+zc-zerocode-locale-set = Locale set to { $locale }. Download its locale file if needed, then restart to apply.
 zc-zerocode-locale-fetching = Downloading locale files for { $locale }…
 zc-zerocode-locale-downloaded = Downloaded { $written } for { $locale }. Skipped: { $skipped }
 zc-zerocode-locale-fetch-failed = Locale download failed for { $locale }: { $err }
 zc-zerocode-locale-list-failed = Failed to load locale list: { $err }
-zc-zerocode-locale-pick-first = Select a locale first, then download.
+zc-zerocode-locale-pick-first = Select a locale row first, then download its locale file.
 zc-zerocode-help-locale = select / download locale
 zc-zerocode-help-conn = edit connection field
 
@@ -162,6 +164,27 @@ zc-logs-help-open-detail = Open detail pane
 zc-logs-help-mouse-label = Mouse
 zc-logs-help-mouse-desc = Click to select, scroll wheel, double-click detail
 
+zc-doctor-title = Doctor
+zc-doctor-loading = Loading diagnostics...
+zc-doctor-error = Doctor failed: { $error }
+zc-doctor-error-unsupported-daemon = Doctor RPC is not available on this daemon yet. Restart the daemon with a build that includes doctor/run.
+zc-doctor-no-results = No diagnostics yet
+zc-doctor-summary = { $ok } ok  { $warnings } warnings  { $errors } errors
+zc-doctor-filter-status = filter: { $filter }
+zc-doctor-filter-all = All
+zc-doctor-filter-problems = Problems
+zc-doctor-filter-errors = Errors
+zc-doctor-list-title = Diagnostics ({ $filter })
+zc-doctor-detail-title = Detail
+zc-doctor-no-selection = No diagnostic selected
+zc-doctor-label-message = Message
+zc-doctor-help-rerun = Run diagnostics again
+zc-doctor-help-move = Move cursor
+zc-doctor-help-filter = Change filter
+zc-doctor-help-scroll-detail = Scroll detail pane
+zc-doctor-help-this-help = This help
+zc-doctor-help-mouse = Mouse: click filter/select, scroll wheel
+
 zc-dashboard-tab-overview = Overview
 zc-dashboard-tab-sessions = Sessions
 zc-dashboard-tab-agents = Agents
@@ -214,7 +237,7 @@ zc-dashboard-detail-schedule = Schedule
 zc-dashboard-detail-next-run = Next Run
 zc-dashboard-detail-last-run = Last Run
 zc-dashboard-detail-last-status = Last Status
-zc-dashboard-detail-live-sessions = Live Sessions
+zc-dashboard-detail-sessions = Sessions
 zc-dashboard-detail-persisted-sessions = Persisted Sessions
 zc-dashboard-cost-not-available = Cost tracking is not available. Configure a cost backend to see usage data.
 
@@ -310,6 +333,9 @@ zc-quickstart-modal-action-save = save
 zc-quickstart-modal-type-prefix = Type:
 zc-quickstart-field-label-alias = Alias
 zc-quickstart-field-help-alias = Unique identifier for this provider instance. Change from "default" if your config already has one with that alias.
+zc-quickstart-model-loading = Loading models for { $provider }...
+zc-quickstart-model-retrying = Retrying model catalog for { $provider }...
+zc-quickstart-model-catalog-empty = catalog unavailable - type a model name
 zc-quickstart-action-done = Done
 zc-quickstart-no-peer-groups = No peer groups configured. Optional — agents can still send messages to channels.
 
@@ -320,10 +346,8 @@ zc-quickstart-status-created = Created `{ $alias }`. Reloading daemon — Chat w
 zc-quickstart-status-errors = { $count } error(s) — fix selectors and resubmit
 zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } more)
-zc-quickstart-model-loading = Loading models for { $provider }…
-zc-quickstart-model-catalog-empty = (catalog unavailable — type a model name)
-zc-quickstart-status-can-create = All selectors ✓. Press `{ $chord }` to Create.
-zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when every selector is ✓.
+zc-quickstart-status-can-create = All required selectors ✓. Press `{ $chord }` to Create.
+zc-quickstart-status-hint = ↑/↓ to move, Enter to open. `{ $chord }` enables when all required selectors are ✓.
 
 zc-quickstart-channels-empty = No channels configured. An agent without channels still works via `zeroclaw agent <name>` from the CLI.
 zc-quickstart-channels-add = + Add channel
@@ -333,6 +357,9 @@ zc-quickstart-block-peers = Peer groups
 zc-quickstart-block-agent = Agent
 zc-quickstart-personality-help = Personality files (e=edit, t=use template, c=clear)
 zc-quickstart-save-and-close = Save & close
+zc-quickstart-no-template = No template is available for `{ $filename }`
+zc-quickstart-agent-name-field = name
+zc-quickstart-file-bytes = { $bytes } bytes
 
 zc-chat-pane-chat = Chat
 zc-chat-pane-acp = ACP
@@ -340,6 +367,8 @@ zc-chat-pane-acp = ACP
 zc-chat-no-agents = No enabled agents yet. Open Quickstart to create one, or use Config to add and enable an agent.
 zc-chat-error-fetch-agents = Failed to fetch agents: { $error }
 zc-chat-error-create-session = Failed to create session: { $error }
+zc-chat-session-restarted = New session started.
+zc-chat-session-restart-error = Failed to start a new session: { $error }
 
 zc-chat-thinking-visible = Thinking output: visible
 zc-chat-thinking-hidden = Thinking output: hidden
@@ -397,6 +426,7 @@ zc-chat-approval-action-edit = Edit
 
 zc-chat-clipboard-you = You: { $text }
 zc-chat-clipboard-agent = Agent: { $text }
+zc-chat-copied-clipboard = Copied to clipboard
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
@@ -446,12 +476,35 @@ zc-config-help-save-value = Save value
 zc-config-help-reset-default = Reset to default
 
 zc-config-status-alias-empty = Alias name cannot be empty
+zc-config-status-alias-deleted = Deleted { $alias }
+zc-config-status-alias-create-failed = Create failed: { $err }
+zc-config-status-delete-failed = Delete failed: { $err }
+zc-config-status-field-reset = Reset { $prop }
+zc-config-status-load-failed = Load failed: { $err }
+zc-config-status-save-failed = Save failed: { $err }
+zc-config-status-personality-loading-file = Loading { $filename }...
+zc-config-status-personality-saving-file = Saving { $filename }...
+zc-config-status-personality-saved-file = Saved { $filename }
+zc-config-status-template-loaded = Template loaded for { $filename }
+zc-config-status-template-missing = No template available for { $filename }
+zc-config-status-template-fetch-failed = Template fetch failed: { $err }
+zc-config-status-skill-loading = Loading { $name }...
+zc-config-status-skill-saving = Saving { $name }...
+zc-config-status-skill-saved = Saved { $name }
+zc-config-status-skill-deleting = Deleting { $name }...
+zc-config-status-skill-archived = Archived { $name }
+zc-config-status-fetching-models = Fetching models for { $family }...
+zc-config-status-field-set = Set { $prop }
+zc-config-status-set-failed = Set failed: { $err }
 zc-config-status-loading-personality = Loading personality files...
 zc-config-status-loading-skills = Loading skills...
 zc-config-status-fetching-templates = Fetching templates...
 zc-config-status-unsaved-discarded = Unsaved changes discarded
 zc-config-status-no-models = No models returned — enter manually
 zc-config-status-model-fetch-failed = Model fetch failed — enter manually
+zc-config-status-loading-aliases = Loading options...
+zc-config-status-no-aliases = None configured yet. Enter manually.
+zc-config-status-alias-fetch-failed = Options fetch failed. Enter manually.
 
 zc-config-footer-action-create = create
 zc-config-footer-action-cancel = cancel
@@ -460,3 +513,7 @@ zc-config-footer-action-back-to-files = back to files
 zc-config-footer-action-back-to-skills = back to skills
 zc-config-footer-action-help = help
 zc-config-footer-action-new-line = new line
+
+## Inline hint shown on the selected config field row. The { $keys } placeholder
+## is resolved from the current keybinding for ConfigTabAction::Enter.
+zc-config-field-edit-hint = { $keys } → press to edit

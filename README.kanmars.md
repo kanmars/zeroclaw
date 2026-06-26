@@ -51,14 +51,14 @@
 
 | flag | 类型 | 何时用 |
 |---|---|---|
-| **`channel-lark`** | 真实 feature（root [`Cargo.toml:286`](Cargo.toml#L286) → channels [`Cargo.toml:91`](crates/zeroclaw-channels/Cargo.toml#L91)） | 推荐 |
-| `channel-feishu` | alias（root [`Cargo.toml:312`](Cargo.toml#L312)：`channel-feishu = ["channel-lark"]`）| 等价别名 |
+| **`channel-lark`** | 真实 feature（root [`Cargo.toml:334`](Cargo.toml#L334) → channels `channel-lark`） | 推荐 |
+| `channel-feishu` | alias（root [`Cargo.toml:367`](Cargo.toml#L367)：`channel-feishu = ["channel-lark"]`）| 等价别名 |
 
 实现文件：[`crates/zeroclaw-channels/src/lark.rs`](crates/zeroclaw-channels/src/lark.rs)（`FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"`，`LarkPlatform` 枚举同时支持 Lark/Feishu）。
 
-> ⚠️ **重要**：默认 features 已经包含 `channel-lark`。
-> Cargo.toml: `default = ["agent-runtime", ...]`，而 `agent-runtime` 列了 `"channel-lark"`（[`Cargo.toml:262`](Cargo.toml#L262)）。
-> **`cargo build --release` 已经把飞书编进去**，只有 `--no-default-features` 模式下才需要显式加 `--features channel-lark`。
+> ⚠️ **重要**：默认 features **不包含** `channel-lark`。
+> Cargo.toml: `default = ["agent-runtime", "default-channels", ...]`，而 `default-channels` 只含 `channel-acp-server`, `channel-webhook`, `channel-email`, `channel-telegram`, `channel-discord`（[`Cargo.toml:304-307`](Cargo.toml#L304)）。
+> **`cargo build --release` 不会编译飞书**，必须显式加 `--features channel-lark` 或 `--features channels-full`。
 
 ### 2.2 Web dashboard 编译说明
 
@@ -74,9 +74,13 @@
 ```bash
 cd /home/admin/workspace-public/kanmars/zeroclaw
 
-# === 方式 A：最简（默认含飞书，纯 API + WS，无 dashboard 嵌入） ===
+# === 方式 A：最简（默认不含飞书，纯 API + WS，无 dashboard 嵌入） ===
 cargo build --release --locked
-# 产物：target/release/zeroclaw
+# 产物：target/release/zeroclaw（不含飞书 channel）
+
+# === 方式 A2：含飞书 ===
+cargo build --release --locked --features channel-lark
+# 产物：target/release/zeroclaw（含飞书 channel）
 
 # === 方式 B：完整（含 dashboard 嵌入二进制） ===
 # Step 1: 先 build web（推荐用 xtask，自动 npm install + 生成 OpenAPI client + vite build）

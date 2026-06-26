@@ -22,11 +22,12 @@ pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
 const RESPONSES_URL: &str = "https://api.openai.com/v1/responses";
 
 pub struct OpenAiModelProvider {
-    /// `[model_providers.openai.<alias>]` config-key alias.
+    /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
     credential: Option<String>,
     max_tokens: Option<u32>,
+    timeout_secs: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -216,7 +217,14 @@ impl OpenAiModelProvider {
                 .unwrap_or_else(|| BASE_URL.to_string()),
             credential: credential.map(ToString::to_string),
             max_tokens: None,
+            timeout_secs: 120,
         }
+    }
+
+    /// Override the HTTP request timeout for LLM API calls.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
     }
 
     /// Set the maximum output tokens for API requests.
@@ -370,7 +378,7 @@ impl OpenAiModelProvider {
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
             "model_provider.openai",
-            120,
+            self.timeout_secs,
             10,
         )
     }
@@ -476,6 +484,7 @@ impl ModelProvider for OpenAiModelProvider {
             temperature.map(|t| Self::adjust_temperature_for_model(model, t));
 
         let tools = Self::convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
@@ -484,6 +493,22 @@ impl ModelProvider for OpenAiModelProvider {
             tools,
             max_tokens: self.max_tokens,
         };
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "chat_completions",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": native_request.tool_choice.as_deref(),
+                    })),
+                "openai provider request prepared"
+            );
+        }
 
         let response = self
             .http_client()
@@ -935,8 +960,11 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         }
     }
 
+    /// Reports the instance's resolved endpoint so callers can verify which
+    /// host a responses provider will actually hit (e.g. a compat family's
+    /// default base vs. OpenAI's).
     fn default_base_url(&self) -> Option<&str> {
-        Some(RESPONSES_URL)
+        Some(&self.responses_url)
     }
 
     fn default_wire_api(&self) -> &str {
@@ -1007,7 +1035,25 @@ impl ModelProvider for OpenAiResponsesModelProvider {
             Some(instructions)
         };
         let tools = convert_tools(request.tools);
+        let tools_count = tools.as_ref().map_or(0, Vec::len);
         let req = self.build_request(instructions, input, tools, model, temperature, false);
+        if ::zeroclaw_log::debug_enabled() {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "openai",
+                        "alias": &self.alias,
+                        "request_api": "responses",
+                        "model": model,
+                        "stream": false,
+                        "tools_count": tools_count,
+                        "tool_choice": req.tool_choice.as_deref(),
+                        "parallel_tool_calls": req.parallel_tool_calls,
+                    })),
+                "openai responses provider request prepared"
+            );
+        }
         let response = Client::new()
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {credential}"))
@@ -1053,6 +1099,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
         let reasoning_effort = self.reasoning_effort.clone();
         let max_tokens = self.max_tokens;
         let client = self.streaming_client();
+        let alias = ::zeroclaw_log::debug_enabled().then(|| self.alias.clone());
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
         let handle = ::zeroclaw_spawn::spawn!(async move {
@@ -1063,6 +1110,7 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 Some(instructions)
             };
             let tools = convert_tools(tools_owned.as_deref());
+            let tools_count = tools.as_ref().map_or(0, Vec::len);
             let has_tools = tools.is_some();
             let reasoning = reasoning_effort
                 .as_deref()
@@ -1081,6 +1129,23 @@ impl ModelProvider for OpenAiResponsesModelProvider {
                 max_output_tokens: max_tokens,
                 reasoning,
             };
+            if let Some(alias) = alias.as_deref() {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
+                        .with_attrs(::serde_json::json!({
+                            "provider": "openai",
+                            "alias": alias,
+                            "request_api": "responses",
+                            "model": &req.model,
+                            "stream": true,
+                            "tools_count": tools_count,
+                            "tool_choice": req.tool_choice.as_deref(),
+                            "parallel_tool_calls": req.parallel_tool_calls,
+                        })),
+                    "openai responses streaming provider request prepared"
+                );
+            }
 
             let request_builder = client
                 .post(&responses_url)
@@ -1126,6 +1191,19 @@ mod tests {
     fn creates_without_key() {
         let p = OpenAiModelProvider::new("test", None);
         assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn responses_url_appends_responses_to_custom_base() {
+        let p =
+            OpenAiResponsesModelProvider::new("opencode", Some("https://opencode.ai/zen/v1"), None);
+        assert_eq!(p.responses_url, "https://opencode.ai/zen/v1/responses");
+    }
+
+    #[test]
+    fn responses_url_defaults_to_openai_when_base_absent() {
+        let p = OpenAiResponsesModelProvider::new("test", None, None);
+        assert_eq!(p.responses_url, RESPONSES_URL);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! Wraps [`RpcOutbound`] from `zeroclaw-api` — the same request/response
 //! plumbing the daemon uses for bidirectional calls.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::jsonrpc::{self, JsonRpcError, RpcOutbound, field};
-use crate::wire::{ConfigFieldEntry, FsListDirResponse, SectionShape};
+use crate::wire::{ConfigFieldEntry, DoctorRunResult, FsListDirResponse, SectionShape};
 
 // ── Platform local-stream shim ──────────────────────────────────
 
@@ -59,6 +60,7 @@ pub mod method {
     pub const CONFIG_DELETE: &str = "config/delete";
     pub const CONFIG_RELOAD: &str = "config/reload";
     pub const CONFIG_MAP_KEYS: &str = "config/map-keys";
+    pub const CONFIG_RESOLVE_ALIAS_SOURCE: &str = "config/resolve-alias-source";
     pub const CONFIG_MAP_KEY_CREATE: &str = "config/map-key-create";
     pub const CONFIG_MAP_KEY_DELETE: &str = "config/map-key-delete";
     pub const CONFIG_TEMPLATES: &str = "config/templates";
@@ -89,6 +91,7 @@ pub mod method {
     // Dashboard
     pub const STATUS: &str = "status";
     pub const HEALTH: &str = "health";
+    pub const DOCTOR_RUN: &str = "doctor/run";
     pub const COST_QUERY: &str = "cost/query";
     pub const SESSION_LIST: &str = "session/list";
     pub const SESSION_LIST_ACP: &str = "session/list-acp";
@@ -328,6 +331,71 @@ pub enum ConnectionState {
     Disconnected { reason: String },
 }
 
+/// The TUI and daemon are built from the same package version and do not
+/// promise cross-version wire compatibility.
+#[derive(Debug)]
+pub struct DaemonVersionMismatch {
+    client_version: &'static str,
+    server_version: String,
+}
+
+impl DaemonVersionMismatch {
+    fn new(server_version: impl Into<String>) -> Self {
+        Self {
+            client_version: env!("CARGO_PKG_VERSION"),
+            server_version: server_version.into(),
+        }
+    }
+
+    pub fn client_version(&self) -> &'static str {
+        self.client_version
+    }
+
+    pub fn server_version(&self) -> &str {
+        &self.server_version
+    }
+}
+
+impl fmt::Display for DaemonVersionMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Version mismatch: zerocode is {} but the daemon is {}. \
+             Rebuild and restart the daemon from the same checkout as zerocode.",
+            self.client_version, self.server_version
+        )
+    }
+}
+
+impl std::error::Error for DaemonVersionMismatch {}
+
+#[derive(Debug)]
+struct InitializeResponse {
+    server_version: String,
+    tui_id: Option<String>,
+    tui_sig: Option<String>,
+}
+
+fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
+    let server_version = resp
+        .get("server_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    if server_version != env!("CARGO_PKG_VERSION") {
+        return Err(DaemonVersionMismatch::new(server_version).into());
+    }
+
+    Ok(InitializeResponse {
+        server_version,
+        tui_id: resp.get("tui_id").and_then(Value::as_str).map(String::from),
+        tui_sig: resp
+            .get("tui_sig")
+            .and_then(Value::as_str)
+            .map(String::from),
+    })
+}
+
 // ── Client ───────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -439,22 +507,24 @@ impl RpcClient {
         // same machine and the socket paths / env values are meaningful.
         let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
         init_params["env"] = serde_json::to_value(env_map).unwrap_or_default();
-        let resp = rpc
-            .request(method::INITIALIZE, init_params)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("initialize: {} ({})", e.message, e.code)))?;
+        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                read_task.abort();
+                return Err(anyhow::Error::msg(format!(
+                    "initialize: {} ({})",
+                    e.message, e.code
+                )));
+            }
+        };
 
-        let server_version = resp
-            .get("server_version")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
-        let tui_id = resp.get("tui_id").and_then(Value::as_str).map(String::from);
-        let tui_sig = resp
-            .get("tui_sig")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let init = match parse_initialize_response(&resp) {
+            Ok(init) => init,
+            Err(e) => {
+                read_task.abort();
+                return Err(e);
+            }
+        };
 
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
@@ -464,11 +534,11 @@ impl RpcClient {
             rpc,
             _read_task: read_task,
             _router_task: router_task,
-            server_version,
+            server_version: init.server_version,
             notifications_bcast: notif_tx,
             connection_state: conn_state,
-            tui_id,
-            tui_sig,
+            tui_id: init.tui_id,
+            tui_sig: init.tui_sig,
             transport: Transport::Local,
         })
     }
@@ -588,22 +658,24 @@ impl RpcClient {
         // them would be misleading at best and silently broken at worst.
         // Env pass-through is only meaningful on a local Unix-socket connection
         // (see `connect` above), where the TUI and daemon share the same filesystem.
-        let resp = rpc
-            .request(method::INITIALIZE, init_params)
-            .await
-            .map_err(|e| anyhow::Error::msg(format!("initialize: {} ({})", e.message, e.code)))?;
+        let resp = match rpc.request(method::INITIALIZE, init_params).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                read_task.abort();
+                return Err(anyhow::Error::msg(format!(
+                    "initialize: {} ({})",
+                    e.message, e.code
+                )));
+            }
+        };
 
-        let server_version = resp
-            .get("server_version")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-
-        let tui_id = resp.get("tui_id").and_then(Value::as_str).map(String::from);
-        let tui_sig = resp
-            .get("tui_sig")
-            .and_then(Value::as_str)
-            .map(String::from);
+        let init = match parse_initialize_response(&resp) {
+            Ok(init) => init,
+            Err(e) => {
+                read_task.abort();
+                return Err(e);
+            }
+        };
 
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
@@ -613,11 +685,11 @@ impl RpcClient {
             rpc,
             _read_task: read_task,
             _router_task: router_task,
-            server_version,
+            server_version: init.server_version,
             notifications_bcast: notif_tx,
             connection_state: conn_state,
-            tui_id,
-            tui_sig,
+            tui_id: init.tui_id,
+            tui_sig: init.tui_sig,
             transport: Transport::Wss,
         })
     }
@@ -682,15 +754,27 @@ impl RpcClient {
     }
 
     pub async fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+        self.call_with_timeout(method, params, std::time::Duration::from_secs(5))
+            .await
+    }
+
+    pub async fn call_with_timeout<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<T> {
         // Timeout prevents indefinite hangs when the daemon dies between
         // the connection-state check and the actual RPC send/recv.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.rpc.request(method, params),
-        )
-        .await
-        .map_err(|_| anyhow::Error::msg(format!("RPC {method}: timed out after 5s")))?
-        .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
+        let result = tokio::time::timeout(timeout, self.rpc.request(method, params))
+            .await
+            .map_err(|_| {
+                anyhow::Error::msg(format!(
+                    "RPC {method}: timed out after {}s",
+                    timeout.as_secs()
+                ))
+            })?
+            .map_err(|e| anyhow::Error::msg(format!("RPC {method}: {} ({})", e.message, e.code)))?;
         serde_json::from_value(result).with_context(|| format!("deserializing {method} result"))
     }
 
@@ -796,6 +880,19 @@ impl RpcClient {
         Ok(result.keys)
     }
 
+    pub async fn config_resolve_alias_source(
+        &self,
+        source: crate::wire::AliasSource,
+    ) -> Result<Vec<String>> {
+        let result: ConfigResolveAliasSourceResult = self
+            .call(
+                method::CONFIG_RESOLVE_ALIAS_SOURCE,
+                serde_json::json!({ "source": source }),
+            )
+            .await?;
+        Ok(result.values)
+    }
+
     pub async fn config_map_key_create(&self, path: &str, key: &str) -> Result<()> {
         let _: Value = self
             .call(
@@ -824,9 +921,10 @@ impl RpcClient {
     }
 
     pub async fn catalog_models(&self, provider: &str) -> Result<CatalogModelsResult> {
-        self.call(
+        self.call_with_timeout(
             method::CONFIG_CATALOG_MODELS,
             serde_json::json!({ "model_provider": provider }),
+            std::time::Duration::from_secs(20),
         )
         .await
     }
@@ -1110,6 +1208,10 @@ impl RpcClient {
         self.call(method::HEALTH, serde_json::json!({})).await
     }
 
+    pub async fn doctor_run(&self) -> Result<DoctorRunResult> {
+        self.call(method::DOCTOR_RUN, serde_json::json!({})).await
+    }
+
     pub async fn cost_query(&self, agent: Option<&str>) -> Result<CostSummaryResult> {
         self.call(method::COST_QUERY, serde_json::json!({ "agent": agent }))
             .await
@@ -1261,6 +1363,52 @@ pub struct ConfigListResult {
 #[serde(rename_all = "snake_case")]
 pub struct ConfigSetResult {}
 
+#[cfg(test)]
+mod initialize_version_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn initialize_response_accepts_matching_server_version() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "tui_id": "tui_1",
+            "tui_sig": "sig_1"
+        }))
+        .unwrap();
+
+        assert_eq!(parsed.server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
+        assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
+    }
+
+    #[test]
+    fn initialize_response_rejects_mismatched_server_version() {
+        let err = parse_initialize_response(&json!({
+            "server_version": "0.0.0-test"
+        }))
+        .unwrap_err();
+        let mismatch = err
+            .downcast_ref::<DaemonVersionMismatch>()
+            .expect("mismatched daemon version should be typed");
+
+        assert_eq!(mismatch.client_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(mismatch.server_version(), "0.0.0-test");
+        assert!(err.to_string().contains("Version mismatch"));
+    }
+
+    #[test]
+    fn initialize_response_rejects_missing_server_version_as_unknown() {
+        let err = parse_initialize_response(&json!({})).unwrap_err();
+        let mismatch = err
+            .downcast_ref::<DaemonVersionMismatch>()
+            .expect("missing daemon version should be typed");
+
+        assert_eq!(mismatch.client_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(mismatch.server_version(), "unknown");
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ConfigDeleteResult {}
@@ -1308,6 +1456,12 @@ pub struct ConfigMapKeysResult {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct ConfigResolveAliasSourceResult {
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct ConfigSectionsResult {
     pub sections: Vec<ConfigSectionEntry>,
 }
@@ -1319,8 +1473,16 @@ pub struct ConfigSectionEntry {
     pub label: String,
     pub help: String,
     pub completed: bool,
+    /// Display group label (`"Foundation"`, `"Tools"`, …) from
+    /// `zeroclaw_config::sections::SectionGroup::label()`. Empty when
+    /// the daemon predates group plumbing — the sections pane falls
+    /// back to the flat ungrouped list.
+    #[serde(default)]
+    pub group: String,
     #[serde(default)]
     pub shape: Option<SectionShape>,
+    #[serde(default)]
+    pub cost_category: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1333,8 +1495,27 @@ pub struct ConfigTemplatesResult {
 #[serde(rename_all = "snake_case")]
 pub struct CatalogModelsResult {
     pub models: Vec<String>,
+    /// Pricing keyed by upstream model id, when the provider's catalog
+    /// returns it. Mirrors the gateway `/api/config/catalog/models` payload
+    /// (same RPC) so the Costs tab can pre-fill rate sheets.
+    #[serde(default)]
+    pub pricing: Option<std::collections::HashMap<String, CatalogModelPricing>>,
     #[serde(default)]
     pub live: bool,
+}
+
+/// Per-token USD pricing strings as emitted by the catalog RPC. Field names
+/// match `zeroclaw_api::model_provider::ModelPricing`; only the rates the
+/// cost-rate sheet consumes are kept.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CatalogModelPricing {
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub completion: Option<String>,
+    #[serde(default)]
+    pub input_cache_read: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1939,8 +2120,6 @@ pub struct TuiListEntry {
 pub struct TuiListResult {
     pub tuis: Vec<TuiListEntry>,
 }
-
-// ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod session_method_tests {
