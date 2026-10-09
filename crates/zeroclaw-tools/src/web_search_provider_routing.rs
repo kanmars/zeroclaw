@@ -5,6 +5,33 @@ pub enum WebSearchProviderRoute {
     SearXNG,
     Tavily,
     Jina,
+    Bocha,
+    AnySearch,
+    Serply,
+    Keenable,
+}
+
+/// Provider HTTP-failure status surfaced to the agent via the error message's
+/// `search_status=` tag. Only the classes `classify_http_status` actually
+/// produces appear here — no speculative variants (wire-or-remove).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchStatus {
+    Blocked,
+    Unavailable,
+    ClientError,
+}
+
+impl SearchStatus {
+    /// Stable lowercase tag embedded in the agent-visible error message
+    /// (`search_status=<tag>`). This is an error-text tag, not a structured
+    /// wire or log-attr contract — the runtime forwards the error as opaque text.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Unavailable => "unavailable",
+            Self::ClientError => "client_error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +46,10 @@ const BRAVE_PROVIDER: &str = "brave";
 const SEARXNG_PROVIDER: &str = "searxng";
 const TAVILY_PROVIDER: &str = "tavily";
 const JINA_PROVIDER: &str = "jina";
+const BOCHA_PROVIDER: &str = "bocha";
+const ANYSEARCH_PROVIDER: &str = "anysearch";
+const SERPLY_PROVIDER: &str = "serply";
+const KEENABLE_PROVIDER: &str = "keenable";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -50,8 +81,32 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
             canonical_provider: JINA_PROVIDER,
             used_fallback: false,
         },
+        "bocha" | "bochaai" | "bocha-ai" | "bocha_ai" | "bocha-search" | "bocha_search" => {
+            WebSearchProviderResolution {
+                route: WebSearchProviderRoute::Bocha,
+                canonical_provider: BOCHA_PROVIDER,
+                used_fallback: false,
+            }
+        }
+        "anysearch" | "any-search" | "any_search" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::AnySearch,
+            canonical_provider: ANYSEARCH_PROVIDER,
+            used_fallback: false,
+        },
+        "serply" | "serply-search" | "serply_search" | "serply-io" | "serply_io" => {
+            WebSearchProviderResolution {
+                route: WebSearchProviderRoute::Serply,
+                canonical_provider: SERPLY_PROVIDER,
+                used_fallback: false,
+            }
+        }
+        "keenable" | "keenable-search" | "keenable_search" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::Keenable,
+            canonical_provider: KEENABLE_PROVIDER,
+            used_fallback: false,
+        },
         // Warns for unknown model_providers, falls back to default.
-        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina.
+        // Known non-default model_providers are matched above.
         _ => WebSearchProviderResolution {
             route: WebSearchProviderRoute::DuckDuckGo,
             canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,
@@ -120,6 +175,62 @@ mod tests {
     }
 
     #[test]
+    fn resolve_aliases_to_bocha() {
+        let bocha_aliases = [
+            "bocha",
+            "bochaai",
+            "bocha-ai",
+            "bocha_ai",
+            "bocha-search",
+            "bocha_search",
+        ];
+        for alias in bocha_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Bocha);
+            assert_eq!(resolved.canonical_provider, BOCHA_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_anysearch() {
+        for alias in ["anysearch", "any-search", "any_search"] {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::AnySearch);
+            assert_eq!(resolved.canonical_provider, ANYSEARCH_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_serply() {
+        let serply_aliases = [
+            "serply",
+            "serply-search",
+            "serply_search",
+            "serply-io",
+            "serply_io",
+        ];
+        for alias in serply_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Serply);
+            assert_eq!(resolved.canonical_provider, SERPLY_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_keenable() {
+        let keenable_aliases = ["keenable", "keenable-search", "keenable_search"];
+        for alias in keenable_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Keenable);
+            assert_eq!(resolved.canonical_provider, KEENABLE_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
     fn resolve_unknown_provider_falls_back_to_default() {
         let resolved = resolve_web_search_provider("bing");
         assert_eq!(resolved.route, WebSearchProviderRoute::DuckDuckGo);
@@ -130,5 +241,36 @@ mod tests {
         assert_eq!(resolved2.route, WebSearchProviderRoute::DuckDuckGo);
         assert_eq!(resolved2.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
         assert!(resolved2.used_fallback);
+    }
+
+    #[test]
+    fn empty_and_default_route_to_duckduckgo_without_fallback() {
+        for alias in ["", "default"] {
+            let r = resolve_web_search_provider(alias);
+            assert_eq!(r.route, WebSearchProviderRoute::DuckDuckGo);
+            assert_eq!(r.canonical_provider, DEFAULT_WEB_SEARCH_PROVIDER);
+            // An explicit empty / "default" is the configured default, not an
+            // unknown-provider fallback (so it must not set used_fallback).
+            assert!(!r.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolution_trims_whitespace_and_ignores_case() {
+        let r = resolve_web_search_provider("  BRAVE  ");
+        assert_eq!(r.route, WebSearchProviderRoute::Brave);
+        assert!(!r.used_fallback);
+
+        let r = resolve_web_search_provider("Tavily-Search");
+        assert_eq!(r.route, WebSearchProviderRoute::Tavily);
+        assert!(!r.used_fallback);
+    }
+
+    #[test]
+    fn search_status_as_str_returns_stable_tags() {
+        // The agent-visible error tag depends on these exact lowercase strings.
+        assert_eq!(SearchStatus::Blocked.as_str(), "blocked");
+        assert_eq!(SearchStatus::Unavailable.as_str(), "unavailable");
+        assert_eq!(SearchStatus::ClientError.as_str(), "client_error");
     }
 }

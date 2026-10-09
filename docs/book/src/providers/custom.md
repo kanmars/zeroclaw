@@ -12,6 +12,21 @@ If the service speaks OpenAI chat-completions, this is a config-only change. The
 
 This is the same `OpenAiCompatibleModelProvider` runtime impl used by `groq`, `mistral`, `xai`, and every other vendor with its own canonical slot in the [catalog](./catalog.md). The difference is which family slot you use: `custom` is the catch-all for endpoints not represented by a vendor slot.
 
+For a gateway that cannot accept image-bearing tool results, omit those payloads while retaining the surrounding tool text. Tool images are declared in an `attachments` array on the native tool-result carrier, so omitting them never edits the result text. This policy governs the native `role = "tool"` carrier's `attachments` array only; prompt-mode tool results (the count-line carrier delivered in a user message) resolve their declared images through a separate path and are unaffected by the setting. To opt in:
+
+```toml
+[providers.models.custom.gateway]
+uri = "https://gateway.example.com/v1"
+model = "my-model"
+tool_result_image_policy = "omit"
+```
+
+### Connection warmup
+
+OpenAI-compatible providers warm the connection with `GET {base_url}/models`, using the same authentication and HTTP client settings as model listing.
+The probe consumes the response body and accepts non-success HTTP status codes, so a service without a models endpoint can still start.
+Chat-completion requests continue to use POST; warmup does not invoke inference or require a model catalog.
+
 ## First-class local-inference servers
 
 ZeroClaw ships canonical slots for popular local-inference stacks. They're all OpenAI-compatible under the hood but with default `uri` values pre-applied so you can usually omit `uri` entirely.
@@ -67,9 +82,12 @@ Slots `lmstudio`, `osaurus`, `litellm` follow the same pattern, see the [catalog
 
 ## Wire protocol: `wire_api = "responses"`
 
-Bring-your-own-endpoint slots default to the OpenAI chat-completions wire. An endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit `wire_api = "responses"` opt-in on the alias entry.
+New **OpenAI** provider slots that are *written to config* (`providers.models.openai.<alias>`, as created by `zeroclaw quickstart` or the gateway/config UI) default to `wire_api = "responses"` because OpenAI's recent GPT models use `POST /v1/responses` as the primary wire. Other bring-your-own-endpoint slots (`custom`, `llamacpp`, and OpenAI-compatible vendors) still default to the chat-completions wire; an endpoint that only speaks the OpenAI **responses** wire (some self-hosted vLLM / TGI deployments) needs an explicit `wire_api = "responses"` opt-in on the alias entry.
 
-When set to `"responses"`, the provider is built as an `OpenAiResponsesModelProvider` (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Omit the field, or set `"chat_completions"`, for the default wire.
+When set to `"responses"`, the provider is built as an `OpenAiResponsesModelProvider` (full streaming tool calls over the responses protocol) instead of a chat-completions provider. Set `"chat_completions"` to force the legacy wire. Two cases keep chat-completions at runtime for backward compatibility, so no existing setup changes wire on upgrade:
+
+- A **persisted** `providers.models.openai.<alias>` entry that omits `wire_api` deserializes as unset and stays on chat-completions.
+- A **bare** `model_provider = "openai"` reference (or a dotted ref to a nonexistent alias) has no config entry to read; it is built from the family fallback and stays on chat-completions. The responses default applies only when a slot is actually written to config.
 
 `wire_api` is honored by the bring-your-own-endpoint families where the wire is operator-configurable: `openai`, `llamacpp`, and `custom` (plus the generic openai-compatible path). Branded vendor slots (`groq`, `mistral`, `deepseek`, …) have a fixed wire protocol and ignore the field, with one exception: `opencode` honors `wire_api = "responses"` because OpenCode Zen serves both wires. With no `uri` override, the OpenCode responses route targets `https://opencode.ai/zen/v1/responses`:
 
@@ -81,6 +99,24 @@ wire_api = "responses"
 
 The setting governs both the primary agent path and delegate targets, so a delegate whose target alias declares `wire_api = "responses"` reaches the endpoint over the responses wire.
 
+### OpenCode session affinity
+
+Every inference request to an `opencode.ai` host carries an `x-opencode-session` header on both wires, streaming and non-streaming. OpenCode uses it to pin one conversation's turns to the same upstream backend, which keeps that backend's prompt cache warm across turns; upstream also lists it under the guidance for keeping an account from being flagged, and some OpenCode Go models reject header-less requests outright. Model-catalog and warmup requests (`GET /models`) do not carry the header: they are not part of a conversation, so there is no backend to pin.
+
+The value is an opaque 128-bit hex token derived from the active conversation scope, so each conversation pins to its own backend and the same conversation keeps its backend across a daemon restart. The conversation's session key is **hashed, never sent**: session keys embed channel and user identifiers, and forwarding one verbatim would hand a third-party relay a per-user identifier. Inference requests made outside any conversation share one process-stable token instead.
+
+Nothing needs configuring. To pin the value yourself, for instance to share one affinity scope across replicas, set it explicitly and ZeroClaw leaves it alone:
+
+```toml
+[providers.models.opencode.default]
+model = "big-pickle"
+
+[providers.models.opencode.default.extra_headers]
+x-opencode-session = "my-fixed-scope"
+```
+
+Hosts other than `opencode.ai` and its subdomains never receive the header. To keep it that way, OpenCode requests follow a redirect only within the same host: a redirect to a different host is not followed, and the request fails with that redirect status.
+
 ## Validation
 
 Regardless of approach:
@@ -91,7 +127,7 @@ Regardless of approach:
 
 ```sh
 zeroclaw config list                          # loads config; any validation failures print to stderr
-zeroclaw models refresh --provider <type>.<alias>   # list models the endpoint advertises
+zeroclaw models refresh --model-provider <type>.<alias>   # list models the endpoint advertises
 zeroclaw agent -a <alias> -m "hello"          # smoke-test against the agent at `[agents.<alias>]`
 ```
 

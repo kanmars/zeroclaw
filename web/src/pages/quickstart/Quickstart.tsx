@@ -28,6 +28,15 @@ import {
 } from "@/lib/api";
 import { Badge, Button, Card, PageHeader } from "@/components/ui";
 import { t } from "@/lib/i18n";
+import {
+  requiredQuickstartSelectionsComplete,
+  runtimeAfterProviderChange,
+  runtimeDefaultForProvider,
+  runtimeValueForSubmit,
+  type RuntimeSelection,
+} from "./runtime-selection";
+import { ChannelAddForm, type StagedChannel } from "./ChannelAddForm";
+import { LabeledInput } from "./quickstart-form-controls";
 
 // Shared tokenized field control classes. Calm input surface with an accent
 // focus ring — replaces the legacy `input-electric` utility.
@@ -47,13 +56,6 @@ interface StagedProvider {
   fields: Record<string, string>;
 }
 
-interface StagedChannel {
-  mode: "fresh" | "existing";
-  channel_type: string;
-  alias: string;
-  extras: Record<string, string>;
-}
-
 interface StagedPeerGroup {
   /** Default `<type>_<alias>_default`, derived from the channel ref. */
   name: string;
@@ -67,10 +69,6 @@ interface StagedPersonalityFile {
   content: string;
 }
 
-/** A preset selection — typed wrapper around a `preset_name` so the
- *  shape can't carry a raw user-typed string. The only way to construct
- *  one is via the `PresetSection` picker, which sources values from
- *  `state.risk_presets` / `state.runtime_presets` / `state.memory_kinds`. */
 interface StagedPreset {
   preset_name: string;
 }
@@ -78,7 +76,7 @@ interface StagedPreset {
 interface FormState {
   provider: StagedProvider | null;
   risk: StagedPreset | null;
-  runtime: StagedPreset | null;
+  runtime: RuntimeSelection | null;
   memory: StagedPreset | null;
   channels: StagedChannel[];
   peerGroups: StagedPeerGroup[];
@@ -99,7 +97,6 @@ const DEFAULT_FORM: FormState = {
 
 const MUTED = { color: "var(--pc-text-muted)" } as const;
 const FAINT = { color: "var(--pc-text-faint)" } as const;
-const ERROR = { color: "var(--color-status-error)" } as const;
 
 export default function Quickstart() {
   const navigate = useNavigate();
@@ -112,6 +109,7 @@ export default function Quickstart() {
   );
   const lastStepRef = useRef<QuickstartStep | null>(null);
   const submittedRef = useRef(false);
+  const runtimeAutoDefaultedRef = useRef(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,18 +118,12 @@ export default function Quickstart() {
         const s = await getQuickstartState();
         if (!cancelled) {
           setState(s);
-          // Default the runtime profile to the previously-hardcoded value
-          // ("unbounded") so behaviour is unchanged unless the user picks
-          // another preset. Fall back to the first preset if the daemon ever
-          // drops "unbounded" from the list. Don't clobber a user choice.
-          const defaultRuntime =
-            s.runtime_presets.find((p) => p.preset_name === "unbounded") ??
-            s.runtime_presets[0];
+          const defaultRuntime = runtimeDefaultForProvider(s);
           if (defaultRuntime) {
             setForm((f) =>
               f.runtime
                 ? f
-                : { ...f, runtime: { preset_name: defaultRuntime.preset_name } },
+                : { ...f, runtime: { preset_name: defaultRuntime } },
             );
           }
         }
@@ -165,6 +157,8 @@ export default function Quickstart() {
   };
 
   const submit = async () => {
+    const runtimeProfile = runtimeValueForSubmit(form.runtime);
+    if (!runtimeProfile) return;
     setBusy(true);
     setErrors([]);
     const res = await quickstartApply({
@@ -172,7 +166,7 @@ export default function Quickstart() {
       risk_profile: { mode: "fresh", value: form.risk!.preset_name },
       runtime_profile: {
         mode: "fresh",
-        value: form.runtime?.preset_name ?? "unbounded",
+        value: runtimeProfile,
       },
       memory: { mode: "fresh", value: form.memory!.preset_name },
       channels: form.channels.map((c) =>
@@ -183,11 +177,7 @@ export default function Quickstart() {
               value: {
                 channel_type: c.channel_type,
                 alias: c.alias,
-                token:
-                  c.extras["bot_token"] ??
-                  c.extras["token"] ??
-                  c.extras["access_token"] ??
-                  null,
+                fields: c.fields,
               },
             },
       ),
@@ -210,15 +200,17 @@ export default function Quickstart() {
 
   const providerDone = form.provider !== null;
   const riskDone = form.risk !== null;
+  const runtimeDone = form.runtime !== null;
   const memoryDone = form.memory !== null;
   const agentDone = form.agentName.trim() !== "";
-  const allDone = providerDone && riskDone && memoryDone && agentDone;
+  const allDone = requiredQuickstartSelectionsComplete(form);
 
   // Required-step progress for the wizard stepper. Channels / peer groups /
   // personality files are optional and intentionally excluded from the gate.
   const steps = [
     { label: t("quickstart.step_provider"), done: providerDone },
     { label: t("quickstart.step_risk"), done: riskDone },
+    { label: t("quickstart.runtime_profile_title"), done: runtimeDone },
     { label: t("quickstart.step_memory"), done: memoryDone },
     { label: t("quickstart.step_agent"), done: agentDone },
   ];
@@ -280,7 +272,19 @@ export default function Quickstart() {
           <ProviderForm
             state={state}
             onStage={(p) => {
-              setForm((f) => ({ ...f, provider: p }));
+              setForm((f) => {
+                const runtime = runtimeAfterProviderChange(
+                  state,
+                  p.provider_type,
+                  f.runtime,
+                  runtimeAutoDefaultedRef.current,
+                );
+                return {
+                  ...f,
+                  provider: p,
+                  runtime,
+                };
+              });
               recordStep("model_provider");
             }}
           />
@@ -312,6 +316,7 @@ export default function Quickstart() {
         }))}
         value={form.runtime?.preset_name ?? ""}
         onChange={(v) => {
+          runtimeAutoDefaultedRef.current = false;
           setForm((f) => ({ ...f, runtime: { preset_name: v } }));
           recordStep("runtime_profile");
         }}
@@ -403,7 +408,9 @@ export default function Quickstart() {
           label={t("common.name")}
           value={form.agentName}
           onChange={(v) => {
-            setForm((f) => ({ ...f, agentName: v }));
+            // Agent aliases must be lowercase — normalize as the user types so
+            // a stray capital (or paste) can't fail validation at apply time.
+            setForm((f) => ({ ...f, agentName: v.toLowerCase() }));
             recordStep("agent");
           }}
           placeholder={t("quickstart.agent_name_placeholder")}
@@ -639,21 +646,17 @@ function StagedRow({
   );
 }
 
-function LabeledInput({
+function LabeledSelect({
   label,
   value,
   onChange,
-  type = "text",
-  placeholder,
-  multiline = false,
+  options,
   help,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
-  type?: "text" | "password";
-  placeholder?: string;
-  multiline?: boolean;
+  options: string[];
   help?: string;
 }) {
   return (
@@ -666,22 +669,17 @@ function LabeledInput({
           {help}
         </div>
       ) : null}
-      {multiline ? (
-        <textarea
-          className={`${TEXTAREA_CLASS} min-h-24`}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-        />
-      ) : (
-        <input
-          className={INPUT_CLASS}
-          type={type}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={placeholder}
-        />
-      )}
+      <select
+        className={INPUT_CLASS}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </select>
     </label>
   );
 }
@@ -723,10 +721,15 @@ function ProviderForm({
           setDescriptors(f.fields);
           // Reset the buffer to an empty value per descriptor so the
           // ghost-text placeholder (descriptor.default) is what the
-          // user sees until they type.
+          // user sees until they type. Enum rows are different: the
+          // selected value is real state, so seed it from the descriptor
+          // default or first variant and submit it back.
           const next: Record<string, string> = {};
           for (const d of f.fields) {
-            next[d.key] = "";
+            next[d.key] =
+              d.enum_variants && d.enum_variants.length > 0
+                ? (d.default ?? d.enum_variants[0] ?? "")
+                : "";
           }
           setFieldValues(next);
         }
@@ -818,19 +821,44 @@ function ProviderForm({
 
       {descriptors
         .filter((d) => d.key !== "model")
-        .map((d) => (
-          <LabeledInput
-            key={d.key}
-            label={d.label}
-            help={d.help}
-            type={d.is_secret ? "password" : "text"}
-            value={fieldValues[d.key] ?? ""}
-            placeholder={d.default ?? ""}
-            onChange={(value) =>
-              setFieldValues((prev) => ({ ...prev, [d.key]: value }))
-            }
-          />
-        ))}
+        .filter(
+          (d) =>
+            !(
+              d.key === "api_key" &&
+              (fieldValues["auth_mode"] ?? "").trim() === "codex"
+            ),
+        )
+        .map((d) =>
+          d.enum_variants && d.enum_variants.length > 0 ? (
+            <LabeledSelect
+              key={d.key}
+              label={d.label}
+              help={d.help}
+              options={d.enum_variants}
+              value={
+                fieldValues[d.key] ??
+                d.default ??
+                d.enum_variants[0] ??
+                ""
+              }
+              onChange={(value) =>
+                setFieldValues((prev) => ({ ...prev, [d.key]: value }))
+              }
+            />
+          ) : (
+            <LabeledInput
+              key={d.key}
+              label={d.label}
+              help={d.help}
+              type={d.is_secret ? "password" : "text"}
+              value={fieldValues[d.key] ?? ""}
+              placeholder={d.default ?? ""}
+              onChange={(value) =>
+                setFieldValues((prev) => ({ ...prev, [d.key]: value }))
+              }
+            />
+          ),
+        )}
 
       <div className="flex justify-end">
         <Button
@@ -927,173 +955,6 @@ function ChannelsList({
         </Button>
       )}
     </>
-  );
-}
-
-function ChannelAddForm({
-  state,
-  inConfig,
-  inFlight,
-  reusable,
-  onAdd,
-  onCancel,
-}: {
-  state: QuickstartState | null;
-  inConfig: Set<string>;
-  inFlight: Set<string>;
-  reusable: string[];
-  onAdd: (c: StagedChannel) => void;
-  onCancel: () => void;
-}) {
-  const [mode, setMode] = useState<"existing" | "fresh">(
-    reusable.length > 0 ? "existing" : "fresh",
-  );
-  const [existingRef, setExistingRef] = useState(reusable[0] ?? "");
-  const [type, setType] = useState("");
-  const [alias, setAlias] = useState("");
-  const [descriptors, setDescriptors] = useState<QuickstartFieldDescriptor[]>(
-    [],
-  );
-  const [extras, setExtras] = useState<Record<string, string>>({});
-
-  useEffect(() => {
-    if (mode !== "fresh" || !type) {
-      setDescriptors([]);
-      return;
-    }
-    let cancelled = false;
-    void (async () => {
-      try {
-        const f = await quickstartFields({ section: "channel", type_key: type });
-        if (!cancelled) setDescriptors(f.fields);
-      } catch {
-        if (!cancelled) setDescriptors([]);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [mode, type]);
-
-  const freshRef = type && alias.trim() ? `${type}.${alias.trim()}` : "";
-  const conflict =
-    freshRef !== "" && (inConfig.has(freshRef) || inFlight.has(freshRef));
-  const canAdd =
-    mode === "existing"
-      ? existingRef !== ""
-      : type !== "" && alias.trim() !== "" && !conflict;
-
-  const submit = () => {
-    if (mode === "existing") {
-      const [t, a] = existingRef.split(".");
-      if (!t || !a) return;
-      onAdd({ mode: "existing", channel_type: t, alias: a, extras: {} });
-    } else {
-      onAdd({
-        mode: "fresh",
-        channel_type: type,
-        alias: alias.trim(),
-        extras,
-      });
-    }
-  };
-
-  return (
-    <Card className="p-4 space-y-3 bg-pc-elevated">
-      <div className="flex gap-2">
-        <Button
-          variant={mode === "existing" ? "primary" : "ghost"}
-          size="sm"
-          disabled={reusable.length === 0}
-          onClick={() => setMode("existing")}
-        >
-          {t("quickstart.use_existing")}
-        </Button>
-        <Button
-          variant={mode === "fresh" ? "primary" : "ghost"}
-          size="sm"
-          onClick={() => setMode("fresh")}
-        >
-          {t("quickstart.create_new")}
-        </Button>
-        <div className="flex-1" />
-        <Button variant="ghost" size="sm" onClick={onCancel}>
-          {t("common.cancel")}
-        </Button>
-      </div>
-
-      {mode === "existing" ? (
-        reusable.length === 0 ? (
-          <div className="text-xs" style={MUTED}>
-            {t("quickstart.no_unassigned_channels")}
-          </div>
-        ) : (
-          <select
-            className={INPUT_CLASS}
-            value={existingRef}
-            onChange={(e) => setExistingRef(e.target.value)}
-          >
-            {reusable.map((r) => (
-              <option key={r} value={r}>
-                {r}
-              </option>
-            ))}
-          </select>
-        )
-      ) : (
-        <>
-          <label className="block">
-            <div className="text-xs uppercase tracking-wider mb-1" style={MUTED}>
-              {t("quickstart.channel_type")}
-            </div>
-            <select
-              className={INPUT_CLASS}
-              value={type}
-              onChange={(e) => {
-                const next = e.target.value;
-                setType(next);
-                setAlias((prev) => (prev === "" || prev === type ? next : prev));
-                setExtras({});
-              }}
-            >
-              <option value="" disabled>
-                {t("quickstart.pick_channel_type")}
-              </option>
-              {state?.channel_types.map((opt) => (
-                <option key={opt.kind} value={opt.kind}>
-                  {opt.display_name}
-                </option>
-              ))}
-            </select>
-          </label>
-
-          <LabeledInput label={t("quickstart.alias_label")} value={alias} onChange={setAlias} />
-          {conflict && (
-            <div className="text-xs" style={ERROR}>
-              <code>{freshRef}</code> {t("quickstart.already_exists")}
-            </div>
-          )}
-
-          {descriptors.map((d) => (
-            <LabeledInput
-              key={d.key}
-              label={d.label}
-              type={d.is_secret ? "password" : "text"}
-              value={extras[d.key] ?? ""}
-              onChange={(v) => setExtras((x) => ({ ...x, [d.key]: v }))}
-              placeholder={d.help}
-            />
-          ))}
-        </>
-      )}
-
-      <div className="flex justify-end">
-        <Button size="sm" disabled={!canAdd} onClick={submit}>
-          <Plus className="h-3.5 w-3.5" />
-          {t("quickstart.add")}
-        </Button>
-      </div>
-    </Card>
   );
 }
 

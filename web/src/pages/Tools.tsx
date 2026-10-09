@@ -21,21 +21,30 @@ import {
   patchConfig,
   ApiError,
 } from '@/lib/api';
+import { loadAgentPickerSummaries, type AgentPickerSummary } from '@/lib/agents';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
+import {
+  applyToolAccessPatch,
+  buildToolAccessPatch,
+  type ToolAccess,
+} from './Tools.logic';
 
 // ── Risk-profile tool access ────────────────────────────────────────────
 // Per-profile allow/exclude state for the tool-access matrix in each expanded
 // tool card. zeroclaw's gate (crates/zeroclaw-config policy + runtime):
-//   • allowed_tools EMPTY  → unrestricted (every tool allowed)
-//   • allowed_tools [list] → only those tools allowed
-//   • excluded_tools       → denylist, wins over allow
+//   • allowed_tools omitted or []  → unrestricted (every tool allowed)
+//   • deny_all_tools = true        → deny-all (nothing allowed)
+//   • allowed_tools [list]         → only those tools allowed — and any
+//     `<server>__<tool>` MCP-shaped name is auto-admitted without being
+//     listed (the runtime's `__` exception for nonempty allowlists)
+//   • excluded_tools               → denylist, wins over allow
 // So we never silently convert an unrestricted profile into an allowlist:
 // BLOCK adds to excluded_tools (no side effects on other tools); ALLOW clears
-// the exclusion and, only when the profile is already an allowlist, adds the
-// tool to it.
+// the exclusion and adds the tool only when an explicit gate is active.
 interface ProfileAccess {
-  allowed: string[];
+  allowed: string[] | null;
+  denyAll: boolean;
   excluded: string[];
 }
 
@@ -55,16 +64,51 @@ function parseStrArray(raw: unknown): string[] {
     .filter(Boolean);
 }
 
+// Parse the allowed_tools entry. `null`/unset and `[]` are both the legacy
+// unrestricted state; a bare `__none__` (the pre-flag sentinel operators
+// hand-wrote to fake deny-all) is surfaced as the explicit deny-all intent.
+function parseOptionalStrArray(raw: unknown): {
+  allowed: string[] | null;
+  sentinelDenyAll: boolean;
+} {
+  if (raw == null) return { allowed: null, sentinelDenyAll: false };
+  if (typeof raw === 'string' && (raw.length === 0 || raw === '<unset>' || raw.trim() === 'null')) {
+    return { allowed: null, sentinelDenyAll: false };
+  }
+  const names = parseStrArray(raw);
+  const real = names.filter((name) => name !== '__none__');
+  if (names.includes('__none__') && real.length === 0) {
+    return { allowed: null, sentinelDenyAll: true };
+  }
+  return { allowed: real.length > 0 ? real : null, sentinelDenyAll: false };
+}
+
+function parseDenyAll(raw: unknown): boolean {
+  return raw === true || raw === 'true';
+}
+
+// Mirrors the runtime auto-admit exception: under a nonempty allowlist, any
+// name containing `__` (the `<server>__<tool>` MCP convention) is admitted
+// even when not listed. See ToolPermissionGrid.logic.ts and
+// crates/zeroclaw-tools/src/tool_search.rs.
+function isMcpAutoAdmitted(tool: string, allowed: string[]): boolean {
+  return allowed.length > 0 && tool.includes('__');
+}
+
 function isToolAllowed(tool: string, a: ProfileAccess): boolean {
   if (a.excluded.includes(tool)) return false;
-  if (a.allowed.length === 0) return true; // unrestricted
-  return a.allowed.includes(tool);
+  if (a.denyAll) return false;
+  if (a.allowed === null) return true;
+  return a.allowed.includes(tool) || isMcpAutoAdmitted(tool, a.allowed);
 }
 
 function accessReason(tool: string, a: ProfileAccess): string {
   if (a.excluded.includes(tool)) return t('tools.reason_excluded');
-  if (a.allowed.length === 0) return t('tools.reason_all_allowed');
-  return a.allowed.includes(tool) ? t('tools.reason_in_allowlist') : t('tools.reason_not_in_allowlist');
+  if (a.denyAll) return t('tools.reason_deny_all');
+  if (a.allowed === null) return t('tools.reason_all_allowed');
+  if (a.allowed.includes(tool)) return t('tools.reason_in_allowlist');
+  if (isMcpAutoAdmitted(tool, a.allowed)) return t('tools.reason_mcp_auto_admitted');
+  return t('tools.reason_not_in_allowlist');
 }
 
 export default function Tools() {
@@ -77,16 +121,42 @@ export default function Tools() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  // Agent selector. Empty string = the gateway's default agent listing
+  // (no `?agent=`). The agent-tools list re-fetches scoped to the pick so
+  // each agent's own tools (built-ins + its `mcp_bundles` MCP tools) show,
+  // instead of one arbitrary agent's.
+  const [agents, setAgents] = useState<AgentPickerSummary[]>([]);
+  const [selectedAgent, setSelectedAgent] = useState('');
+
   // Risk-profile access, keyed by profile name. `null` until loaded.
   const [access, setAccess] = useState<Record<string, ProfileAccess> | null>(null);
   const [accessError, setAccessError] = useState<string | null>(null);
 
+  // Agent list for the selector (non-fatal: the page still works as the
+  // default listing if this fails).
   useEffect(() => {
-    Promise.all([getTools(), getCliTools()])
-      .then(([t, c]) => { setTools(t); setCliTools(c); })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false));
+    loadAgentPickerSummaries()
+      .then(setAgents)
+      .catch(() => setAgents([]));
   }, []);
+
+  // CLI tools are not agent-scoped, so load them once.
+  useEffect(() => {
+    getCliTools()
+      .then(setCliTools)
+      .catch((err) => setError(err.message));
+  }, []);
+
+  // Agent tools re-fetch whenever the selected agent changes.
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getTools(selectedAgent || undefined)
+      .then((toolList) => { if (!cancelled) setTools(toolList); })
+      .catch((err) => { if (!cancelled) setError(err.message); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [selectedAgent]);
 
   // Load every risk profile's allowed/excluded tool lists for the matrix.
   useEffect(() => {
@@ -97,13 +167,18 @@ export default function Tools() {
         const entriesPerProfile = await Promise.all(
           keys.map(async (name) => {
             const { entries } = await listProps(`risk_profiles.${name}`);
-            const allowed = parseStrArray(
+            const allowlist = parseOptionalStrArray(
               entries.find((e) => e.path === `risk_profiles.${name}.allowed_tools`)?.value,
             );
+            const denyAll =
+              allowlist.sentinelDenyAll ||
+              parseDenyAll(
+                entries.find((e) => e.path === `risk_profiles.${name}.deny_all_tools`)?.value,
+              );
             const excluded = parseStrArray(
               entries.find((e) => e.path === `risk_profiles.${name}.excluded_tools`)?.value,
             );
-            return [name, { allowed, excluded }] as const;
+            return [name, { allowed: allowlist.allowed, denyAll, excluded }] as const;
           }),
         );
         if (!cancelled) setAccess(Object.fromEntries(entriesPerProfile));
@@ -122,34 +197,18 @@ export default function Tools() {
     async (profile: string, tool: string, makeAllowed: boolean) => {
       const current = access?.[profile];
       if (!current) return;
-      const allowed = [...current.allowed];
-      let excluded = [...current.excluded];
-      if (makeAllowed) {
-        excluded = excluded.filter((x) => x !== tool);
-        if (allowed.length > 0 && !allowed.includes(tool)) allowed.push(tool);
-      } else if (!excluded.includes(tool)) {
-        excluded.push(tool);
-      }
-      const ops: Parameters<typeof patchConfig>[0] = [];
-      if (JSON.stringify(allowed) !== JSON.stringify(current.allowed)) {
-        ops.push({ op: 'replace', path: `risk_profiles.${profile}.allowed_tools`, value: allowed });
-      }
-      if (JSON.stringify(excluded) !== JSON.stringify(current.excluded)) {
-        ops.push({
-          op: 'replace',
-          path: `risk_profiles.${profile}.excluded_tools`,
-          value: excluded.length > 0 ? excluded : null,
-        });
-      }
-      if (ops.length === 0) return;
-      const next = { allowed, excluded };
-      setAccess((prev) => (prev ? { ...prev, [profile]: next } : prev));
+      const change = buildToolAccessPatch(profile, tool, current, makeAllowed);
+      if (!change) return;
       setAccessError(null);
       try {
-        await patchConfig(ops);
+        await applyToolAccessPatch(
+          change,
+          patchConfig,
+          (state: ToolAccess) => {
+            setAccess((prev) => (prev ? { ...prev, [profile]: state } : prev));
+          },
+        );
       } catch (e) {
-        // Revert on failure.
-        setAccess((prev) => (prev ? { ...prev, [profile]: current } : prev));
         setAccessError(
           e instanceof ApiError
             ? `[${e.envelope.code}] ${e.envelope.message}`
@@ -205,6 +264,22 @@ export default function Tools() {
         }
         actions={
           <div className="flex items-center gap-2 flex-wrap justify-end">
+            {agents.length > 0 && (
+              <select
+                value={selectedAgent}
+                onChange={(e) => setSelectedAgent(e.target.value)}
+                className="h-9 min-w-0 max-w-full rounded-[var(--radius-md)] border border-pc-border bg-pc-input px-3 text-sm font-medium text-pc-text-secondary transition-colors focus:outline-none focus:border-pc-border-strong focus:ring-2 focus:ring-[var(--pc-focus)]/30"
+                aria-label={t('tools.agent_select_label')}
+                title={t('tools.agent_select_label')}
+              >
+                <option value="">{t('tools.agent_select_default')}</option>
+                {agents.map((a) => (
+                  <option key={a.alias} value={a.alias} disabled={!a.enabled}>
+                    {a.alias}{a.enabled ? '' : ` (${t('tools.agent_disabled')})`}
+                  </option>
+                ))}
+              </select>
+            )}
             <div className="relative w-64 max-w-full">
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-pc-text-faint pointer-events-none" />
               <input

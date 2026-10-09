@@ -1,5 +1,4 @@
 //! ClawdTalk voice channel - real-time voice calling via Telnyx SIP infrastructure.
-//!
 //! ClawdTalk (<https://clawdtalk.com>) provides AI-powered voice conversations
 //! using Telnyx's global SIP network for low-latency, high-quality calls.
 
@@ -37,10 +36,12 @@ impl ClawdTalkChannel {
             from_number: config.from_number,
             allowed_destinations: config.allowed_destinations,
             alias: alias.into(),
-            client: Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            client: zeroclaw_config::schema::apply_runtime_proxy_to_builder(
+                Client::builder().timeout(std::time::Duration::from_secs(30)),
+                "channel.clawdtalk",
+            )
+            .build()
+            .unwrap_or_else(|_| Client::new()),
         }
     }
 
@@ -269,6 +270,16 @@ impl ::zeroclaw_api::attribution::Attributable for ClawdTalkChannel {
 
 #[async_trait]
 impl Channel for ClawdTalkChannel {
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // ClawdTalk has no typing-indicator endpoint.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // ClawdTalk has no typing-indicator endpoint.
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "ClawdTalk"
     }

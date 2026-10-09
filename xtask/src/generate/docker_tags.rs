@@ -11,7 +11,15 @@ struct TagSpec {
     stem: &'static str,
     selection: Selection,
     dockerfile: &'static str,
+    /// Build platforms the docker-publish workflow targets for this tag. Only
+    /// `Dockerfile` carries the cross-compilation logic that builds an arm64
+    /// image without emulating the Rust build under QEMU; `Containerfile` is
+    /// amd64-only until the same cross-build support lands there.
+    platforms: &'static str,
 }
+
+const MULTI_ARCH: &str = "linux/amd64,linux/arm64";
+const AMD64_ONLY: &str = "linux/amd64";
 
 /// The canonical tag set. Each selection maps to a stem + the dockerfile that
 /// realizes it. Driven by selections, not literal tag strings.
@@ -21,21 +29,25 @@ fn tag_specs() -> Vec<TagSpec> {
             stem: "minimal",
             selection: Selection::Minimal,
             dockerfile: "Dockerfile",
+            platforms: MULTI_ARCH,
         },
         TagSpec {
             stem: "default-features",
             selection: Selection::Full,
             dockerfile: "Dockerfile",
+            platforms: MULTI_ARCH,
         },
         TagSpec {
             stem: "dist",
             selection: Selection::Dist,
             dockerfile: "Dockerfile",
+            platforms: MULTI_ARCH,
         },
         TagSpec {
             stem: "all-features",
             selection: Selection::All,
             dockerfile: "Containerfile",
+            platforms: AMD64_ONLY,
         },
     ]
 }
@@ -57,6 +69,7 @@ pub fn render(root: &Path) -> anyhow::Result<String> {
         out.push_str(&format!("pinned_tag = \"{}-v{version}\"\n", ts.stem));
         out.push_str(&format!("floating_tag = \"{}\"\n", ts.stem));
         out.push_str(&format!("dockerfile = \"{}\"\n", ts.dockerfile));
+        out.push_str(&format!("platforms = \"{}\"\n", ts.platforms));
         out.push_str(&format!("flags = \"{flags}\"\n"));
         out.push_str(&format!("features = \"{features}\"\n\n"));
     }
@@ -100,6 +113,61 @@ mod tests {
         assert_eq!(dist["floating_tag"].as_str().unwrap(), "dist");
     }
 
+    // B6: the reusable relay image publish job must build from the SAME immutable
+    // ref the caller requested (`inputs.release_ref`) and derive its pinned tag
+    // from that ref, exactly like the main image job. Otherwise a workflow_call
+    // release builds/publishes the relay from the wrong ref under a mismatched
+    // SHA tag.
+    #[test]
+    fn publish_relay_pins_release_ref_for_provenance() {
+        let wf =
+            std::fs::read_to_string(root().join(".github/workflows/docker-publish.yml")).unwrap();
+        let (_, relay) = wf
+            .split_once("publish-relay:")
+            .expect("publish-relay job must exist");
+        // Stop at the next job so we only assert against this job's block.
+        let relay = relay.split("\n  scan-relay:").next().unwrap_or(relay);
+
+        assert!(
+            relay.contains("ref: ${{ inputs.release_ref || github.ref }}"),
+            "publish-relay must check out the release ref, not the triggering ref"
+        );
+        assert!(
+            relay.contains("RELEASE_REF: ${{ inputs.release_ref }}")
+                && relay.contains("-zerorelay:${RELEASE_REF}"),
+            "publish-relay must derive its pinned tag from inputs.release_ref"
+        );
+    }
+
+    // B7: the signed relay image must build with --locked so it cannot resolve
+    // newer semver-compatible deps than the reviewed Cargo.lock.
+    #[test]
+    fn relay_dockerfile_build_is_lockfile_enforced() {
+        let dockerfile = std::fs::read_to_string(root().join("apps/zerorelay/Dockerfile")).unwrap();
+        assert!(
+            dockerfile.contains("cargo build --release --locked -p zerorelay"),
+            "the relay image build must use --locked for a reproducible signed artifact"
+        );
+        assert!(
+            !dockerfile.contains("cargo build --release -p zerorelay"),
+            "the relay image build must not have an unlocked cargo build path"
+        );
+    }
+
+    #[test]
+    fn dockerfile_tags_are_multi_arch_containerfile_is_amd64_only() {
+        let s = render(&root()).unwrap();
+        let v: toml::Value = toml::from_str(&s).unwrap();
+        for t in v["tags"].as_array().unwrap() {
+            let platforms = t["platforms"].as_str().unwrap();
+            match t["dockerfile"].as_str().unwrap() {
+                "Dockerfile" => assert_eq!(platforms, "linux/amd64,linux/arm64"),
+                "Containerfile" => assert_eq!(platforms, "linux/amd64"),
+                other => panic!("unexpected dockerfile {other}"),
+            }
+        }
+    }
+
     #[test]
     fn minimal_carries_no_default_flag_default_features_does_not() {
         let s = render(&root()).unwrap();
@@ -119,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn dist_tag_ships_channels_all_tag_ships_heavyweight() {
+    fn dist_tag_is_lean_while_all_tag_is_kitchen_sink() {
         let s = render(&root()).unwrap();
         let v: toml::Value = toml::from_str(&s).unwrap();
         let tags = v["tags"].as_array().unwrap();
@@ -131,13 +199,21 @@ mod tests {
             .iter()
             .find(|t| t["stem"].as_str() == Some("all-features"))
             .unwrap();
-        assert!(
-            dist["features"]
-                .as_str()
-                .unwrap()
-                .contains("channel-discord")
-        );
-        assert!(!dist["features"].as_str().unwrap().contains("hardware"));
+        let dist_features = dist["features"].as_str().unwrap();
+        for feature in
+            crate::generate::spec::resolve_feature_list(&root(), &Selection::Dist).unwrap()
+        {
+            assert!(
+                dist_features.contains(&feature),
+                "dist feature {feature} not rendered"
+            );
+        }
+        for feature in crate::generate::spec::features_outside_dist(&root()).unwrap() {
+            assert!(
+                !dist_features.contains(&feature),
+                "{feature} leaked into lean dist"
+            );
+        }
         assert!(all["features"].as_str().unwrap().contains("hardware"));
     }
 }

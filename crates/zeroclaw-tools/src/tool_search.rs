@@ -1,9 +1,4 @@
 //! Built-in `tool_search` tool for on-demand MCP tool schema loading.
-//!
-//! When `mcp.deferred_loading` is enabled, this tool lets the LLM discover and
-//! activate deferred MCP tools. Supports two query modes:
-//! - `select:name1,name2` — fetch exact tools by prefixed name.
-//! - Free-text keyword search — returns the best-matching stubs.
 
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
@@ -11,37 +6,13 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 
 /// Default maximum number of search results.
 const DEFAULT_MAX_RESULTS: usize = 5;
 
 type ActivationHook = Arc<dyn Fn(Arc<dyn Tool>) + Send + Sync>;
 
-/// Tool-level access policy applied at discovery time.
-///
-/// When set on `ToolSearchTool`, deferred tools that fail this check are
-/// never surfaced to the LLM and never activated — keeping them out of
-/// the context window entirely.
-///
-/// The policy carries two independent allow-list gates that are AND-ed
-/// together, plus a single deny-list:
-///
-/// - `allowed`: the agent's risk-profile allow-list. The MCP
-///   `<server>__<tool>` auto-admit exception (any name containing `__`
-///   passes when the list is non-empty) applies **only** to this gate.
-///   This is the high-risk default-accept-unless-denied shift introduced
-///   in PR #7547 so that the post-#7464 `mcp.enabled = true` default
-///   actually surfaces discovered MCP tools to agents.
-/// - `caller_allowed`: a caller-supplied per-run allow-list (cron job
-///   `allowed_tools`, narrowed delegate invocations, etc.). This is a
-///   strict explicit-list intersection — there is **no** MCP auto-admit
-///   on this gate. PR #7547 review (Audacity88, singlerider) called out
-///   that collapsing this list into `allowed` made per-run narrowing
-///   stop working as a capability boundary the moment an MCP server was
-///   configured.
-/// - `denied`: subtracts from the final set. Applies to both gates and
-///   to auto-admitted MCP names.
 #[derive(Clone, Default)]
 pub struct ToolAccessPolicy {
     pub allowed: Option<Vec<String>>,
@@ -50,16 +21,6 @@ pub struct ToolAccessPolicy {
 }
 
 impl ToolAccessPolicy {
-    /// Construct from a `SecurityPolicy`'s tool fields and an optional
-    /// caller-supplied allowlist. Used by both `run()` and
-    /// `process_message()` to keep policy construction in sync.
-    ///
-    /// The risk-profile `allowed_tools` and the caller-supplied
-    /// `caller_allowed` are kept as two separate gates inside the
-    /// returned policy. Per PR #7547 review, this is required so the
-    /// MCP `<server>__<tool>` auto-admit exception that applies to the
-    /// risk-profile gate does **not** silently widen narrower per-run
-    /// allow-lists.
     pub fn from_security(
         allowed_tools: Option<&[String]>,
         excluded_tools: Option<&[String]>,
@@ -104,11 +65,6 @@ impl ToolAccessPolicy {
             return false;
         }
 
-        // Caller-supplied per-run gate: strict explicit-list intersection.
-        // No MCP auto-admit here — per PR #7547 review, that exception is
-        // scoped to the risk-profile gate so per-run narrowing (cron jobs,
-        // narrowed delegate invocations) remains a reliable capability
-        // boundary even when an MCP server is configured.
         match self.caller_allowed.as_ref() {
             None => true,
             Some(list) => list.iter().any(|t| t == name),
@@ -118,7 +74,9 @@ impl ToolAccessPolicy {
 
 /// Built-in tool that fetches full schemas for deferred MCP tools.
 pub struct ToolSearchTool {
-    deferred: DeferredMcpToolSet,
+    // This is the executable deferred registry, not a cached grants record.
+    // Session admission may only remove entries from it.
+    deferred: Mutex<DeferredMcpToolSet>,
     activated: Arc<Mutex<ActivatedToolSet>>,
     access_policy: Option<ToolAccessPolicy>,
     activation_hook: Option<ActivationHook>,
@@ -127,7 +85,7 @@ pub struct ToolSearchTool {
 impl ToolSearchTool {
     pub fn new(deferred: DeferredMcpToolSet, activated: Arc<Mutex<ActivatedToolSet>>) -> Self {
         Self {
-            deferred,
+            deferred: Mutex::new(deferred),
             activated,
             access_policy: None,
             activation_hook: None,
@@ -142,6 +100,37 @@ impl ToolSearchTool {
     pub fn with_activation_hook(mut self, hook: ActivationHook) -> Self {
         self.activation_hook = Some(hook);
         self
+    }
+
+    /// Remove revoked schemas and activated tools together. Recovering a
+    /// poisoned guard is safe here because every surviving entry is checked
+    /// against the current ceiling before execution can resume.
+    pub fn narrow_to_caller(&self, allowed: &[String]) {
+        let mut deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        deferred
+            .stubs
+            .retain(|stub| allowed.contains(&stub.prefixed_name));
+        self.activated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain_allowed(allowed);
+    }
+
+    /// Advertise only still-loadable, not-yet-activated tools, from the same
+    /// registry used by both keyword search and exact selection.
+    pub fn deferred_prompt_section(&self) -> String {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let activated = self.activated.lock().unwrap_or_else(|e| e.into_inner());
+        let names = activated
+            .tool_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        crate::mcp_deferred::build_deferred_tools_section_excluding(
+            &deferred,
+            self.access_policy.as_ref(),
+            &names,
+        )
     }
 
     fn is_allowed(&self, tool_name: &str) -> bool {
@@ -204,7 +193,7 @@ impl Tool for ToolSearchTool {
         if query.is_empty() {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("query parameter is required".into()),
             });
         }
@@ -224,7 +213,8 @@ impl Tool for ToolSearchTool {
         } else {
             max_results
         };
-        let results = self.deferred.search(query, search_limit);
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
+        let results = deferred.search(query, search_limit);
         if results.is_empty() {
             return Ok(ToolResult {
                 success: true,
@@ -270,9 +260,9 @@ impl Tool for ToolSearchTool {
                 );
                 continue;
             }
-            if let Some(spec) = self.deferred.tool_spec(&stub.prefixed_name) {
+            if let Some(spec) = deferred.tool_spec(&stub.prefixed_name) {
                 if !guard.is_activated(&stub.prefixed_name)
-                    && let Some(tool) = self.deferred.activate(&stub.prefixed_name)
+                    && let Some(tool) = deferred.activate(&stub.prefixed_name)
                 {
                     let tool: Arc<dyn Tool> = Arc::from(tool);
                     guard.activate(stub.prefixed_name.clone(), Arc::clone(&tool));
@@ -305,7 +295,7 @@ impl Tool for ToolSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -313,6 +303,7 @@ impl Tool for ToolSearchTool {
 
 impl ToolSearchTool {
     fn select_tools(&self, names: &[&str]) -> anyhow::Result<ToolResult> {
+        let deferred = self.deferred.lock().unwrap_or_else(|e| e.into_inner());
         let mut output = String::from("<functions>\n");
         let mut not_found = Vec::new();
         let mut activated_count = 0;
@@ -347,10 +338,10 @@ impl ToolSearchTool {
                 not_found.push(*name);
                 continue;
             }
-            match self.deferred.tool_spec(name) {
+            match deferred.tool_spec(name) {
                 Some(spec) => {
                     if !guard.is_activated(name)
-                        && let Some(tool) = self.deferred.activate(name)
+                        && let Some(tool) = deferred.activate(name)
                     {
                         let tool: Arc<dyn Tool> = Arc::from(tool);
                         guard.activate(String::from(*name), Arc::clone(&tool));
@@ -391,7 +382,7 @@ impl ToolSearchTool {
 
         Ok(ToolResult {
             success: true,
-            output,
+            output: output.into(),
             error: None,
         })
     }
@@ -401,12 +392,18 @@ impl ToolSearchTool {
 mod tests {
     use super::*;
     use crate::mcp_client::McpRegistry;
-    use crate::mcp_deferred::DeferredMcpToolStub;
+    use crate::mcp_deferred::{
+        DeferredMcpToolStub, build_deferred_tools_section, build_deferred_tools_section_filtered,
+    };
     use crate::mcp_protocol::McpToolDef;
 
     async fn make_deferred_set(stubs: Vec<DeferredMcpToolStub>) -> DeferredMcpToolSet {
         let registry = Arc::new(McpRegistry::connect_all(&[]).await.unwrap());
-        DeferredMcpToolSet { stubs, registry }
+        DeferredMcpToolSet {
+            stubs,
+            registry,
+            security: Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        }
     }
 
     fn make_stub(name: &str, desc: &str) -> DeferredMcpToolStub {
@@ -426,6 +423,60 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert!(guard.is_activated(tool_name));
+    }
+
+    #[tokio::test]
+    async fn principal_narrowing_keeps_positive_prompt_and_blocks_reactivation() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let tool = ToolSearchTool::new(
+            make_deferred_set(vec![
+                make_stub("mcp__keep", "retained tool"),
+                make_stub("mcp__revoke", "revoked tool"),
+            ])
+            .await,
+            Arc::clone(&activated),
+        );
+        assert!(tool.deferred_prompt_section().contains("mcp__revoke"));
+        tool.execute(serde_json::json!({"query":"select:mcp__revoke"}))
+            .await
+            .unwrap();
+        assert!(activated.lock().unwrap().is_activated("mcp__revoke"));
+        let poison = Arc::clone(&activated);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poison.lock().unwrap();
+                panic!("test poison");
+            })
+            .join()
+            .is_err()
+        );
+        tool.narrow_to_caller(&["mcp__keep".into()]);
+        let prompt = tool.deferred_prompt_section();
+        assert!(prompt.contains("mcp__keep") && prompt.contains("tool_search"));
+        assert!(!prompt.contains("mcp__revoke"));
+        for query in ["select:mcp__revoke", "revoked"] {
+            let result = tool
+                .execute(serde_json::json!({"query":query}))
+                .await
+                .unwrap();
+            assert!(!result.output.contains("<function>{"));
+            assert!(
+                !activated
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_activated("mcp__revoke")
+            );
+        }
+        tool.execute(serde_json::json!({"query":"select:mcp__keep"}))
+            .await
+            .unwrap();
+        assert!(
+            activated
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_activated("mcp__keep")
+        );
+        assert!(tool.deferred_prompt_section().is_empty());
     }
 
     #[tokio::test]
@@ -523,8 +574,6 @@ mod tests {
         assert_poisoned_activated_contains(&activated, "fs__read");
     }
 
-    /// Verify tool_search works with stubs from multiple MCP servers,
-    /// simulating a daemon-mode setup where several servers are deferred.
     #[tokio::test]
     async fn multiple_servers_stubs_all_searchable() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -554,8 +603,6 @@ mod tests {
         assert!(result.output.contains("server_b__query_db"));
     }
 
-    /// Verify select mode activates tools and they stay activated across calls,
-    /// matching the daemon-mode pattern where a single ActivatedToolSet persists.
     #[tokio::test]
     async fn select_activates_and_persists_across_calls() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -614,7 +661,6 @@ mod tests {
         assert_poisoned_activated_contains(&activated, "srv__tool_a");
     }
 
-    /// Verify re-activating an already-activated tool does not duplicate it.
     #[tokio::test]
     async fn reactivation_is_idempotent() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -756,7 +802,7 @@ mod tests {
         // Runtime-discovered MCP tools (names containing "__") are auto-admitted
         // when an allow-list is present, so the operator-visible way to block a
         // specific MCP tool is the deny-list (the `excluded_tools` equivalent).
-        // See `ToolAccessPolicy::is_tool_allowed` and PR #7547.
+        // See `ToolAccessPolicy::is_tool_allowed` and
         let policy = ToolAccessPolicy {
             allowed: Some(vec!["srv__ok".into()]),
             denied: Some(vec!["srv__nope".into()]),
@@ -776,17 +822,88 @@ mod tests {
         assert!(!activated.lock().unwrap().is_activated("srv__nope"));
     }
 
-    /// PR #7547 review (Audacity88 / singlerider) — second-round blocking:
-    /// the MCP `<server>__<tool>` auto-admit exception must apply ONLY to
-    /// the risk-profile allow-list, not to the caller-supplied per-run
-    /// `allowed_tools`. Otherwise a cron job that narrows
-    /// `allowed_tools = ["cron_add"]` would still surface every
-    /// runtime-discovered MCP wrapper, breaking per-job capability
-    /// narrowing the moment an MCP server is configured.
-    ///
-    /// This test fixes `from_security` semantics so an MCP name the
-    /// caller did not explicitly include is rejected even when the
-    /// risk-profile allow-list would auto-admit it.
+    #[tokio::test]
+    async fn prompt_section_and_tool_search_see_same_filtered_set() {
+        // The prompt-side
+        // `build_deferred_tools_section_filtered` and the runtime
+        // `ToolSearchTool` constructor (built from the same
+        // `filtered_deferred` value, the single source of
+        // truth) must agree on which tools are visible. If the
+        // prompt and the search tool each applied the access policy
+        // independently, a denied tool could leak through one of them.
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let set = make_deferred_set(vec![
+            make_stub("srv__visible", "Visible tool"),
+            make_stub("srv__hidden", "Hidden tool"),
+        ])
+        .await;
+        let policy = ToolAccessPolicy {
+            denied: Some(vec!["srv__hidden".into()]),
+            ..ToolAccessPolicy::default()
+        };
+
+        // Single source of truth: build the filtered set once and
+        // feed it to both consumers.
+        let filtered = set.filter_by_policy(Some(&policy));
+
+        // Prompt-side: the section must not mention the denied tool.
+        let section = build_deferred_tools_section_filtered(&filtered, Some(&policy));
+        assert!(section.contains("srv__visible"));
+        assert!(!section.contains("srv__hidden"));
+
+        // Runtime-side: the search tool must not return the denied
+        // tool's schema on a keyword match.
+        let tool = ToolSearchTool::new(filtered, Arc::clone(&activated)).with_access_policy(policy);
+        let result = tool
+            .execute(serde_json::json!({"query": "tool"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("srv__visible"));
+        assert!(!result.output.contains("srv__hidden"));
+        assert!(!activated.lock().unwrap().is_activated("srv__hidden"));
+    }
+
+    #[tokio::test]
+    async fn omission_safety_pre_filtered_set_suffices_without_reapplied_policy() {
+        // The `filter_by_policy` helper alone (the single source of
+        // truth) is sufficient to keep a denied tool schema out of
+        // both consumers, even when the policy is NOT reapplied at the
+        // consumer level. A missed `with_access_policy` builder step
+        // on `ToolSearchTool` is therefore not load-bearing.
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let set = make_deferred_set(vec![
+            make_stub("srv__visible", "Visible tool"),
+            make_stub("srv__hidden", "Hidden tool"),
+        ])
+        .await;
+        let policy = ToolAccessPolicy {
+            denied: Some(vec!["srv__hidden".into()]),
+            ..ToolAccessPolicy::default()
+        };
+
+        // Single source of truth: build the filtered set once.
+        let filtered = set.filter_by_policy(Some(&policy));
+
+        // Prompt-side: use the UNFILTERED prompt builder — the pre-filtered
+        // set alone must keep the denied tool out. No policy re-applied.
+        let section = build_deferred_tools_section(&filtered);
+        assert!(section.contains("srv__visible"));
+        assert!(!section.contains("srv__hidden"));
+
+        // Runtime-side: construct ToolSearchTool WITHOUT with_access_policy.
+        // The pre-filtered stub set alone must keep the denied schema out.
+        let tool = ToolSearchTool::new(filtered, Arc::clone(&activated));
+        let result = tool
+            .execute(serde_json::json!({"query": "tool"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("srv__visible"));
+        assert!(!result.output.contains("srv__hidden"));
+        assert!(!activated.lock().unwrap().is_activated("srv__hidden"));
+    }
+
     #[test]
     fn caller_allowed_per_run_gate_does_not_auto_admit_mcp_names() {
         // The risk-profile gate is wide (unrestricted), so the MCP
@@ -812,11 +929,6 @@ mod tests {
         );
     }
 
-    /// Companion to the test above: even when the risk profile DOES have
-    /// a non-empty allow-list (so the auto-admit branch is live on that
-    /// gate), the caller-supplied per-run list still narrows the final
-    /// set strictly. The risk-profile auto-admit must not leak past the
-    /// per-run gate.
     #[test]
     fn caller_allowed_per_run_gate_narrows_after_risk_profile_auto_admit() {
         let policy = ToolAccessPolicy::from_security(
@@ -843,8 +955,21 @@ mod tests {
         assert!(!policy.is_tool_allowed("memory_recall"));
     }
 
-    /// `excluded_tools` must subtract regardless of which gate admitted
-    /// the name. Pins the deny-list contract across the refactor.
+    #[test]
+    fn empty_caller_allowlist_denies_every_mcp_tool() {
+        // The principal tool narrowing flows in as `caller_allowed`. An
+        // empty principal list must yield a tool-less session even in the
+        // presence of MCP `<server>__<tool>` names, which the risk-profile
+        // gate would otherwise auto-admit. No `__` escape at the caller layer.
+        let policy = ToolAccessPolicy::from_security(None, None, Some(&[]))
+            .expect("an empty caller allowlist still produces a policy");
+        assert!(!policy.is_tool_allowed("shell"));
+        assert!(
+            !policy.is_tool_allowed("filesystem__write_file"),
+            "empty caller allowlist must deny MCP tools despite the __ auto-admit"
+        );
+    }
+
     #[test]
     fn caller_allowed_per_run_gate_still_honors_denylist() {
         let policy = ToolAccessPolicy::from_security(

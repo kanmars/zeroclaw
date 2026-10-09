@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_memory::Memory;
@@ -68,7 +68,7 @@ impl Tool for MemoryPurgeTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error),
             });
         }
@@ -85,7 +85,7 @@ impl Tool for MemoryPurgeTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to purge namespace: {e}")),
                     });
                 }
@@ -101,7 +101,7 @@ impl Tool for MemoryPurgeTool {
                 Err(e) => {
                     return Ok(ToolResult {
                         success: false,
-                        output: String::new(),
+                        output: ToolOutput::default(),
                         error: Some(format!("Failed to purge session: {e}")),
                     });
                 }
@@ -111,9 +111,9 @@ impl Tool for MemoryPurgeTool {
         Ok(ToolResult {
             success: true,
             output: if output_parts.is_empty() {
-                format!("Purged {total_purged} memories")
+                format!("Purged {total_purged} memories").into()
             } else {
-                output_parts.join("; ")
+                output_parts.join("; ").into()
             },
             error: None,
         })
@@ -169,6 +169,78 @@ mod tests {
         assert!(result.success);
         assert_eq!(in_ns1(&after), 0);
         assert_eq!(after.len() - in_ns1(&after), before.len() - in_ns1(&before));
+    }
+
+    /// The production tool route over a principal's private handle purges
+    /// only that principal's rows; through the legacy handle, private rows
+    /// are never reachable at all.
+    #[tokio::test]
+    async fn purge_through_a_private_handle_stays_inside_the_owners_plane() {
+        use zeroclaw_api::memory_traits::PrincipalScope;
+        use zeroclaw_memory::PrincipalPlaneMemory;
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn Memory> =
+            Arc::new(zeroclaw_memory::sqlite::SqliteMemory::new("test", tmp.path()).unwrap());
+        let alice = PrincipalScope::new("user:alice");
+        let bob = PrincipalScope::new("user:bob");
+        inner
+            .store(
+                "shared",
+                "shared-data",
+                MemoryCategory::Core,
+                Some("sess-x"),
+            )
+            .await
+            .unwrap();
+        inner
+            .store_for_principal(
+                &alice,
+                "a",
+                "alice-data",
+                MemoryCategory::Core,
+                Some("sess-x"),
+            )
+            .await
+            .unwrap();
+        inner
+            .store_for_principal(&bob, "b", "bob-data", MemoryCategory::Core, Some("sess-x"))
+            .await
+            .unwrap();
+
+        let alices_handle: Arc<dyn Memory> =
+            Arc::new(PrincipalPlaneMemory::new(Arc::clone(&inner), alice.clone()));
+        let tool = MemoryPurgeTool::new(alices_handle, test_security());
+        let result = tool
+            .execute(serde_json::json!({"session_id": "sess-x"}))
+            .await
+            .unwrap();
+        assert!(result.success, "{}", result.output);
+        assert!(
+            inner
+                .get_for_principal(&alice, "a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            inner.get_for_principal(&bob, "b").await.unwrap().is_some(),
+            "another principal's private rows survive"
+        );
+        assert!(
+            inner.get("shared").await.unwrap().is_some(),
+            "the shared row survives a private purge"
+        );
+
+        let legacy_tool = MemoryPurgeTool::new(Arc::clone(&inner), test_security());
+        legacy_tool
+            .execute(serde_json::json!({"session_id": "sess-x"}))
+            .await
+            .unwrap();
+        assert!(inner.get("shared").await.unwrap().is_none());
+        assert!(
+            inner.get_for_principal(&bob, "b").await.unwrap().is_some(),
+            "the legacy purge never reaches private rows"
+        );
     }
 
     #[tokio::test]

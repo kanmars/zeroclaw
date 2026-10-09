@@ -1,5 +1,46 @@
 use std::time::Duration;
 
+/// A single conversation message captured for OTel GenAI semconv export.
+/// Structurally mirrors [`crate::model_provider::ChatMessage`] but is defined
+/// independently to keep the observability API decoupled from the model-provider
+/// API and to signal that `content` has been credential-scrubbed at capture time.
+#[derive(Debug, Clone)]
+pub struct MessageSnapshot {
+    pub role: String,
+    pub content: String,
+}
+
+/// A tool call the model emitted, captured for `gen_ai.output.messages`.
+/// `arguments_json` is the raw JSON arguments string, credential-scrubbed.
+#[derive(Debug, Clone)]
+pub struct ToolCallSnapshot {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
+}
+
+/// Full prompt/completion content for one `llm.call`, captured and
+/// credential-scrubbed at the agent-loop boundary so the OTel exporter can emit
+/// `gen_ai.input.messages` / `gen_ai.output.messages` / `gen_ai.system_instructions`.
+///
+/// Populated at the agent-loop capture boundary whenever the `observability-otel`
+/// feature is active; `None` otherwise (other observers and non-OTel builds leave
+/// it `None`). Capture is policy-agnostic: whether the snapshot is actually
+/// exported — and at which privacy level (`off` / `redacted` / `full`) — is
+/// decided by the owning `OtelObserver`'s instance content config at the OTel
+/// export boundary, not by the capture path.
+#[derive(Debug, Clone)]
+pub struct LlmMessageSnapshot {
+    /// Non-system input messages, in send order.
+    pub input: Vec<MessageSnapshot>,
+    /// Assistant text output, if any. Empty text is captured as `None`.
+    pub output_text: Option<String>,
+    /// Tool calls the assistant emitted this turn.
+    pub output_tool_calls: Vec<ToolCallSnapshot>,
+    /// System prompt, carried separately from `input`.
+    pub system_instructions: Option<String>,
+}
+
 /// Token usage breakdown for a single agent turn.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TurnTokenUsage {
@@ -18,6 +59,9 @@ pub struct TurnTokenUsage {
 /// degrade gracefully when new variants are added in future minor
 /// releases — they must include a wildcard arm in their `match`
 /// expressions and will simply ignore unknown event kinds.
+/// Exception: under the `observability-otel` feature, [`ObserverEvent::LlmResponse`]
+/// carries credential-scrubbed prompt/completion content in `messages` for GenAI
+/// semantic-convention export. See [`LlmMessageSnapshot`].
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ObserverEvent {
@@ -39,6 +83,12 @@ pub enum ObserverEvent {
         messages_count: usize,
         channel: Option<String>,
         agent_alias: Option<String>,
+        /// The delegating agent's alias when this record was produced by a
+        /// nested cross-agent execution (e.g. a live SOP step that named a
+        /// different agent): `agent_alias` is the EFFECTIVE agent whose
+        /// policy/tools executed; this preserves the parent correlation.
+        /// `None` for ordinary single-agent turns.
+        parent_agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// Result of a single LLM model_provider call.
@@ -50,8 +100,20 @@ pub enum ObserverEvent {
         error_message: Option<String>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        /// Credential-scrubbed prompt/completion content for OTel GenAI export.
+        /// `None` unless the `observability-otel` feature is active. When
+        /// populated, whether the content is exported (and at which privacy
+        /// level) is gated by the receiving `OtelObserver`'s instance content
+        /// policy, not by the capture path. See [`LlmMessageSnapshot`].
+        messages: Option<LlmMessageSnapshot>,
         channel: Option<String>,
         agent_alias: Option<String>,
+        /// The delegating agent's alias when this record was produced by a
+        /// nested cross-agent execution (e.g. a live SOP step that named a
+        /// different agent): `agent_alias` is the EFFECTIVE agent whose
+        /// policy/tools executed; this preserves the parent correlation.
+        /// `None` for ordinary single-agent turns.
+        parent_agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// The agent session has finished.
@@ -83,6 +145,12 @@ pub enum ObserverEvent {
         arguments: Option<String>,
         channel: Option<String>,
         agent_alias: Option<String>,
+        /// The delegating agent's alias when this record was produced by a
+        /// nested cross-agent execution (e.g. a live SOP step that named a
+        /// different agent): `agent_alias` is the EFFECTIVE agent whose
+        /// policy/tools executed; this preserves the parent correlation.
+        /// `None` for ordinary single-agent turns.
+        parent_agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// A tool call has completed with a success/failure outcome.
@@ -107,6 +175,12 @@ pub enum ObserverEvent {
         result: Option<String>,
         channel: Option<String>,
         agent_alias: Option<String>,
+        /// The delegating agent's alias when this record was produced by a
+        /// nested cross-agent execution (e.g. a live SOP step that named a
+        /// different agent): `agent_alias` is the EFFECTIVE agent whose
+        /// policy/tools executed; this preserves the parent correlation.
+        /// `None` for ordinary single-agent turns.
+        parent_agent_alias: Option<String>,
         turn_id: Option<String>,
     },
     /// A memory recall (search) operation has completed.
@@ -127,6 +201,9 @@ pub enum ObserverEvent {
         /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`, `"none"`).
         backend: String,
         success: bool,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// A memory store (write) operation has completed.
     ///
@@ -139,6 +216,22 @@ pub enum ObserverEvent {
         /// Memory category (`"core"`, `"daily"`, `"conversation"`, etc.) —
         /// bounded set, safe to use as a Prometheus label.
         category: String,
+        /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`).
+        backend: String,
+        duration: Duration,
+        success: bool,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
+    },
+    /// A memory audit/operator action was recorded on the audit trail.
+    ///
+    /// Carries only bounded labels. The action is an audit verb such as
+    /// `"store"`, `"recall"`, or `"purge"`; raw memory keys and content
+    /// are intentionally excluded from this event.
+    MemoryAudit {
+        /// Bounded audit action name, safe to use as a metric label.
+        action: String,
         /// Bounded backend identifier (e.g. `"sqlite"`, `"qdrant"`).
         backend: String,
         duration: Duration,
@@ -156,6 +249,9 @@ pub enum ObserverEvent {
         duration: Duration,
         num_chunks: usize,
         num_boards: usize,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
@@ -187,29 +283,10 @@ pub enum ObserverEvent {
         /// Human-readable error description. Must not contain secrets or tokens.
         message: String,
     },
-    /// A deployment has started.
-    DeploymentStarted {
-        /// Identifier for the deployment (e.g., commit SHA or release tag).
-        deploy_id: String,
-    },
-    /// A deployment has completed successfully.
-    DeploymentCompleted {
-        deploy_id: String,
-        /// Commit SHA that was deployed.
-        commit_sha: String,
-    },
-    /// A deployment has failed.
-    DeploymentFailed {
-        deploy_id: String,
-        /// Human-readable failure reason.
-        reason: String,
-    },
-    /// Recovery from a failed deployment has completed.
-    RecoveryCompleted { deploy_id: String },
-    /// The agent trimmed oldest whole turns from history to fit the context
-    /// token budget. Carries the cut accounting so dashboards and clients can
-    /// surface a visible "context was trimmed" signal instead of the agent
-    /// silently losing earlier turns.
+    /// The agent trimmed oldest whole turns from history to fit either the
+    /// context token budget or the configured message limit. Carries the cut
+    /// accounting so dashboards and clients can surface a visible "context was
+    /// trimmed" signal instead of the agent silently losing earlier turns.
     HistoryTrimmed {
         dropped_messages: usize,
         kept_turns: usize,
@@ -217,6 +294,23 @@ pub enum ObserverEvent {
         channel: Option<String>,
         agent_alias: Option<String>,
         turn_id: Option<String>,
+        /// Configured context token budget in effect at trim time. `None` for
+        /// message-limit trims, which carry no token accounting.
+        token_budget: Option<u64>,
+        /// Token count before trimming.
+        tokens_before: Option<u64>,
+        /// Token count after trimming.
+        tokens_after: Option<u64>,
+        /// Provenance of `tokens_before`.
+        tokens_before_source: Option<crate::agent::TokenCountSource>,
+        /// Provenance of `tokens_after`.
+        tokens_after_source: Option<crate::agent::TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget because only the protected newest turn (plus
+        /// tool schemas) remains. History MAY have been trimmed on the way to
+        /// that floor, so this flag — not `dropped_messages == 0` — is the
+        /// authoritative "unsatisfiable" signal. `None` for ordinary trims.
+        unsatisfiable_floor: Option<bool>,
     },
 }
 
@@ -234,10 +328,6 @@ pub enum ObserverMetric {
     ActiveSessions(u64),
     /// Current depth of the inbound message queue.
     QueueDepth(u64),
-    /// Time elapsed from commit to deployment (lead time for changes).
-    DeploymentLeadTime(Duration),
-    /// Time elapsed to recover from a failed deployment.
-    RecoveryTime(Duration),
 }
 
 /// Core observability trait for recording agent runtime telemetry.
@@ -416,6 +506,7 @@ mod tests {
             result: Some("Mon Apr 22 12:00:00 UTC 2026\n".into()),
             channel: None,
             agent_alias: None,
+            parent_agent_alias: None,
             turn_id: None,
         };
         let metric = ObserverMetric::RequestLatency(Duration::from_millis(8));
@@ -435,22 +526,43 @@ mod tests {
             num_entries: 3,
             backend: "sqlite".into(),
             success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let store = ObserverEvent::MemoryStore {
             category: "conversation".into(),
             backend: "sqlite".into(),
             duration: Duration::from_millis(8),
             success: true,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
         };
         let rag = ObserverEvent::RagRetrieve {
             query_summary: None,
             duration: Duration::from_millis(120),
             num_chunks: 5,
             num_boards: 2,
+            channel: Some("cli".into()),
+            agent_alias: Some("default".into()),
+            turn_id: Some("turn-1".into()),
+        };
+        let audit = ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(2),
+            success: true,
         };
 
-        assert!(matches!(recall.clone(), ObserverEvent::MemoryRecall { .. }));
+        match recall.clone() {
+            ObserverEvent::MemoryRecall { turn_id, .. } => {
+                assert_eq!(turn_id.as_deref(), Some("turn-1"));
+            }
+            other => panic!("clone changed variant: {other:?}"),
+        }
         assert!(matches!(store.clone(), ObserverEvent::MemoryStore { .. }));
         assert!(matches!(rag.clone(), ObserverEvent::RagRetrieve { .. }));
+        assert!(matches!(audit.clone(), ObserverEvent::MemoryAudit { .. }));
     }
 }

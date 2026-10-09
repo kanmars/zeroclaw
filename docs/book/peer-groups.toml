@@ -71,6 +71,21 @@ sender_desc = "the Twitter/X @username"
 sender_example = "example_user"
 
 [[channel]]
+key = "git"
+sender_desc = "the forge username (login) of the comment author"
+sender_example = "octocat"
+
+[[channel]]
 key = "nostr"
 sender_desc = "the sender's hex public key"
 sender_example = "npub1exampleexampleexampleexample"
+
+[[channel]]
+key = "bluesky"
+sender_desc = "the sender's handle or DID (a DID survives a handle rename)"
+sender_example = "example.bsky.social"
+
+[[channel]]
+key = "reddit"
+sender_desc = "the Reddit username without the `u/` prefix (case-insensitive)"
+sender_example = "example_user"

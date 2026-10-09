@@ -1,11 +1,4 @@
 //! HMAC-SHA256 tool execution receipts for hallucination detection.
-//!
-//! When enabled, every tool execution produces a cryptographic receipt that
-//! proves the tool actually ran. The LLM cannot forge valid receipts because
-//! it doesn't know the ephemeral session key.
-//!
-//! Based on: Basu, A. (2026). "Tool Receipts, Not Zero-Knowledge Proofs:
-//! Practical Hallucination Detection for AI Agents." arXiv:2603.10060
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -40,14 +33,12 @@ impl ReceiptGenerator {
         Self { key }
     }
 
-    /// Create a generator with a known key (for testing).
     #[cfg(test)]
     pub fn with_key(key: Vec<u8>) -> Self {
         Self { key }
     }
 
     /// Generate a receipt for a tool execution.
-    ///
     /// The receipt encodes: tool_name | args_hash | result_hash | timestamp
     /// into an HMAC-SHA256 digest, formatted as `zc-receipt-{timestamp}-{hash}`.
     pub fn generate(
@@ -74,7 +65,6 @@ impl ReceiptGenerator {
     }
 
     /// Verify a receipt against the expected tool execution parameters.
-    ///
     /// Parses the timestamp from the receipt string, recomputes the HMAC,
     /// and compares. Returns `false` for malformed, tampered, or fabricated receipts.
     pub fn verify(
@@ -169,6 +159,14 @@ where
     F: std::future::Future,
 {
     TOOL_LOOP_RECEIPT_CONTEXT.scope(scope, fut).await
+}
+
+/// Scope for detached work (background delegation): the parent's generator so
+/// the child's tool results verify against the same key, and a FRESH collector,
+/// because the parent's per-turn collector belongs to a turn that ends before the
+/// detached task does. `None` stays `None` so receipts-off installs are unchanged.
+pub fn detached_scope(parent_generator: Option<ReceiptGenerator>) -> Option<ReceiptScope> {
+    parent_generator.map(ReceiptScope::with_generator)
 }
 
 /// Canonical system-prompt addendum that instructs the model to carry the
@@ -334,5 +332,33 @@ mod tests {
         let r2 = receipt_gen2.generate("shell", &args, "out", 100);
         // Different keys → different receipts (probabilistically)
         assert_ne!(r1, r2);
+    }
+
+    #[test]
+    fn detached_scope_clones_the_generator_and_starts_a_fresh_collector() {
+        // Receipts-off installs stay off: no parent generator, no scope.
+        assert!(detached_scope(None).is_none());
+
+        let parent = ReceiptScope::with_generator(ReceiptGenerator::with_key(test_key()));
+        let detached = detached_scope(Some(parent.generator.clone()))
+            .expect("a parent generator yields a scope");
+        assert!(
+            !std::sync::Arc::ptr_eq(&detached.collector, &parent.collector),
+            "detached work gets a fresh collector, never the parent's per-turn collector"
+        );
+        assert!(
+            detached.collector.lock().unwrap().is_empty(),
+            "the fresh collector starts empty"
+        );
+        let args = test_args();
+        let receipt = detached.generator.generate_now("shell", &args, "output");
+        assert!(
+            receipt.starts_with("zc-receipt-"),
+            "the detached scope produces receipt-shaped output, got {receipt}"
+        );
+        assert!(
+            parent.generator.verify(&receipt, "shell", &args, "output"),
+            "the detached scope signs with the parent's key, so the parent verifies it"
+        );
     }
 }

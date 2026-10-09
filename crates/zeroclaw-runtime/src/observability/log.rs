@@ -142,6 +142,7 @@ impl Observer for LogObserver {
                 backend,
                 duration,
                 success,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 ::zeroclaw_log::record!(
@@ -154,6 +155,29 @@ impl Observer for LogObserver {
                             "success": success
                         })),
                     "memory.store"
+                );
+            }
+            ObserverEvent::MemoryAudit {
+                action,
+                backend,
+                duration,
+                success,
+            } => {
+                // Action::Note keeps this arm out of the observer bridge's
+                // "memory_audit" projection: re-recording Action::MemoryAudit
+                // here would loop the event back into this observer when a
+                // bridge observer is installed.
+                let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "memory_action": action,
+                            "backend": backend,
+                            "duration_ms": ms,
+                            "success": success
+                        })),
+                    "memory.audit"
                 );
             }
             ObserverEvent::RagRetrieve {
@@ -180,6 +204,7 @@ impl Observer for LogObserver {
                 messages_count,
                 channel: _,
                 agent_alias: _,
+                parent_agent_alias: _,
                 turn_id: _,
             } => {
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "messages_count": messages_count})), "llm.request");
@@ -192,44 +217,10 @@ impl Observer for LogObserver {
                 error_message,
                 input_tokens,
                 output_tokens,
-                channel: _,
-                agent_alias: _,
-                turn_id: _,
+                ..
             } => {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": model_provider, "model": model, "duration_ms": ms, "success": success, "error": error_message, "input_tokens": input_tokens, "output_tokens": output_tokens})), "llm.response");
-            }
-            ObserverEvent::DeploymentStarted { deploy_id } => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"deploy_id": deploy_id})),
-                    "deployment.started"
-                );
-            }
-            ObserverEvent::DeploymentCompleted {
-                deploy_id,
-                commit_sha,
-            } => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(
-                            ::serde_json::json!({"deploy_id": deploy_id, "commit_sha": commit_sha})
-                        ),
-                    "deployment.completed"
-                );
-            }
-            ObserverEvent::DeploymentFailed { deploy_id, reason } => {
-                ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"deploy_id": deploy_id, "reason": reason.to_string()})), "deployment.failed");
-            }
-            ObserverEvent::RecoveryCompleted { deploy_id } => {
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"deploy_id": deploy_id})),
-                    "recovery.completed"
-                );
             }
             // `ObserverEvent` is `#[non_exhaustive]` — silently ignore any
             // future variant added by upstream `zeroclaw-api`.
@@ -270,24 +261,6 @@ impl Observer for LogObserver {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_attrs(::serde_json::json!({"depth": d})),
                     "metric.queue_depth"
-                );
-            }
-            ObserverMetric::DeploymentLeadTime(d) => {
-                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"lead_time_ms": ms})),
-                    "metric.deployment_lead_time"
-                );
-            }
-            ObserverMetric::RecoveryTime(d) => {
-                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-                ::zeroclaw_log::record!(
-                    INFO,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"recovery_time_ms": ms})),
-                    "metric.recovery_time"
                 );
             }
         }
@@ -343,6 +316,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(150),
@@ -350,11 +324,13 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(200),
@@ -362,11 +338,13 @@ mod tests {
             error_message: Some("rate limited".into()),
             input_tokens: None,
             output_tokens: None,
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -380,6 +358,12 @@ mod tests {
         obs.record_event(&ObserverEvent::ChannelMessage {
             channel: "telegram".into(),
             direction: "outbound".into(),
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(5),
+            success: true,
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::Error {

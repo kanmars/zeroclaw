@@ -39,8 +39,8 @@ Name the YOLO posture explicitly on a dedicated risk profile (`yolo` is a good i
 
 YOLO mode doesn't lobotomise the agent:
 
-- **[Tool receipts](../security/tool-receipts.md)** still get written. You can `tail -f` the receipts log and see exactly what ran.
-- **[Audit logging](../ops/observability.md)** still works if enabled (`[security.audit] enabled = true`). Strongly recommended in YOLO.
+- **[Tool receipts](../security/tool-receipts.md)** still protect successful tool-result claims when enabled. They are conversation-visible receipts, not a durable receipt log.
+- **Command audit logging is not currently implemented.** `[security.audit]` records certificate issuance and renewal, not tool commands, so it never tells you what the agent ran. Do not rely on it as a compensating control in YOLO mode; if you need a record of what ran, use an external supervisor or logging wrapper that explicitly observes the ZeroClaw process, or enable OS-level process accounting.
 - **Conversation memory** still persists: there's still a record of what happened.
 
 You're not turning off the logs, you're turning off the approval gates and path enforcement.
@@ -52,5 +52,5 @@ Delete the YOLO settings from the risk profile, or flip `[risk_profiles.<alias>]
 ## See also
 
 - [Security → Autonomy levels](../security/autonomy.md): the full gradient between YOLO and paranoid
-- [Security → Tool receipts](../security/tool-receipts.md): the audit trail you should keep on even in YOLO
+- [Security → Tool receipts](../security/tool-receipts.md): successful tool-result receipts you should keep on even in YOLO
 - [Philosophy](../philosophy/index.md): why this exists as an escape hatch rather than a default

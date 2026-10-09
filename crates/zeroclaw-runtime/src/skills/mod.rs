@@ -1,16 +1,16 @@
 pub mod skill_http;
 pub mod skill_tool;
 use anyhow::{Context, Result};
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use directories::UserDirs;
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
-
-use zip::ZipArchive;
 
 pub mod audit;
 pub mod bundle;
@@ -33,19 +33,14 @@ pub use frontmatter::SkillFrontmatter;
 pub use reference::{SkillRef, SkillRefError};
 pub use scaffold::{ScaffoldError, ScaffoldOptions};
 pub use service::{
-    EffectiveSkill, RemoveMode, ServiceError, SkillOrigin, SkillSummary, SkillsService,
+    EffectiveSkill, EffectiveSkillSet, RemoveMode, ServiceError, SkillOrigin, SkillSummary,
+    SkillsService,
 };
 pub(crate) use suggestions::render_missing_skill_install_suggestion;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
-
-// ─── ClawHub / OpenClaw registry installers ───────────────────────────────
-const CLAWHUB_DOMAIN: &str = "clawhub.ai";
-const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
-const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
-const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 
 // ─── Skills registry (zeroclaw-skills) ────────────────────────────────────────
 const SKILLS_REGISTRY_REPO_URL: &str = "https://github.com/zeroclaw-labs/zeroclaw-skills";
@@ -86,8 +81,159 @@ pub struct Skill {
     /// then fall back to a single free-text option. See [`SkillSlashOption`].
     #[serde(default)]
     pub slash_options: Vec<SkillSlashOption>,
+    /// When `true`, this skill's full instructions stay inlined in the system
+    /// prompt even in [`zeroclaw_config::schema::SkillsPromptInjectionMode::Compact`]
+    /// mode, instead of being loaded on demand via `read_skill(name)`. Intended
+    /// for policy/critical skills that must always be visible to the model.
+    #[serde(default)]
+    pub always: bool,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+}
+
+/// Why the audited resolver dropped a candidate skill directory/file.
+/// Carries the human-readable detail the loader already logs, so the
+/// dashboard can show the same reason without re-running the audit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SkillDropReason {
+    /// `audit_*` returned Ok(report) with findings. `summary` = report.summary();
+    /// `scripts_blocked` is true when the secure-default script policy is the
+    /// blocker, so consumers can offer the `skills.allow_scripts = true` hint
+    /// without re-parsing the human-readable summary.
+    AuditFindings {
+        summary: String,
+        scripts_blocked: bool,
+    },
+    /// `audit_*` returned Err (unauditable); String = error message.
+    AuditError(String),
+    ManifestParseError(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DroppedSkill {
+    pub name: String,
+    /// `"workspace"` | `"open-skills"` | `"plugin"` | `"bundle"`.
+    pub origin_hint: String,
+    pub reason: SkillDropReason,
+    pub location: Option<PathBuf>,
+}
+
+/// One lower-precedence skill that lost its name to an earlier (higher-priority)
+/// source during the agent's effective-skill dedup. Recorded for the dashboard
+/// so operators can see why an assigned bundle skill is being overridden.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShadowedSkill {
+    /// The name shared with (and won by) the higher-precedence skill.
+    pub name: String,
+    /// Origin of the LOSER: `"open-skills"` | `"plugin"` | `"bundle"`.
+    pub origin_hint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlashOptionKind {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    User,
+    Channel,
+    Role,
+    Mentionable,
+}
+
+impl SlashOptionKind {
+    /// Every kind, in the order surfaces should offer them. Walked (not
+    /// restated) by every registry consumer.
+    pub const ALL: [Self; 8] = [
+        Self::String,
+        Self::Integer,
+        Self::Number,
+        Self::Boolean,
+        Self::User,
+        Self::Channel,
+        Self::Role,
+        Self::Mentionable,
+    ];
+
+    /// The canonical `type` token written in frontmatter.
+    pub fn manifest_name(self) -> &'static str {
+        match self {
+            Self::String => "string",
+            Self::Integer => "integer",
+            Self::Number => "number",
+            Self::Boolean => "boolean",
+            Self::User => "user",
+            Self::Channel => "channel",
+            Self::Role => "role",
+            Self::Mentionable => "mentionable",
+        }
+    }
+
+    /// Predefined `choices` apply only to string/integer/number options.
+    pub fn supports_choices(self) -> bool {
+        match self {
+            Self::String | Self::Integer | Self::Number => true,
+            Self::Boolean | Self::User | Self::Channel | Self::Role | Self::Mentionable => false,
+        }
+    }
+
+    /// `min`/`max` numeric bounds apply only to integer/number options.
+    pub fn supports_numeric_bounds(self) -> bool {
+        match self {
+            Self::Integer | Self::Number => true,
+            Self::String
+            | Self::Boolean
+            | Self::User
+            | Self::Channel
+            | Self::Role
+            | Self::Mentionable => false,
+        }
+    }
+
+    /// `min_length`/`max_length` bounds apply only to string options.
+    pub fn supports_length_bounds(self) -> bool {
+        match self {
+            Self::String => true,
+            Self::Integer
+            | Self::Number
+            | Self::Boolean
+            | Self::User
+            | Self::Channel
+            | Self::Role
+            | Self::Mentionable => false,
+        }
+    }
+
+    /// The wire-facing capability row for this kind, consumed by API surfaces.
+    pub fn descriptor(self) -> SlashOptionKindDescriptor {
+        SlashOptionKindDescriptor {
+            manifest_name: self.manifest_name().to_string(),
+            supports_choices: self.supports_choices(),
+            supports_numeric_bounds: self.supports_numeric_bounds(),
+            supports_length_bounds: self.supports_length_bounds(),
+        }
+    }
+}
+
+/// Serialized capability row for one [`SlashOptionKind`], as published to
+/// surfaces (the web dashboard mirrors this shape). Built by walking
+/// [`SlashOptionKind::ALL`]; never hand-authored.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct SlashOptionKindDescriptor {
+    pub manifest_name: String,
+    pub supports_choices: bool,
+    pub supports_numeric_bounds: bool,
+    pub supports_length_bounds: bool,
+}
+
+/// The full registry, produced by exhaustively walking [`SlashOptionKind::ALL`].
+pub fn slash_option_kinds() -> Vec<SlashOptionKindDescriptor> {
+    SlashOptionKind::ALL
+        .into_iter()
+        .map(SlashOptionKind::descriptor)
+        .collect()
 }
 
 /// A typed option a `slash`-tagged skill exposes on its slash command. Shaped
@@ -158,12 +304,6 @@ pub struct SkillTool {
     /// (e.g. `images__generate`).
     #[serde(default)]
     pub target: Option<String>,
-    /// For `kind = "builtin"` / `kind = "mcp"`: arguments fixed by the skill
-    /// manifest. These are **locked** — they are applied on top of the
-    /// caller-supplied args and cannot be overridden by the model. This is
-    /// what scopes a delegated tool (e.g. `target = "composio"` +
-    /// `locked_args = { action_name = "TEXT_TO_PDF" }` exposes exactly one
-    /// action). Accepts the legacy key `default_args` for compatibility.
     #[serde(default, alias = "default_args")]
     pub locked_args: HashMap<String, String>,
     /// For `kind = "shell"` / `kind = "script"`: maximum execution time in
@@ -178,11 +318,6 @@ pub struct SkillTool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillManifest {
     skill: SkillMeta,
-    /// SkillForge-emitted provenance metadata. Lives in a top-level `[forge]`
-    /// table so that `SkillMeta` (the canonical skill-identity contract) is
-    /// not coupled to the SkillForge integrator's emit format. Hand-authored
-    /// SKILL.toml files omit this; auto-integrated skills carry it. See
-    /// #6210 for the architectural rationale (FND-001 §4.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     forge: Option<ForgeMetadata>,
     #[serde(default)]
@@ -208,14 +343,12 @@ struct SkillMeta {
     prompts: Vec<String>,
     #[serde(default)]
     slash_options: Vec<SkillSlashOption>,
+    /// See [`Skill::always`]. Declared in SKILL.toml under `[skill]` as
+    /// `always = true`.
+    #[serde(default)]
+    always: bool,
 }
 
-/// Provenance metadata emitted by the SkillForge integrator (see
-/// `crates/zeroclaw-runtime/src/skillforge/integrate.rs`). Lives at the
-/// top level of SKILL.toml under `[forge]`, kept separate from
-/// `[skill]` so the canonical skill identity stays decoupled from the
-/// integrator's emit format. Strict by design: a typo here is just as
-/// bad as a typo in `[skill]` (silent misconfiguration of provenance).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ForgeMetadata {
@@ -241,12 +374,6 @@ struct ForgeMetadata {
     /// Runtime/version requirements declared by the integrator.
     #[serde(default)]
     requirements: BTreeMap<String, toml::Value>,
-    /// Free-form integrator metadata (e.g. `auto_integrated`,
-    /// `forge_timestamp`). **This is the intended extension point** for
-    /// future SkillForge metadata: prefer adding new keys under
-    /// `[forge.metadata.X]` over new top-level `[forge]` fields, which
-    /// would require a coordinated `ForgeMetadata` schema bump and break
-    /// strict parsing for anyone running an older runtime.
     #[serde(default)]
     metadata: BTreeMap<String, toml::Value>,
 }
@@ -263,25 +390,14 @@ struct SkillMarkdownMeta {
     /// so a SKILL.md skill can drive native Discord slash commands — parity with
     /// SKILL.toml's `[[skill.slash_options]]`.
     slash_options: Vec<SkillSlashOption>,
+    /// See [`Skill::always`]. Parsed from a top-level `always: true` key.
+    always: bool,
 }
 
 fn default_version() -> String {
     "0.1.0".to_string()
 }
 
-/// Trust tier of a skill listed in the `zeroclaw-skills` registry.
-///
-/// Derived from the `tags` array in `registry.json`. `Unknown` is used as the
-/// "no recognized tier tag" fallback and is treated like `Community` for trust
-/// purposes when displaying the install banner.
-///
-/// `Featured` is intentionally kept as a distinct variant even though it
-/// renders identically to `Community` today: the registry's `Featured` tag is
-/// a separate curation signal (zeroclaw-labs hand-picked, but still authored
-/// outside zeroclaw-labs) and we expect to render it differently later — e.g.
-/// "Featured — community-curated by zeroclaw-labs but not maintained by us".
-/// Keeping the variant now avoids a churn-y enum extension once that copy
-/// lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillTier {
     Official,
@@ -335,12 +451,6 @@ pub fn lookup_registry_skill_tier(registry_dir: &Path, name: &str) -> (SkillTier
     (tier_from_tags(&entry.tags), entry.version)
 }
 
-/// Build the install-time tier banner. `Official` skills get a single
-/// informational line; everything else (including `Featured` and the
-/// missing-tag fallback) gets the Community warn block.
-/// Pure: the Fluent key for a tier's install banner. Split out so tests can
-/// resolve it against the English catalogue without depending on the process
-/// locale.
 fn install_tier_banner_key(tier: SkillTier) -> &'static str {
     match tier {
         SkillTier::Official => "cli-skills-install-tier-official",
@@ -367,11 +477,10 @@ pub fn print_install_tier_banner(name: &str, version: Option<&str>, tier: SkillT
 }
 
 /// Emit a user-visible warning when a skill directory is skipped due to audit
-/// findings. When the findings mention blocked scripts and `allow_scripts` is
-/// `false`, the message includes actionable remediation guidance so users know
-/// how to enable their skill.
-fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
-    let scripts_blocked = summary.contains("script-like files are blocked");
+/// findings. When `scripts_blocked` is set and `allow_scripts` is `false`, the
+/// message includes actionable remediation guidance so users know how to enable
+/// their skill.
+fn warn_skipped_skill(path: &Path, summary: &str, scripts_blocked: bool, allow_scripts: bool) {
     if scripts_blocked && !allow_scripts {
         ::zeroclaw_log::record!(
             WARN,
@@ -442,9 +551,17 @@ fn warn_metadata_drift(skill_dir: &Path, toml_skill: &Skill, md_path: &Path) {
     }
 }
 
+/// Infer the directory/file stem a dropped/loaded skill is named after when its
+/// manifest can't be (or wasn't) read.
+fn dir_stem(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None, None)
+    load_skills_with_open_skills_config(workspace_dir, None, None, None).0
 }
 
 /// Load skills using runtime config values (preferred at runtime).
@@ -452,8 +569,17 @@ pub fn load_skills_with_config(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
 ) -> Vec<Skill> {
+    load_skills_with_config_audited(workspace_dir, config).0
+}
+
+/// Like [`load_skills_with_config`] but also returns the audit-dropped
+/// candidates the resolver skipped, so the dashboard can surface them
+pub fn load_skills_with_config_audited(
+    workspace_dir: &Path,
+    config: &zeroclaw_config::schema::Config,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
     #[allow(unused_mut)]
-    let mut skills = load_skills_with_open_skills_config(
+    let (mut skills, mut dropped) = load_skills_with_open_skills_config(
         workspace_dir,
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
@@ -461,35 +587,59 @@ pub fn load_skills_with_config(
     );
 
     #[cfg(feature = "plugins-wasm")]
-    skills.extend(load_plugin_skills_from_config(config));
+    {
+        let (plugin_skills, plugin_dropped) = load_plugin_skills_from_config(config);
+        skills.extend(plugin_skills);
+        dropped.extend(plugin_dropped);
+    }
 
-    skills
+    (skills, dropped)
 }
 
-/// Per-agent skill discovery. Walks `[agents.<agent_alias>].skill_bundles`,
-/// resolves each bundle's directory via the shared
-/// [`zeroclaw_config::skill_bundles::resolve_directory`] helper, and unions
-/// the skills under each bundle with whatever
-/// [`load_skills_with_config`] would return for the install (workspace
-/// skills, open-skills, plugin skills). Empty `skill_bundles` falls back
-/// to the install-wide set — keeps freshly-migrated agents working until
-/// the operator assigns a bundle.
 pub fn load_skills_for_agent(
     workspace_dir: &Path,
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> Vec<Skill> {
-    let mut skills = load_skills_with_config(workspace_dir, config);
+    load_skills_for_agent_audited(workspace_dir, config, agent_alias).0
+}
+
+fn origin_hint_of(skill: &Skill) -> &'static str {
+    if skill.tags.iter().any(|t| t == "open-skills") {
+        "open-skills"
+    } else if skill.name.starts_with("plugin:")
+        || skill.tags.iter().any(|t| t.starts_with("plugin:"))
+    {
+        "plugin"
+    } else {
+        "workspace"
+    }
+}
+
+/// [`load_skills_for_agent`] plus the audit-dropped and shadowed candidates the
+/// resolver skipped, so the dashboard can surface them without re-auditing or
+/// re-walking
+pub fn load_skills_for_agent_audited(
+    workspace_dir: &Path,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> (Vec<Skill>, Vec<DroppedSkill>, Vec<ShadowedSkill>) {
+    let (mut skills, mut dropped) = load_skills_with_config_audited(workspace_dir, config);
+    let mut shadows: Vec<ShadowedSkill> = Vec::new();
     let Some(agent) = config.agent(agent_alias) else {
-        return skills;
+        return (skills, dropped, shadows);
     };
     if agent.skill_bundles.is_empty() {
-        return skills;
+        return (skills, dropped, shadows);
     }
     let install_root = config.install_root_dir();
     let allow_scripts = config.skills.allow_scripts;
-    let mut seen: std::collections::HashSet<String> =
-        skills.iter().map(|s| s.name.clone()).collect();
+    // name → origin_hint of the winner already in `skills`, so a shadowed
+    // bundle skill can be attributed to the source that beat it.
+    let mut seen: std::collections::HashMap<String, &'static str> = skills
+        .iter()
+        .map(|s| (s.name.clone(), origin_hint_of(s)))
+        .collect();
     for bundle_alias in &agent.skill_bundles {
         let bundle = match config.skill_bundles.get(bundle_alias) {
             Some(b) => b,
@@ -509,34 +659,50 @@ pub fn load_skills_for_agent(
                 continue;
             }
         };
-        for skill in load_skills_from_directory(&dir, allow_scripts) {
+        let (bundle_skills, bundle_dropped) = load_skills_from_directory(&dir, allow_scripts);
+        dropped.extend(bundle_dropped.into_iter().map(|mut d| {
+            d.origin_hint = "bundle".into();
+            d
+        }));
+        for skill in bundle_skills {
             if !bundle.admits_skill(&skill.name) {
                 continue;
             }
             // First-write wins so workspace skills override bundle skills
             // with the same name (legacy agents who edited a workspace
             // copy keep their override after a bundle is assigned).
-            if seen.insert(skill.name.clone()) {
+            if seen.contains_key(&skill.name) {
+                // This bundle skill lost the name to an earlier source.
+                // Record the loser keyed to the winner's name so the
+                // dashboard can badge the winning skill.
+                shadows.push(ShadowedSkill {
+                    name: skill.name.clone(),
+                    origin_hint: "bundle".into(),
+                });
+            } else {
+                seen.insert(skill.name.clone(), "bundle");
                 skills.push(skill);
             }
         }
     }
-    skills
+    (skills, dropped, shadows)
 }
 
-/// Production helper: loads skills for an agent using the correct per-agent
-/// workspace directory. This is the single call site that all runtime paths
-/// (agent boot, message processing, WebSocket/daemon) must use to ensure
-/// skills are loaded from `<install>/agents/<alias>/workspace/skills/`
-/// rather than `config.data_dir`.
-///
-/// Source of truth for the workspace directory is `config.agent_workspace_dir(agent_alias)`;
-/// this helper resolves it on every call so config reloads take effect.
 pub fn load_skills_for_agent_from_config(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
 ) -> Vec<Skill> {
-    load_skills_for_agent(
+    load_skills_for_agent_from_config_audited(config, agent_alias).0
+}
+
+/// [`load_skills_for_agent_from_config`] plus the audit-dropped and shadowed
+/// candidates the resolver skipped — the dashboard's source for the
+/// skipped-audit banner and shadow badges
+pub fn load_skills_for_agent_from_config_audited(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> (Vec<Skill>, Vec<DroppedSkill>, Vec<ShadowedSkill>) {
+    load_skills_for_agent_audited(
         &config.agent_workspace_dir(agent_alias),
         config,
         agent_alias,
@@ -556,6 +722,7 @@ pub fn load_skills_with_open_skills_settings(
         open_skills_dir,
         Some(allow_scripts),
     )
+    .0
 }
 
 fn load_skills_with_open_skills_config(
@@ -563,40 +730,56 @@ fn load_skills_with_open_skills_config(
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
     config_allow_scripts: Option<bool>,
-) -> Vec<Skill> {
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
     let mut skills = Vec::new();
+    let mut dropped = Vec::new();
     let allow_scripts = config_allow_scripts.unwrap_or(false);
 
     if let Some(open_skills_dir) =
         ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
     {
-        skills.extend(load_open_skills(&open_skills_dir, allow_scripts));
+        let (os_skills, os_dropped) = load_open_skills(&open_skills_dir, allow_scripts);
+        skills.extend(os_skills);
+        dropped.extend(os_dropped);
     }
 
-    skills.extend(load_workspace_skills(workspace_dir, allow_scripts));
-    skills
+    let (ws_skills, ws_dropped) = load_workspace_skills(workspace_dir, allow_scripts);
+    skills.extend(ws_skills);
+    dropped.extend(ws_dropped);
+    (skills, dropped)
 }
 
-fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_workspace_skills(
+    workspace_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
     let skills_dir = workspace_dir.join("skills");
     load_skills_from_directory(&skills_dir, allow_scripts)
 }
 
-pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
-    cache::cached_load(skills_dir, allow_scripts, "workspace", || {
-        load_skills_from_directory_uncached(skills_dir, allow_scripts)
-    })
+pub fn load_skills_from_directory(
+    skills_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
+    let out = cache::cached_load(skills_dir, allow_scripts, "workspace", || {
+        let (skills, dropped) = load_skills_from_directory_uncached(skills_dir, allow_scripts);
+        cache::LoadOutput { skills, dropped }
+    });
+    (out.skills, out.dropped)
 }
 
-fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_skills_from_directory_uncached(
+    skills_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
+    let mut skills = Vec::new();
+    let mut dropped = Vec::new();
     if !skills_dir.exists() {
-        return Vec::new();
+        return (skills, dropped);
     }
 
-    let mut skills = Vec::new();
-
     let Ok(entries) = std::fs::read_dir(skills_dir) else {
-        return skills;
+        return (skills, dropped);
     };
 
     for entry in entries.flatten() {
@@ -612,7 +795,17 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
-                warn_skipped_skill(&path, &summary, allow_scripts);
+                let scripts_blocked = report.scripts_blocked;
+                warn_skipped_skill(&path, &summary, scripts_blocked, allow_scripts);
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "workspace".into(),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
+                    location: Some(path.clone()),
+                });
                 continue;
             }
             Err(err) => {
@@ -625,6 +818,12 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
                         path.display().to_string()
                     )
                 );
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "workspace".into(),
+                    reason: SkillDropReason::AuditError(err.to_string()),
+                    location: Some(path.clone()),
+                });
                 continue;
             }
         }
@@ -659,6 +858,12 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
                             })),
                         "failed to load SKILL.toml — skill directory skipped"
                     );
+                    dropped.push(DroppedSkill {
+                        name: dir_stem(&path),
+                        origin_hint: "workspace".into(),
+                        reason: SkillDropReason::ManifestParseError(format!("{e}")),
+                        location: Some(path.clone()),
+                    });
                 }
             }
         } else if md_path.exists()
@@ -668,7 +873,7 @@ fn load_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -
         }
     }
 
-    skills
+    (skills, dropped)
 }
 
 fn finalize_open_skill(mut skill: Skill) -> Skill {
@@ -681,21 +886,29 @@ fn finalize_open_skill(mut skill: Skill) -> Skill {
     skill
 }
 
-fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
-    cache::cached_load(skills_dir, allow_scripts, "open-skills", || {
-        load_open_skills_from_directory_uncached(skills_dir, allow_scripts)
-    })
+fn load_open_skills_from_directory(
+    skills_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
+    let out = cache::cached_load(skills_dir, allow_scripts, "open-skills", || {
+        let (skills, dropped) = load_open_skills_from_directory_uncached(skills_dir, allow_scripts);
+        cache::LoadOutput { skills, dropped }
+    });
+    (out.skills, out.dropped)
 }
 
-fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_open_skills_from_directory_uncached(
+    skills_dir: &Path,
+    allow_scripts: bool,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
+    let mut skills = Vec::new();
+    let mut dropped = Vec::new();
     if !skills_dir.exists() {
-        return Vec::new();
+        return (skills, dropped);
     }
 
-    let mut skills = Vec::new();
-
     let Ok(entries) = std::fs::read_dir(skills_dir) else {
-        return skills;
+        return (skills, dropped);
     };
 
     for entry in entries.flatten() {
@@ -711,7 +924,17 @@ fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bo
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
                 let summary = report.summary();
-                warn_skipped_skill(&path, &summary, allow_scripts);
+                let scripts_blocked = report.scripts_blocked;
+                warn_skipped_skill(&path, &summary, scripts_blocked, allow_scripts);
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "open-skills".into(),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
+                    location: Some(path.clone()),
+                });
                 continue;
             }
             Err(err) => {
@@ -724,6 +947,12 @@ fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bo
                         path.display().to_string()
                     )
                 );
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "open-skills".into(),
+                    reason: SkillDropReason::AuditError(err.to_string()),
+                    location: Some(path.clone()),
+                });
                 continue;
             }
         }
@@ -757,6 +986,12 @@ fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bo
                             })),
                         "failed to load SKILL.toml — skill directory skipped"
                     );
+                    dropped.push(DroppedSkill {
+                        name: dir_stem(&path),
+                        origin_hint: "open-skills".into(),
+                        reason: SkillDropReason::ManifestParseError(format!("{e}")),
+                        location: Some(path.clone()),
+                    });
                 }
             }
         } else if md_path.exists()
@@ -766,10 +1001,10 @@ fn load_open_skills_from_directory_uncached(skills_dir: &Path, allow_scripts: bo
         }
     }
 
-    skills
+    (skills, dropped)
 }
 
-fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
+fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<DroppedSkill>) {
     // Modern open-skills layout stores skill packages in `skills/<name>/SKILL.md`.
     // Prefer that structure to avoid treating repository docs (e.g. CONTRIBUTING.md)
     // as executable skills.
@@ -779,9 +1014,10 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
     }
 
     let mut skills = Vec::new();
+    let mut dropped = Vec::new();
 
     let Ok(entries) = std::fs::read_dir(repo_dir) else {
-        return skills;
+        return (skills, dropped);
     };
 
     for entry in entries.flatten() {
@@ -809,6 +1045,8 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
         match audit::audit_open_skill_markdown(&path, repo_dir) {
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
+                let summary = report.summary();
+                let scripts_blocked = report.scripts_blocked;
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -816,9 +1054,18 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
                     &format!(
                         "skipping insecure open-skill file {}: {}",
                         path.display().to_string(),
-                        report.summary()
+                        summary
                     )
                 );
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "open-skills".into(),
+                    reason: SkillDropReason::AuditFindings {
+                        summary,
+                        scripts_blocked,
+                    },
+                    location: Some(path.clone()),
+                });
                 continue;
             }
             Err(err) => {
@@ -831,6 +1078,12 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
                         path.display().to_string()
                     )
                 );
+                dropped.push(DroppedSkill {
+                    name: dir_stem(&path),
+                    origin_hint: "open-skills".into(),
+                    reason: SkillDropReason::AuditError(err.to_string()),
+                    location: Some(path.clone()),
+                });
                 continue;
             }
         }
@@ -840,7 +1093,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
         }
     }
 
-    skills
+    (skills, dropped)
 }
 
 fn parse_open_skills_enabled(raw: &str) -> Option<bool> {
@@ -1084,6 +1337,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tools: manifest.tools,
         prompts,
         slash_options: manifest.skill.slash_options,
+        always: manifest.skill.always,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1113,6 +1367,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
+        always: parsed.meta.always,
         location: Some(path.to_path_buf()),
     })
 }
@@ -1155,6 +1410,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         slash_options: parsed.meta.slash_options,
+        always: parsed.meta.always,
         location: Some(path.to_path_buf()),
     }))
 }
@@ -1241,6 +1497,7 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
             "description" => meta.description = Some(val.to_string()),
             "version" => meta.version = Some(val.to_string()),
             "author" => meta.author = Some(val.to_string()),
+            "always" => meta.always = val.eq_ignore_ascii_case("true"),
             "tags" => {
                 if val.is_empty() {
                     // YAML block list follows on subsequent lines
@@ -1346,7 +1603,8 @@ fn display_skill_location(path: &Path) -> String {
     }
 }
 
-/// Build the "Available Skills" system prompt section with full skill instructions.
+/// Build the available-skills prompt when no tool-availability context exists.
+/// Full mode is the safe fallback because compact mode requires `read_skill`.
 pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     skills_to_prompt_with_mode(
         skills,
@@ -1355,11 +1613,57 @@ pub fn skills_to_prompt(skills: &[Skill], workspace_dir: &Path) -> String {
     )
 }
 
-/// Build the "Available Skills" system prompt section with configurable verbosity.
+/// Resolve compact skill prompting against the effective tool surface.
+/// Compact mode is only safe when `read_skill` is available for the turn.
+pub fn skills_prompt_mode_with_loader_fallback(
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    read_skill_available: bool,
+) -> zeroclaw_config::schema::SkillsPromptInjectionMode {
+    if matches!(
+        mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
+    ) && !read_skill_available
+    {
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+    } else {
+        mode
+    }
+}
+
+fn is_registered_skill_tool_kind(kind: &str) -> bool {
+    matches!(kind, "shell" | "script" | "http" | "builtin" | "mcp")
+}
+
+fn skill_tool_is_prompt_callable(tool: &SkillTool) -> bool {
+    if !is_registered_skill_tool_kind(tool.kind.as_str()) {
+        return false;
+    }
+    match tool.kind.as_str() {
+        "builtin" | "mcp" => tool.target.as_deref().is_some_and(|t| !t.trim().is_empty()),
+        _ => true,
+    }
+}
+
+/// Build the available-skills prompt section with the requested verbosity.
 pub fn skills_to_prompt_with_mode(
     skills: &[Skill],
     workspace_dir: &Path,
+    // The caller supplies the resolved mode after applying any runtime-profile
+    // override over the global value. Full inlines instructions eagerly;
+    // Compact renders summaries whose instructions load via `read_skill`.
     mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+) -> String {
+    skills_to_prompt_with_mode_and_availability(skills, workspace_dir, mode, |_| true)
+}
+
+/// Build the available-skills prompt while checking callable names against the
+/// effective tool surface. Tools that fail this availability check remain in
+/// descriptive metadata so the skill and its instructions are not dropped.
+pub(crate) fn skills_to_prompt_with_mode_and_availability(
+    skills: &[Skill],
+    workspace_dir: &Path,
+    mode: zeroclaw_config::schema::SkillsPromptInjectionMode,
+    is_tool_available: impl Fn(&str) -> bool,
 ) -> String {
     use std::fmt::Write;
 
@@ -1367,44 +1671,39 @@ pub fn skills_to_prompt_with_mode(
         return String::new();
     }
 
-    let mut prompt = match mode {
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Full => String::from(
+    let is_full = matches!(
+        mode,
+        zeroclaw_config::schema::SkillsPromptInjectionMode::Full
+    );
+
+    let mut prompt = if is_full {
+        String::from(
             "## Available Skills\n\n\
              Skill instructions and tool metadata are preloaded below.\n\
              Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\n\
              <available_skills>\n",
-        ),
-        zeroclaw_config::schema::SkillsPromptInjectionMode::Compact => String::from(
+        )
+    } else {
+        String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
              Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
+             Skills marked `always` include full instructions below even in compact mode.\n\
              The `location` field is included for reference.\n\n\
              <available_skills>\n",
-        ),
+        )
     };
 
     for skill in skills {
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
-        let location = render_skill_location(
-            skill,
-            workspace_dir,
-            matches!(
-                mode,
-                zeroclaw_config::schema::SkillsPromptInjectionMode::Compact
-            ),
-        );
+        let location = render_skill_location(skill, workspace_dir, !is_full);
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        // In Full mode, inline both instructions and tools.
-        // In Compact mode, skip instructions (loaded on demand) but keep tools
-        // so the LLM knows which skill tools are available.
-        if matches!(
-            mode,
-            zeroclaw_config::schema::SkillsPromptInjectionMode::Full
-        ) && !skill.prompts.is_empty()
-        {
+        // Full mode inlines instructions eagerly. Compact mode does so only for
+        // always-injected skills; other instructions load through `read_skill`.
+        if (is_full || skill.always) && !skill.prompts.is_empty() {
             let _ = writeln!(prompt, "    <instructions>");
             for instruction in &skill.prompts {
                 write_xml_text_element(&mut prompt, 6, "instruction", instruction);
@@ -1413,18 +1712,27 @@ pub fn skills_to_prompt_with_mode(
         }
 
         if !skill.tools.is_empty() {
-            // Tools with known kinds (shell, script, http) are registered as
-            // callable tool specs and can be invoked directly via function calling.
-            // We note them here for context but mark them as callable.
             let registered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
+                .filter(|t| {
+                    skill_tool_is_prompt_callable(t)
+                        && is_tool_available(&crate::tools::skill_tool::composed_tool_name(
+                            &skill.name,
+                            &t.name,
+                        ))
+                })
                 .collect();
             let unregistered: Vec<_> = skill
                 .tools
                 .iter()
-                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http" | "builtin"))
+                .filter(|t| {
+                    !skill_tool_is_prompt_callable(t)
+                        || !is_tool_available(&crate::tools::skill_tool::composed_tool_name(
+                            &skill.name,
+                            &t.name,
+                        ))
+                })
                 .collect();
 
             if !registered.is_empty() {
@@ -1440,7 +1748,7 @@ pub fn skills_to_prompt_with_mode(
                         "name",
                         // Must match the registered tool spec's name exactly
                         // (same sanitizer), or the model is told to call a name
-                        // that no tool exposes (#6678).
+                        // that no tool exposes
                         &crate::tools::skill_tool::composed_tool_name(&skill.name, &tool.name),
                     );
                     write_xml_text_element(&mut prompt, 8, "description", &tool.description);
@@ -1469,34 +1777,14 @@ pub fn skills_to_prompt_with_mode(
     prompt
 }
 
-/// Convert skill tools into callable `Tool` trait objects.
-///
-/// Each skill's `[[tools]]` entries are converted to either `SkillShellTool`
-/// (for `shell`/`script` kinds), `SkillHttpTool` (for `http` kind), or
-/// `SkillBuiltinTool` (for `builtin` kind), enabling them to appear as
-/// first-class callable tool specs rather than only as XML in the system
-/// prompt.
-///
-/// The `builtin` kind requires the unfiltered tool registry. Use
-/// [`skills_to_tools_with_context`] to register that kind.
 pub fn skills_to_tools(
     skills: &[Skill],
     security: std::sync::Arc<crate::security::SecurityPolicy>,
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
-    skills_to_tools_with_context(skills, security, &[])
+    skills_to_tools_with_context(skills, security, &[], nat64_prefixes)
 }
 
-/// Convert skill tools into callable `Tool` trait objects with full context.
-///
-/// `unfiltered_registry` provides the pre-policy tool list for `builtin`
-/// delegation.
-/// Resolve a skill elevation tool (`kind = "builtin"` or `kind = "mcp"`).
-///
-/// Both kinds delegate to a tool resolved by name from `resolution_registry`
-/// (built-in tools + MCP tool wrappers). The only difference is `kind_label`,
-/// used for diagnostics. Returns `None` (after a WARN) when the `target` is
-/// missing or not resolvable, so a misconfigured manifest is skipped, never
-/// fatal.
 fn resolve_elevated_tool(
     skill_name: &str,
     tool: &SkillTool,
@@ -1543,12 +1831,14 @@ pub fn skills_to_tools_with_context(
     skills: &[Skill],
     security: std::sync::Arc<crate::security::SecurityPolicy>,
     unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     skills_to_tools_with_context_and_runtime(
         skills,
         security,
         unfiltered_registry,
         std::sync::Arc::new(crate::platform::NativeRuntime::new()),
+        nat64_prefixes,
     )
 }
 
@@ -1557,10 +1847,41 @@ pub fn skills_to_tools_with_context_and_runtime(
     security: std::sync::Arc<crate::security::SecurityPolicy>,
     unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
     runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
+    nat64_prefixes: &[zeroclaw_infra::net_guard::Nat64Prefix],
+) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
+    skills_to_tools_with_context_and_runtime_optional_nat64(
+        skills,
+        security,
+        unfiltered_registry,
+        runtime,
+        Some(nat64_prefixes),
+    )
+}
+
+/// Internal assembly seam. `None` omits only HTTP tools after an invalid NAT64
+/// configuration; other skill kinds continue through their normal path.
+pub(crate) fn skills_to_tools_with_context_and_runtime_optional_nat64(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+    unfiltered_registry: &[std::sync::Arc<dyn zeroclaw_api::tool::Tool>],
+    runtime: std::sync::Arc<dyn crate::platform::RuntimeAdapter>,
+    nat64_prefixes: Option<&[zeroclaw_infra::net_guard::Nat64Prefix]>,
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
         for tool in &skill.tools {
+            if !is_registered_skill_tool_kind(tool.kind.as_str()) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "Unknown skill tool kind '{}' for {}.{}, skipping",
+                        tool.kind, skill.name, tool.name
+                    )
+                );
+                continue;
+            }
             match tool.kind.as_str() {
                 "shell" | "script" => {
                     let inner = crate::skills::skill_tool::SkillShellTool::new_with_runtime(
@@ -1575,10 +1896,13 @@ pub fn skills_to_tools_with_context_and_runtime(
                     )));
                 }
                 "http" => {
-                    tools.push(Box::new(crate::skills::skill_http::SkillHttpTool::new(
-                        &skill.name,
-                        tool,
-                    )));
+                    if let Some(nat64_prefixes) = nat64_prefixes {
+                        tools.push(Box::new(crate::skills::skill_http::SkillHttpTool::new(
+                            &skill.name,
+                            tool,
+                            nat64_prefixes,
+                        )));
+                    }
                 }
                 "builtin" => {
                     if let Some(t) =
@@ -1594,14 +1918,17 @@ pub fn skills_to_tools_with_context_and_runtime(
                         tools.push(t);
                     }
                 }
+                // Keep this fail-closed if the admission list and dispatcher
+                // ever drift apart: an unsupported tool is safer skipped than
+                // allowed to abort agent startup.
                 other => {
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                             .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                         &format!(
-                            "Unknown skill tool kind '{}' for {}.{}, skipping",
-                            other, skill.name, tool.name
+                            "Registered skill tool kind '{other}' for {}.{} has no dispatcher, skipping",
+                            skill.name, tool.name
                         )
                     );
                 }
@@ -1656,114 +1983,7 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_clawhub_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case(CLAWHUB_DOMAIN) || host.eq_ignore_ascii_case(CLAWHUB_WWW_DOMAIN)
-}
-
-fn parse_clawhub_url(source: &str) -> Option<Url> {
-    let parsed = Url::parse(source).ok()?;
-    match parsed.scheme() {
-        "https" | "http" => {}
-        _ => return None,
-    }
-
-    if !parsed.host_str().is_some_and(is_clawhub_host) {
-        return None;
-    }
-
-    Some(parsed)
-}
-
-pub fn is_clawhub_source(source: &str) -> bool {
-    if source.starts_with("clawhub:") {
-        return true;
-    }
-    parse_clawhub_url(source).is_some()
-}
-
-fn clawhub_download_url(source: &str) -> Result<String> {
-    // Short prefix: clawhub:<slug>
-    if let Some(slug) = source.strip_prefix("clawhub:") {
-        let slug = slug.trim().trim_end_matches('/');
-        if slug.is_empty() || slug.contains('/') {
-            anyhow::bail!(
-                "invalid clawhub source '{}': expected 'clawhub:<slug>' (no slashes in slug)",
-                source
-            );
-        }
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
-    }
-
-    // Profile URL: https://clawhub.ai/<owner>/<slug> or https://www.clawhub.ai/<slug>
-    if let Some(parsed) = parse_clawhub_url(source) {
-        let path = parsed
-            .path_segments()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join("/");
-
-        if path.is_empty() {
-            anyhow::bail!("could not extract slug from ClawHub URL: {source}");
-        }
-
-        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
-    }
-
-    anyhow::bail!("unrecognised ClawHub source format: {source}")
-}
-
-fn normalize_skill_name(s: &str) -> String {
-    s.to_lowercase()
-        .chars()
-        .map(|c| if c == '-' { '_' } else { c })
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect()
-}
-
-fn clawhub_skill_dir_name(source: &str) -> Result<String> {
-    if let Some(slug) = source.strip_prefix("clawhub:") {
-        let slug = slug.trim().trim_end_matches('/');
-        let base = slug.rsplit('/').next().unwrap_or(slug);
-        let name = normalize_skill_name(base);
-        return Ok(if name.is_empty() {
-            "skill".to_string()
-        } else {
-            name
-        });
-    }
-
-    let parsed = parse_clawhub_url(source).ok_or_else(|| {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"source": source})),
-            "skill install rejected: invalid clawhub URL"
-        );
-        anyhow::Error::msg(format!("invalid clawhub URL: {source}"))
-    })?;
-
-    let path = parsed
-        .path_segments()
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-
-    let base = path.last().copied().unwrap_or("skill");
-    let name = normalize_skill_name(base);
-    Ok(if name.is_empty() {
-        "skill".to_string()
-    } else {
-        name
-    })
-}
-
 pub fn is_git_source(source: &str) -> bool {
-    // ClawHub URLs look like https:// but are not git repos
-    if is_clawhub_source(source) {
-        return false;
-    }
     is_git_scheme_source(source, "https://")
         || is_git_scheme_source(source, "http://")
         || is_git_scheme_source(source, "ssh://")
@@ -1864,60 +2084,339 @@ fn remove_git_metadata(skill_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn copy_dir_recursive_secure(src: &Path, dest: &Path) -> Result<()> {
-    let src_meta = std::fs::symlink_metadata(src)
-        .with_context(|| format!("failed to read metadata for {}", src.display().to_string()))?;
-    if src_meta.file_type().is_symlink() {
-        anyhow::bail!(
-            "Refusing to copy symlinked skill source path: {}",
-            src.display()
-        );
-    }
-    if !src_meta.is_dir() {
-        anyhow::bail!(
-            "Skill source must be a directory: {}",
-            src.display().to_string()
-        );
-    }
+    source_open_seam();
+    let source = open_source_dir_nofollow(src)?;
+    copy_open_dir_recursive_secure(&source, src, dest)
+}
 
-    std::fs::create_dir_all(dest).with_context(|| {
+#[cfg(test)]
+fn copy_open_dir_recursive_secure(source: &Dir, source_path: &Path, dest: &Path) -> Result<()> {
+    let dest_parent_path = dest
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dest_parent_path).with_context(|| {
+        format!(
+            "failed to create destination parent {}",
+            dest_parent_path.display()
+        )
+    })?;
+    let dest_parent = open_parent_dir(dest)?;
+    let dest_name = dest
+        .file_name()
+        .context("Destination path must include a directory name")?;
+    dest_parent.create_dir(dest_name).with_context(|| {
         format!(
             "failed to create destination {}",
             dest.display().to_string()
         )
     })?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-        let metadata = std::fs::symlink_metadata(&src_path).with_context(|| {
+    let destination = dest_parent
+        .open_dir_nofollow(dest_name)
+        .with_context(|| format!("failed to open destination {}", dest.display()))?;
+
+    copy_dir_contents(source, &destination, source_path, dest, Path::new(""))
+}
+
+#[cfg(test)]
+fn open_parent_dir(path: &Path) -> Result<Dir> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Dir::open_ambient_dir(parent, ambient_authority())
+        .with_context(|| format!("failed to open parent directory {}", parent.display()))
+}
+
+fn open_final_dir_nofollow(path: &Path) -> Result<Dir> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_parent = parent.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize parent directory {}",
+            parent.display()
+        )
+    })?;
+    let parent_dir = open_source_dir_nofollow(&canonical_parent)?;
+    let name = path
+        .file_name()
+        .context("Directory path must include a final component")?;
+    parent_dir.open_dir_nofollow(name).with_context(|| {
+        format!(
+            "failed to open directory without following symlinks: {}",
+            path.display()
+        )
+    })
+}
+
+fn open_source_dir_nofollow(src: &Path) -> Result<Dir> {
+    let mut components = src.components();
+    let anchor = match components.next() {
+        Some(Component::RootDir) => PathBuf::from(std::path::MAIN_SEPARATOR_STR),
+        Some(Component::Prefix(prefix)) => {
+            if !matches!(components.next(), Some(Component::RootDir)) {
+                anyhow::bail!(
+                    "Skill source path has an unsupported prefix without a root: {}",
+                    src.display()
+                );
+            }
+            #[cfg(windows)]
+            {
+                let mut anchor = prefix.as_os_str().to_os_string();
+                anchor.push(std::path::MAIN_SEPARATOR_STR);
+                PathBuf::from(anchor)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = prefix;
+                anyhow::bail!(
+                    "Skill source path has an unsupported platform prefix: {}",
+                    src.display()
+                );
+            }
+        }
+        Some(component) => anyhow::bail!(
+            "Skill source path must be absolute; unsupported initial component {component:?} in {}",
+            src.display()
+        ),
+        None => anyhow::bail!("Skill source path is empty"),
+    };
+
+    let mut current = Dir::open_ambient_dir(&anchor, ambient_authority())
+        .with_context(|| format!("failed to open stable source anchor {}", anchor.display()))?;
+    let mut normal_components = 0;
+    for component in components {
+        let name = match component {
+            Component::Normal(name) => name,
+            unsupported => anyhow::bail!(
+                "Skill source path has unsupported component {unsupported:?}: {}",
+                src.display()
+            ),
+        };
+        normal_components += 1;
+        current = current.open_dir_nofollow(name).with_context(|| {
+            format!(
+                "failed to open skill source component {} in {}",
+                name.to_string_lossy(),
+                src.display()
+            )
+        })?;
+    }
+
+    if normal_components == 0 {
+        anyhow::bail!(
+            "Skill source path must include a directory name: {}",
+            src.display()
+        );
+    }
+
+    Ok(current)
+}
+
+fn copy_dir_contents(
+    source: &Dir,
+    destination: &Dir,
+    source_path: &Path,
+    destination_path: &Path,
+    relative: &Path,
+) -> Result<()> {
+    for entry in source.entries().with_context(|| {
+        format!(
+            "failed to read skill source directory {}",
+            source_path.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read skill source directory {}",
+                source_path.display()
+            )
+        })?;
+        let name = entry.file_name();
+        let source_entry_path = source_path.join(&name);
+        let destination_entry_path = destination_path.join(&name);
+        let entry_relative = relative.join(&name);
+        let metadata = entry.metadata().with_context(|| {
             format!(
                 "failed to read metadata for {}",
-                src_path.display().to_string()
+                source_entry_path.display().to_string()
             )
         })?;
 
         if metadata.file_type().is_symlink() {
             anyhow::bail!(
                 "Refusing to copy symlink within skill source: {}",
-                src_path.display()
+                source_entry_path.display()
             );
         }
 
         if metadata.is_dir() {
-            copy_dir_recursive_secure(&src_path, &dest_path)?;
-        } else if metadata.is_file() {
-            std::fs::copy(&src_path, &dest_path).with_context(|| {
+            entry_swap_seam(&entry_relative);
+            let child_source = source
+                .open_dir_nofollow(&name)
+                .with_context(|| format!("failed to open {}", source_entry_path.display()))?;
+            destination.create_dir(&name).with_context(|| {
                 format!(
-                    "failed to copy skill file from {} to {}",
-                    src_path.display().to_string(),
-                    dest_path.display()
+                    "failed to create destination {}",
+                    destination_entry_path.display()
                 )
             })?;
+            let child_destination = destination.open_dir_nofollow(&name).with_context(|| {
+                format!(
+                    "failed to open destination {}",
+                    destination_entry_path.display()
+                )
+            })?;
+            copy_dir_contents(
+                &child_source,
+                &child_destination,
+                &source_entry_path,
+                &destination_entry_path,
+                &entry_relative,
+            )?;
+        } else if metadata.is_file() {
+            entry_swap_seam(&entry_relative);
+            let mut reader = entry
+                .open_with(OpenOptions::new().read(true).follow(FollowSymlinks::No))
+                .with_context(|| format!("failed to open {}", source_entry_path.display()))?;
+            let opened_metadata = reader.metadata().with_context(|| {
+                format!(
+                    "failed to read metadata for {}",
+                    source_entry_path.display().to_string()
+                )
+            })?;
+            if !opened_metadata.is_file() {
+                anyhow::bail!(
+                    "opened skill source entry {} is not a regular file",
+                    source_entry_path.display()
+                );
+            }
+
+            let mut writer = destination
+                .open_with(&name, OpenOptions::new().write(true).create_new(true))
+                .with_context(|| {
+                    format!(
+                        "failed to create destination file {}",
+                        destination_entry_path.display()
+                    )
+                })?;
+            std::io::copy(&mut reader, &mut writer).with_context(|| {
+                format!(
+                    "failed to copy skill file from {} to {}",
+                    source_entry_path.display(),
+                    destination_entry_path.display()
+                )
+            })?;
+            writer
+                .set_permissions(opened_metadata.permissions())
+                .with_context(|| {
+                    format!(
+                        "failed to preserve permissions on {}",
+                        destination_entry_path.display()
+                    )
+                })?;
         }
     }
 
     Ok(())
+}
+
+#[cfg(not(test))]
+#[inline]
+fn entry_swap_seam(_relative: &Path) {}
+
+#[cfg(test)]
+fn entry_swap_seam(relative: &Path) {
+    copy_tests::run_entry_swap_seam(relative);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn source_open_seam() {}
+
+#[cfg(test)]
+fn source_open_seam() {
+    copy_tests::run_source_open_seam();
+}
+
+#[cfg(not(test))]
+#[inline]
+fn selected_source_seam() {}
+
+#[cfg(test)]
+fn selected_source_seam() {
+    copy_tests::run_selected_source_seam();
+}
+
+fn install_open_skill_source(
+    source: Dir,
+    source_path: &Path,
+    name: &OsStr,
+    skills_path: &Path,
+    allow_scripts: bool,
+) -> Result<(PathBuf, usize)> {
+    std::fs::create_dir_all(skills_path).with_context(|| {
+        format!(
+            "failed to create skills directory {}",
+            skills_path.display()
+        )
+    })?;
+
+    let dest = skills_path.join(name);
+    if dest.exists() {
+        anyhow::bail!("Destination skill already exists: {}", dest.display());
+    }
+
+    // Keep incomplete bytes outside the live skills directory. The temporary
+    // directory is process-private, and publication stays on one filesystem.
+    let staging_parent = skills_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let staging = tempfile::Builder::new()
+        .prefix(".skill-install-")
+        .tempdir_in(staging_parent)
+        .with_context(|| {
+            format!(
+                "failed to create private skill staging directory in {}",
+                staging_parent.display()
+            )
+        })?;
+    let staging_path = staging.path();
+    let staging_dir =
+        Dir::open_ambient_dir(staging_path, ambient_authority()).with_context(|| {
+            format!(
+                "failed to open private skill staging directory {}",
+                staging_path.display()
+            )
+        })?;
+
+    copy_dir_contents(
+        &source,
+        &staging_dir,
+        source_path,
+        staging_path,
+        Path::new(""),
+    )?;
+    drop(staging_dir);
+
+    let report = enforce_skill_security_audit(staging_path, allow_scripts)?;
+    if dest.exists() {
+        anyhow::bail!("Destination skill already exists: {}", dest.display());
+    }
+    std::fs::rename(staging_path, &dest).with_context(|| {
+        format!(
+            "failed to publish audited skill from {} to {}",
+            staging_path.display(),
+            dest.display()
+        )
+    })?;
+
+    Ok((dest, report.files_scanned))
 }
 
 pub fn install_local_skill_source(
@@ -1930,33 +2429,321 @@ pub fn install_local_skill_source(
         anyhow::bail!("Source path does not exist: {source}");
     }
 
-    let source_path = source_path
+    let canonical_source_path = source_path
         .canonicalize()
         .with_context(|| format!("failed to canonicalize source path {source}"))?;
-    let _ = enforce_skill_security_audit(&source_path, allow_scripts)?;
-
-    let name = source_path
+    let name = canonical_source_path
         .file_name()
         .context("Source path must include a directory name")?;
-    let dest = skills_path.join(name);
-    if dest.exists() {
-        anyhow::bail!(
-            "Destination skill already exists: {}",
-            dest.display().to_string()
+    source_open_seam();
+    let source = open_source_dir_nofollow(&canonical_source_path)?;
+    install_open_skill_source(
+        source,
+        &canonical_source_path,
+        name,
+        skills_path,
+        allow_scripts,
+    )
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::*;
+    #[cfg(unix)]
+    use std::cell::Cell;
+    use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::rc::Rc;
+
+    type Swap = Box<dyn Fn(&Path)>;
+    type SourceOpen = Box<dyn Fn()>;
+    type SelectedSource = Box<dyn Fn()>;
+
+    thread_local! {
+        static ENTRY_SWAP: RefCell<Option<Swap>> = const { RefCell::new(None) };
+        static SOURCE_OPEN: RefCell<Option<SourceOpen>> = const { RefCell::new(None) };
+        static SELECTED_SOURCE: RefCell<Option<SelectedSource>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn run_entry_swap_seam(relative: &Path) {
+        ENTRY_SWAP.with(|swap| {
+            if let Some(swap) = swap.borrow().as_ref() {
+                swap(relative);
+            }
+        });
+    }
+
+    pub(super) fn run_source_open_seam() {
+        SOURCE_OPEN.with(|swap| {
+            if let Some(swap) = swap.borrow().as_ref() {
+                swap();
+            }
+        });
+    }
+
+    pub(super) fn run_selected_source_seam() {
+        SELECTED_SOURCE.with(|swap| {
+            if let Some(swap) = swap.borrow().as_ref() {
+                swap();
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    struct EntrySwapGuard;
+
+    #[cfg(unix)]
+    impl EntrySwapGuard {
+        fn install(swap: impl Fn(&Path) + 'static) -> Self {
+            ENTRY_SWAP.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EntrySwapGuard {
+        fn drop(&mut self) {
+            ENTRY_SWAP.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(unix)]
+    struct SourceOpenGuard;
+
+    #[cfg(unix)]
+    impl SourceOpenGuard {
+        fn install(swap: impl Fn() + 'static) -> Self {
+            SOURCE_OPEN.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SourceOpenGuard {
+        fn drop(&mut self) {
+            SOURCE_OPEN.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    #[cfg(unix)]
+    pub(super) struct SelectedSourceGuard;
+
+    #[cfg(unix)]
+    impl SelectedSourceGuard {
+        pub(super) fn install(swap: impl Fn() + 'static) -> Self {
+            SELECTED_SOURCE.with(|slot| *slot.borrow_mut() = Some(Box::new(swap)));
+            Self
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for SelectedSourceGuard {
+        fn drop(&mut self) {
+            SELECTED_SOURCE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    #[test]
+    fn copies_nested_files_and_preserves_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        std::fs::create_dir_all(source.join("nested/deeper")).unwrap();
+        std::fs::write(source.join("nested/deeper/SKILL.md"), "skill").unwrap();
+        let script = source.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho ok\n").unwrap();
+        let canonical_source = source.canonicalize().unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        copy_dir_recursive_secure(&canonical_source, &destination).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("nested/deeper/SKILL.md")).unwrap(),
+            "skill"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(destination.join("run.sh"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o111, 0o111, "mode {mode:o}");
+        }
+    }
+
+    #[test]
+    fn install_creates_a_missing_skills_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let skills_path = root.path().join("skills");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Safe Skill\n").unwrap();
+
+        let (destination, files_scanned) =
+            install_local_skill_source(source.to_str().unwrap(), &skills_path, false).unwrap();
+
+        assert_eq!(destination, skills_path.join("source"));
+        assert!(destination.join("SKILL.md").is_file());
+        assert!(files_scanned >= 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_a_static_nested_source_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let skills_path = root.path().join("skills");
+        let destination = skills_path.join("source");
+        let outside = root.path().join("outside.txt");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&skills_path).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Safe Skill\n").unwrap();
+        std::fs::write(&outside, "external secret").unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("escape.txt")).unwrap();
+
+        let err = install_local_skill_source(source.to_str().unwrap(), &skills_path, false)
+            .expect_err("a static nested source symlink must reject the install");
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert!(!destination.exists());
+        let staging_leftover = std::fs::read_dir(root.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-install-")
+            });
+        assert!(!staging_leftover, "failed installs must remove staging");
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "external secret"
         );
     }
 
-    if let Err(err) = copy_dir_recursive_secure(&source_path, &dest) {
-        let _ = std::fs::remove_dir_all(&dest);
-        return Err(err);
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_a_file_swapped_to_an_external_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let skills_path = root.path().join("skills");
+        let destination = skills_path.join("source");
+        let entry = source.join("payload.txt");
+        let outside = root.path().join("outside.txt");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&skills_path).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Safe Skill\n").unwrap();
+        std::fs::write(&entry, "safe").unwrap();
+        std::fs::write(&outside, "external secret").unwrap();
+
+        let entry_for_swap = entry.clone();
+        let outside_for_swap = outside.clone();
+        let swapped = Rc::new(Cell::new(false));
+        let swapped_in_seam = Rc::clone(&swapped);
+        let result = {
+            let _swap = EntrySwapGuard::install(move |relative| {
+                if relative == Path::new("payload.txt") {
+                    std::fs::remove_file(&entry_for_swap).unwrap();
+                    std::os::unix::fs::symlink(&outside_for_swap, &entry_for_swap).unwrap();
+                    swapped_in_seam.set(true);
+                }
+            });
+            install_local_skill_source(source.to_str().unwrap(), &skills_path, false)
+        };
+
+        let err = result.expect_err("a swapped file symlink must fail the install");
+        assert!(swapped.get(), "the pre-copy audit must reach the copy seam");
+        assert!(err.to_string().contains("payload.txt"), "got: {err}");
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "external secret"
+        );
     }
 
-    match enforce_skill_security_audit(&dest, allow_scripts) {
-        Ok(report) => Ok((dest, report.files_scanned)),
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&dest);
-            Err(err)
-        }
+    #[cfg(unix)]
+    #[test]
+    fn install_rejects_an_ancestor_swapped_to_an_external_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join("ancestor");
+        let source = ancestor.join("source");
+        let moved_ancestor = root.path().join("ancestor-moved");
+        let outside = root.path().join("outside");
+        let skills_path = root.path().join("skills");
+        let destination = skills_path.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(outside.join("source")).unwrap();
+        std::fs::create_dir(&skills_path).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Safe Skill\n").unwrap();
+        std::fs::write(
+            outside.join("source/SKILL.md"),
+            "[outside host content](file:///etc/passwd)\n",
+        )
+        .unwrap();
+
+        let swapped = Rc::new(Cell::new(false));
+        let swapped_in_seam = Rc::clone(&swapped);
+        let ancestor_for_swap = ancestor.clone();
+        let moved_ancestor_for_swap = moved_ancestor.clone();
+        let outside_for_swap = outside.clone();
+        let result = {
+            let _swap = SourceOpenGuard::install(move || {
+                std::fs::rename(&ancestor_for_swap, &moved_ancestor_for_swap).unwrap();
+                std::os::unix::fs::symlink(&outside_for_swap, &ancestor_for_swap).unwrap();
+                swapped_in_seam.set(true);
+            });
+            install_local_skill_source(source.to_str().unwrap(), &skills_path, false)
+        };
+
+        let err = result.expect_err("an ancestor swapped to a symlink must fail the install");
+        assert!(
+            swapped.get(),
+            "the source-open seam must run after the audit"
+        );
+        assert!(err.to_string().contains("ancestor"), "got: {err}");
+        assert!(!destination.exists());
+        assert!(!destination.join("SKILL.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("source/SKILL.md")).unwrap(),
+            "[outside host content](file:///etc/passwd)\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_directory_swapped_to_an_external_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        let entry = source.join("nested");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(entry.join("safe")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "external secret").unwrap();
+
+        let entry_for_swap = entry.clone();
+        let outside_for_swap = outside.clone();
+        let canonical_source = source.canonicalize().unwrap();
+        let result = {
+            let _swap = EntrySwapGuard::install(move |relative| {
+                if relative == Path::new("nested") {
+                    std::fs::remove_dir_all(&entry_for_swap).unwrap();
+                    std::os::unix::fs::symlink(&outside_for_swap, &entry_for_swap).unwrap();
+                }
+            });
+            copy_dir_recursive_secure(&canonical_source, &destination)
+        };
+
+        let err = result.expect_err("a swapped directory symlink must fail the copy");
+        assert!(err.to_string().contains("nested"), "got: {err}");
+        assert!(!destination.join("nested").exists());
+        assert!(outside.join("secret.txt").is_file());
     }
 }
 
@@ -1977,124 +2764,6 @@ pub fn install_git_skill_source(
 
     let installed_dir = detect_newly_installed_directory(skills_path, &before)?;
     remove_git_metadata(&installed_dir)?;
-    match enforce_skill_security_audit(&installed_dir, allow_scripts) {
-        Ok(report) => Ok((installed_dir, report.files_scanned)),
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(&installed_dir);
-            Err(err)
-        }
-    }
-}
-
-/// True when a zip entry path could escape the extraction root (parent
-/// traversal, absolute path, backslash, drive/scheme colon) or is empty.
-fn is_unsafe_zip_entry_name(raw_name: &str) -> bool {
-    raw_name.is_empty()
-        || raw_name.contains("..")
-        || raw_name.starts_with('/')
-        || raw_name.contains('\\')
-        || raw_name.contains(':')
-}
-
-/// Securely extract a downloaded skill zip into `dest`.
-///
-/// Rejects archives larger than `max_bytes` and any entry whose path could
-/// escape `dest`. On a rejected entry the partially-created `dest` is removed
-/// before returning. Shared by the ClawHub installer and unit-tested directly.
-fn extract_zip_secure(bytes: Vec<u8>, dest: &Path, max_bytes: u64) -> Result<()> {
-    if bytes.len() as u64 > max_bytes {
-        anyhow::bail!(
-            "skill zip rejected: too large ({} bytes > {})",
-            bytes.len(),
-            max_bytes
-        );
-    }
-
-    std::fs::create_dir_all(dest)?;
-
-    let cursor = Cursor::new(bytes);
-    let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
-
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let raw_name = entry.name().to_string();
-
-        if is_unsafe_zip_entry_name(&raw_name) {
-            let _ = std::fs::remove_dir_all(dest);
-            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
-        }
-
-        let out_path = dest.join(&raw_name);
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out_path)?;
-            continue;
-        }
-
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut out_file = std::fs::File::create(&out_path).with_context(|| {
-            format!(
-                "failed to create extracted file: {}",
-                out_path.display().to_string()
-            )
-        })?;
-        std::io::copy(&mut entry, &mut out_file)?;
-    }
-
-    Ok(())
-}
-
-pub async fn install_clawhub_skill_source(
-    source: &str,
-    skills_path: &Path,
-    allow_scripts: bool,
-) -> Result<(PathBuf, usize)> {
-    let download_url = clawhub_download_url(source)
-        .with_context(|| format!("invalid ClawHub source: {source}"))?;
-    let skill_dir_name = clawhub_skill_dir_name(source)?;
-    let installed_dir = skills_path.join(&skill_dir_name);
-    if installed_dir.exists() {
-        anyhow::bail!(
-            "Destination skill already exists: {}",
-            installed_dir.display()
-        );
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()?;
-
-    let resp = client
-        .get(&download_url)
-        .send()
-        .await
-        .with_context(|| format!("failed to fetch zip from {download_url}"))?;
-
-    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        anyhow::bail!("ClawHub rate limit reached (HTTP 429). Wait a moment and retry.");
-    }
-    if !resp.status().is_success() {
-        anyhow::bail!("ClawHub download failed (HTTP {})", resp.status());
-    }
-
-    let bytes = resp.bytes().await?.to_vec();
-    extract_zip_secure(bytes, &installed_dir, MAX_CLAWHUB_ZIP_BYTES)?;
-
-    let has_manifest = installed_dir.join("SKILL.md").exists()
-        || installed_dir.join("SKILL.toml").exists()
-        || installed_dir.join("manifest.toml").exists();
-    if !has_manifest {
-        std::fs::write(
-            installed_dir.join("SKILL.toml"),
-            format!(
-                "[skill]\nname = \"{}\"\ndescription = \"ClawHub installed skill\"\nversion = \"0.1.0\"\n",
-                skill_dir_name
-            ),
-        )?;
-    }
-
     match enforce_skill_security_audit(&installed_dir, allow_scripts) {
         Ok(report) => Ok((installed_dir, report.files_scanned)),
         Err(err) => {
@@ -2143,8 +2812,8 @@ pub fn parse_extra_registry_source(source: &str) -> Option<(String, String)> {
     Some((name.to_string(), skill.to_string()))
 }
 
-fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
-    if let Some(parent) = registry_dir.parent() {
+fn clone_skills_repository(target_dir: &Path, repo_url: &str) -> Result<()> {
+    if let Some(parent) = target_dir.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
             format!(
                 "failed to create registry parent: {}",
@@ -2155,7 +2824,7 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
 
     let output = Command::new("git")
         .args(["clone", "--depth", "1", repo_url])
-        .arg(registry_dir)
+        .arg(target_dir)
         .output()
         .context("failed to run git clone for skills registry")?;
 
@@ -2169,9 +2838,14 @@ fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
         &format!(
             "cloned skills registry to {}",
-            registry_dir.display().to_string()
+            target_dir.display().to_string()
         )
     );
+    Ok(())
+}
+
+fn clone_skills_registry(registry_dir: &Path, repo_url: &str) -> Result<()> {
+    clone_skills_repository(registry_dir, repo_url)?;
     mark_skills_registry_synced(registry_dir)?;
     Ok(())
 }
@@ -2260,18 +2934,135 @@ fn ensure_skills_registry(workspace_dir: &Path, registry_url: Option<&str>) -> R
     Ok(registry_dir)
 }
 
-fn list_registry_skill_names(registry_dir: &Path) -> Vec<String> {
-    let skills_parent = registry_dir.join("skills");
-    let Ok(entries) = std::fs::read_dir(&skills_parent) else {
+fn list_open_skill_names(skills_root: &Dir) -> Vec<String> {
+    let Ok(entries) = skills_root.entries() else {
         return vec![];
     };
     let mut names: Vec<String> = entries
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_dir())
-        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
     names.sort();
     names
+}
+
+fn open_registry_skills_root(registry_dir: &Path) -> Result<Dir> {
+    source_open_seam();
+    let registry = open_final_dir_nofollow(registry_dir).with_context(|| {
+        format!(
+            "failed to open registry without following symlinks: {}",
+            registry_dir.display()
+        )
+    })?;
+    registry.open_dir_nofollow("skills").with_context(|| {
+        format!(
+            "failed to open registry skills root without following symlinks: {}",
+            registry_dir.join("skills").display()
+        )
+    })
+}
+
+/// Install a single skill by name from a git catalog repository.
+///
+/// Clones `url` into a throwaway directory, resolves `skills/<skill_name>/`
+/// (the same `<repo>/skills/<name>/` layout as the default and extra
+/// registries), and installs it through the shared local-copy path (which
+/// runs the security audit). No archive handling — pure `git clone`.
+pub fn install_git_catalog_skill_source(
+    url: &str,
+    skill_name: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+    workspace_dir: &Path,
+) -> Result<(PathBuf, usize)> {
+    if !is_registry_source(skill_name) {
+        anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-install-invalid-skill-name",
+            &[("skill", skill_name)]
+        ));
+    }
+
+    std::fs::create_dir_all(workspace_dir).with_context(|| {
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-install-catalog-clone-failed",
+            &[("url", url)],
+        )
+    })?;
+    let clone_tempdir = tempfile::Builder::new()
+        .prefix(".skill-catalog-")
+        .tempdir_in(workspace_dir)
+        .with_context(|| {
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-clone-failed",
+                &[("url", url)],
+            )
+        })?;
+    let clone_dir = clone_tempdir.path();
+
+    // A transient catalog has no sync lifecycle, so clone it without writing
+    // the persistent registry marker into the untrusted checkout. Besides
+    // avoiding unnecessary state, this prevents a catalog-committed marker
+    // symlink from redirecting that write to an arbitrary host file.
+    clone_skills_repository(clone_dir, url).with_context(|| {
+        crate::i18n::get_required_cli_string_with_args(
+            "cli-skills-install-catalog-clone-failed",
+            &[("url", url)],
+        )
+    })?;
+
+    (|| {
+        source_open_seam();
+        let clone_root = open_final_dir_nofollow(clone_dir).with_context(|| {
+            format!(
+                "failed to open catalog clone without following symlinks: {}",
+                clone_dir.display()
+            )
+        })?;
+        let skills_root = clone_root.open_dir_nofollow("skills").with_context(|| {
+            crate::i18n::get_required_cli_string_with_args(
+                "cli-skills-install-catalog-root-symlink",
+                &[("url", url)],
+            )
+        })?;
+        let selected = match skills_root.open_dir_nofollow(skill_name) {
+            Ok(selected) => selected,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let available = list_open_skill_names(&skills_root);
+                if available.is_empty() {
+                    anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                        "cli-skills-install-skill-not-in-catalog-empty",
+                        &[("skill", skill_name), ("url", url)]
+                    ));
+                }
+                anyhow::bail!(crate::i18n::get_required_cli_string_with_args(
+                    "cli-skills-install-skill-not-in-catalog",
+                    &[
+                        ("skill", skill_name),
+                        ("url", url),
+                        ("available", &available.join(", ")),
+                    ]
+                ));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    crate::i18n::get_required_cli_string_with_args(
+                        "cli-skills-install-catalog-skill-symlink",
+                        &[("skill", skill_name), ("url", url)],
+                    )
+                });
+            }
+        };
+
+        selected_source_seam();
+        install_open_skill_source(
+            selected,
+            &clone_dir.join("skills").join(skill_name),
+            OsStr::new(skill_name),
+            skills_path,
+            allow_scripts,
+        )
+    })()
 }
 
 pub fn install_registry_skill_source(
@@ -2284,30 +3075,41 @@ pub fn install_registry_skill_source(
 ) -> Result<(PathBuf, usize)> {
     let registry_dir = ensure_skills_registry(workspace_dir, registry_url)?;
     let skill_dir = registry_dir.join("skills").join(source);
-
-    if !skill_dir.is_dir() {
-        let available = list_registry_skill_names(&registry_dir);
-        if available.is_empty() {
-            anyhow::bail!("skill '{source}' not found in the registry and no skills are available");
+    let skills_root = open_registry_skills_root(&registry_dir)?;
+    let selected = match skills_root.open_dir_nofollow(source) {
+        Ok(selected) => selected,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let available = list_open_skill_names(&skills_root);
+            if available.is_empty() {
+                anyhow::bail!(
+                    "skill '{source}' not found in the registry and no skills are available"
+                );
+            }
+            anyhow::bail!(
+                "skill '{source}' not found in the registry.\nAvailable skills: {}",
+                available.join(", ")
+            );
         }
-        anyhow::bail!(
-            "skill '{source}' not found in the registry.\nAvailable skills: {}",
-            available.join(", ")
-        );
-    }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to open registry skill without following symlinks: {}",
+                    skill_dir.display()
+                )
+            });
+        }
+    };
 
     if !suppress_tier_banner {
         let (tier, version) = lookup_registry_skill_tier(&registry_dir, source);
         print_install_tier_banner(source, version.as_deref(), tier);
     }
 
-    install_local_skill_source(
-        skill_dir.to_str().with_context(|| {
-            format!(
-                "registry path is not valid UTF-8: {}",
-                skill_dir.display().to_string()
-            )
-        })?,
+    selected_source_seam();
+    install_open_skill_source(
+        selected,
+        &skill_dir,
+        OsStr::new(source),
         skills_path,
         allow_scripts,
     )
@@ -2395,32 +3197,41 @@ pub fn install_extra_registry_skill_source(
 
     let registry_dir = ensure_extra_registry(workspace_dir, &registry_name, &registry.url)?;
     let skill_dir = registry_dir.join("skills").join(&skill_name);
-
-    if !skill_dir.is_dir() {
-        let available = list_registry_skill_names(&registry_dir);
-        if available.is_empty() {
+    let skills_root = open_registry_skills_root(&registry_dir)?;
+    let selected = match skills_root.open_dir_nofollow(&skill_name) {
+        Ok(selected) => selected,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let available = list_open_skill_names(&skills_root);
+            if available.is_empty() {
+                anyhow::bail!(
+                    "skill '{skill_name}' not found in registry '{registry_name}' and no skills are available"
+                );
+            }
             anyhow::bail!(
-                "skill '{skill_name}' not found in registry '{registry_name}' and no skills are available"
+                "skill '{skill_name}' not found in registry '{registry_name}'.\nAvailable skills: {}",
+                available.join(", ")
             );
         }
-        anyhow::bail!(
-            "skill '{skill_name}' not found in registry '{registry_name}'.\nAvailable skills: {}",
-            available.join(", ")
-        );
-    }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to open registry skill without following symlinks: {}",
+                    skill_dir.display()
+                )
+            });
+        }
+    };
 
     if !suppress_tier_banner {
         let (tier, version) = lookup_registry_skill_tier(&registry_dir, &skill_name);
         print_install_tier_banner(&skill_name, version.as_deref(), tier);
     }
 
-    install_local_skill_source(
-        skill_dir.to_str().with_context(|| {
-            format!(
-                "registry path is not valid UTF-8: {}",
-                skill_dir.display().to_string()
-            )
-        })?,
+    selected_source_seam();
+    install_open_skill_source(
+        selected,
+        &skill_dir,
+        OsStr::new(skill_name.as_str()),
         skills_path,
         allow_scripts,
     )
@@ -2428,21 +3239,27 @@ pub fn install_extra_registry_skill_source(
 
 // ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
 
-/// Load skills from skill-capable plugins discovered by the plugin host.
+/// Load the skills shipped by every skill-plugin instance the activation plan
+/// admitted.
 ///
-/// Each plugin's `skills/` directory is fed to the existing skill loader, and
-/// every loaded skill is renamed to `plugin:<plugin>/<skill>` to avoid
-/// collisions with user-authored skills and between bundles. The `plugin:<name>`
-/// tag is also added so prompts can distinguish plugin skills.
+/// The `plugins.max_active_instances` ceiling spans channels, tools, and
+/// skills, so this loader may not walk `skill_plugin_details()` directly: it
+/// derives the same admitted set from the current config and host snapshot
+/// that the channel and tool loaders derive, and skips any package whose skill
+/// binding the plan did not admit. The plan holds no counter, so loading
+/// skills repeatedly from one snapshot yields the same set instead of spending
+/// the same logical slot again.
 #[cfg(feature = "plugins-wasm")]
-pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) -> Vec<Skill> {
+pub fn load_plugin_skills_from_config(
+    config: &zeroclaw_config::schema::Config,
+) -> (Vec<Skill>, Vec<DroppedSkill>) {
     if !config.plugins.enabled {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     let plugins_dir = config.plugins.resolved_plugins_dir();
 
-    let signature_mode = zeroclaw_plugins::host::PluginHost::parse_signature_mode(
+    let signature_mode = zeroclaw_plugins::host::PluginHost::resolve_signature_mode(
         &config.plugins.security.signature_mode,
     );
     let trusted_keys = config.plugins.security.trusted_publisher_keys.clone();
@@ -2461,18 +3278,48 @@ pub fn load_plugin_skills_from_config(config: &zeroclaw_config::schema::Config) 
                     .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                 "failed to discover plugin skills"
             );
-            return Vec::new();
+            return (Vec::new(), Vec::new());
+        }
+    };
+
+    let plan = match crate::plugin_runtime::PluginActivationPlan::build(config, &host) {
+        Ok(plan) => plan,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "failed to admit logical plugin skill instances"
+            );
+            return (Vec::new(), Vec::new());
         }
     };
 
     let allow_scripts = config.skills.allow_scripts;
     let mut skills = Vec::new();
+    let mut dropped = Vec::new();
     for (manifest, skills_dir) in host.skill_plugin_details() {
-        for raw in load_skills_from_directory(&skills_dir, allow_scripts) {
+        // `for_package_binding` names the skill binding after the package, so
+        // the package name is both halves of this admission lookup.
+        if !plan.admits(
+            &manifest.name,
+            zeroclaw_plugins::PluginCapability::Skill,
+            &manifest.name,
+        ) {
+            continue;
+        }
+        let (raw_skills, raw_dropped) = load_skills_from_directory(&skills_dir, allow_scripts);
+        for raw in raw_skills {
             skills.push(namespace_plugin_skill(&manifest.name, raw));
         }
+        // Retag the workspace-loader's drops as plugin-origin.
+        dropped.extend(raw_dropped.into_iter().map(|mut d| {
+            d.origin_hint = "plugin".into();
+            d
+        }));
     }
-    skills
+    (skills, dropped)
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -2489,6 +3336,46 @@ fn namespace_plugin_skill(plugin_name: &str, mut skill: Skill) -> Skill {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    #[test]
+    fn slash_option_kinds_registry_is_walked_from_the_enum() {
+        // The published registry is exactly `SlashOptionKind::ALL` walked into
+        // descriptors, in order. No hand-authored rows: adding a variant to the
+        // enum extends this without touching the builder.
+        let registry = slash_option_kinds();
+        assert_eq!(registry.len(), SlashOptionKind::ALL.len());
+        for (descriptor, kind) in registry.iter().zip(SlashOptionKind::ALL) {
+            assert_eq!(descriptor.manifest_name, kind.manifest_name());
+            assert_eq!(descriptor.supports_choices, kind.supports_choices());
+            assert_eq!(
+                descriptor.supports_numeric_bounds,
+                kind.supports_numeric_bounds()
+            );
+            assert_eq!(
+                descriptor.supports_length_bounds,
+                kind.supports_length_bounds()
+            );
+        }
+    }
+
+    #[test]
+    fn only_scalar_kinds_carry_bounds_and_choices() {
+        // Capability invariants the surfaces depend on: numeric bounds imply a
+        // scalar with choices; length bounds are string-only.
+        for kind in SlashOptionKind::ALL {
+            if kind.supports_numeric_bounds() || kind.supports_length_bounds() {
+                assert!(
+                    kind.supports_choices(),
+                    "{:?} carries bounds but is not choiceable",
+                    kind.manifest_name()
+                );
+            }
+        }
+        assert!(SlashOptionKind::String.supports_length_bounds());
+        assert!(!SlashOptionKind::String.supports_numeric_bounds());
+        assert!(SlashOptionKind::Integer.supports_numeric_bounds());
+        assert!(!SlashOptionKind::Integer.supports_length_bounds());
+    }
 
     #[test]
     fn parse_simple_frontmatter_keeps_blank_line_in_block_scalar() {
@@ -2552,8 +3439,8 @@ mod registry_tests {
     }
 
     #[test]
-    fn test_is_registry_source_rejects_clawhub() {
-        assert!(!is_registry_source("clawhub:my-skill"));
+    fn test_is_registry_source_rejects_prefixed() {
+        assert!(!is_registry_source("external:my-skill"));
     }
 
     #[test]
@@ -2592,7 +3479,7 @@ mod registry_tests {
 
     #[test]
     fn test_is_extra_registry_source_rejects_competing_schemes() {
-        assert!(!is_extra_registry_source("clawhub:x"));
+        assert!(!is_extra_registry_source("external:x"));
         assert!(!is_extra_registry_source("https://github.com/o/r"));
         assert!(!is_extra_registry_source("git@github.com:o/r"));
         assert!(!is_extra_registry_source("./local"));
@@ -2607,70 +3494,6 @@ mod registry_tests {
         assert_eq!(parse_extra_registry_source("registry:onlyname"), None);
         assert_eq!(parse_extra_registry_source("registry:a/b/c"), None);
         assert_eq!(parse_extra_registry_source("auto-coder"), None);
-    }
-
-    #[test]
-    fn test_is_unsafe_zip_entry_name() {
-        assert!(is_unsafe_zip_entry_name(""));
-        assert!(is_unsafe_zip_entry_name("../evil.txt"));
-        assert!(is_unsafe_zip_entry_name("a/../b"));
-        assert!(is_unsafe_zip_entry_name("/abs/path"));
-        assert!(is_unsafe_zip_entry_name("dir\\file"));
-        assert!(is_unsafe_zip_entry_name("c:/win"));
-        assert!(!is_unsafe_zip_entry_name("SKILL.md"));
-        assert!(!is_unsafe_zip_entry_name("scripts/run.sh"));
-    }
-
-    #[test]
-    fn test_extract_zip_secure_happy_path() {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        {
-            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("SKILL.md", opts).unwrap();
-            w.write_all(b"# demo").unwrap();
-            w.start_file("scripts/run.txt", opts).unwrap();
-            w.write_all(b"echo hi").unwrap();
-            w.finish().unwrap();
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        extract_zip_secure(buf, &dest, MAX_CLAWHUB_ZIP_BYTES).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
-            "# demo"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dest.join("scripts/run.txt")).unwrap(),
-            "echo hi"
-        );
-    }
-
-    #[test]
-    fn test_extract_zip_secure_rejects_oversize() {
-        use std::io::Write;
-        let mut buf = Vec::new();
-        {
-            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
-            w.start_file("SKILL.md", opts).unwrap();
-            w.write_all(b"# demo").unwrap();
-            w.finish().unwrap();
-        }
-
-        let tmp = tempfile::tempdir().unwrap();
-        let dest = tmp.path().join("skill");
-        let err = extract_zip_secure(buf, &dest, 1).expect_err("oversize zip must be rejected");
-        assert!(err.to_string().contains("too large"), "got: {err}");
-        assert!(
-            !dest.exists(),
-            "dest must not be created when the zip is rejected for size"
-        );
     }
 
     #[test]
@@ -2691,6 +3514,650 @@ mod registry_tests {
         )
         .expect_err("unknown registry must error before any git work");
         assert!(err.to_string().contains("nope"), "got: {err}");
+    }
+
+    #[cfg(unix)]
+    fn write_clean_skill(path: &Path, name: &str, body: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(
+            path.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: test skill\n---\n\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    fn mark_test_registry_fresh(registry_dir: &Path) {
+        std::fs::write(registry_dir.join(SKILLS_REGISTRY_SYNC_MARKER), b"synced").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_no_install_staging(parent: &Path) {
+        let leftover = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-install-")
+            });
+        assert!(!leftover, "private install staging must be cleaned up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_registry_rejects_symlinked_skills_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let registry = workspace.join(SKILLS_REGISTRY_DIR_NAME);
+        let external_skills = tmp.path().join("external-skills");
+        let skills_path = tmp.path().join("installed-skills");
+        std::fs::create_dir_all(&registry).unwrap();
+        write_clean_skill(&external_skills.join("victim"), "victim", "external secret");
+        std::os::unix::fs::symlink(&external_skills, registry.join("skills")).unwrap();
+        mark_test_registry_fresh(&registry);
+
+        let err =
+            install_registry_skill_source("victim", &skills_path, false, &workspace, None, true)
+                .expect_err("a symlinked default-registry skills root must be rejected");
+
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert!(!skills_path.join("victim").exists());
+        assert_no_install_staging(tmp.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_registry_rejects_symlinked_selected_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let registry = workspace.join(SKILLS_REGISTRY_DIR_NAME);
+        let external = tmp.path().join("external-victim");
+        let skills_path = tmp.path().join("installed-skills");
+        std::fs::create_dir_all(registry.join("skills")).unwrap();
+        write_clean_skill(&external, "victim", "external secret");
+        std::os::unix::fs::symlink(&external, registry.join("skills/victim")).unwrap();
+        mark_test_registry_fresh(&registry);
+
+        let err =
+            install_registry_skill_source("victim", &skills_path, false, &workspace, None, true)
+                .expect_err("a symlinked default-registry skill must be rejected");
+
+        assert!(err.to_string().contains("symlink"), "got: {err}");
+        assert!(!skills_path.join("victim").exists());
+        assert_no_install_staging(tmp.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extra_registry_rejects_symlinked_root_and_selected_skill() {
+        for symlink_root in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let workspace = tmp.path().join("workspace");
+            let registry = workspace.join(format!("{EXTRA_REGISTRY_DIR_PREFIX}custom"));
+            let external_skills = tmp.path().join("external-skills");
+            let skills_path = tmp.path().join("installed-skills");
+            std::fs::create_dir_all(&registry).unwrap();
+            write_clean_skill(&external_skills.join("victim"), "victim", "external secret");
+            if symlink_root {
+                std::os::unix::fs::symlink(&external_skills, registry.join("skills")).unwrap();
+            } else {
+                std::fs::create_dir(registry.join("skills")).unwrap();
+                std::os::unix::fs::symlink(
+                    external_skills.join("victim"),
+                    registry.join("skills/victim"),
+                )
+                .unwrap();
+            }
+            mark_test_registry_fresh(&registry);
+            let configured = [zeroclaw_config::schema::ExternalRegistry {
+                name: "custom".to_string(),
+                url: "unused".to_string(),
+                kind: zeroclaw_config::schema::ExternalRegistryKind::Git,
+                enabled: true,
+            }];
+
+            let err = install_extra_registry_skill_source(
+                "registry:custom/victim",
+                &skills_path,
+                false,
+                &workspace,
+                &configured,
+                true,
+            )
+            .expect_err("extra registries must reject symlinked roots and selected skills");
+
+            assert!(err.to_string().contains("symlink"), "got: {err}");
+            assert!(!skills_path.join("victim").exists());
+            assert_no_install_staging(tmp.path());
+        }
+    }
+
+    #[test]
+    fn test_install_git_catalog_rejects_non_bare_skill_name() {
+        // The bare-name guard must reject anything with a path separator before
+        // any network/git work happens (hermetic — no clone is attempted).
+        assert!(!is_registry_source("a/b"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            "https://github.com/example/skills",
+            "a/b",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a slashed --skill name must be rejected before any git work");
+        assert!(err.to_string().contains("bare skill name"), "got: {err}");
+    }
+
+    /// Build a local git repository that acts as a skill catalog: a real commit
+    /// containing `skills/<name>/SKILL.md` for each requested skill. Returns the
+    /// repo path, which doubles as the clone URL for
+    /// `install_git_catalog_skill_source` (git clones local paths directly, so
+    /// the test stays hermetic — no network).
+    fn init_git_skill_catalog(root: &Path, skills: &[&str]) -> std::path::PathBuf {
+        let repo = root.join("catalog");
+        for name in skills {
+            let skill_dir = repo.join("skills").join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\ndescription: hermetic git-catalog fixture\n---\n\n# {name}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("git must be available to build the catalog fixture");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["add", "-A"]);
+        // Pass identity/signing inline so the commit does not depend on the
+        // runner's global git config.
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "init",
+        ]);
+        repo
+    }
+
+    #[test]
+    fn install_git_catalog_skill_source_installs_selected_skill_through_audit() {
+        // Happy path for the `--skill` replacement: clone a local git catalog,
+        // resolve `skills/<name>/`, and install it through the shared
+        // clone → local-copy → security-audit path. Skipped if git is absent.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = init_git_skill_catalog(tmp.path(), &["demo-skill", "other-skill"]);
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let (dest, files_scanned) = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "demo-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect("happy-path git-catalog install should succeed");
+
+        // Installed at the expected destination, with the catalog's SKILL.md.
+        assert_eq!(dest, skills_path.join("demo-skill"));
+        assert!(
+            dest.join("SKILL.md").is_file(),
+            "the selected skill's SKILL.md must be installed"
+        );
+        // A non-zero scan count proves the security-audit path was entered.
+        assert!(
+            files_scanned >= 1,
+            "install must run through the audit path; files_scanned = {files_scanned}"
+        );
+        // Only the requested skill is installed, not its sibling.
+        assert!(!skills_path.join("other-skill").exists());
+        // The transient clone scratch dir is cleaned up afterwards.
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(!leftover, "clone scratch dir must be removed after install");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_catalog_ordinary_ancestor_swap_cannot_redirect_selected_handle() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = init_git_skill_catalog(tmp.path(), &["demo-skill"]);
+        let skills_path = tmp.path().join("installed-skills");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let workspace_for_swap = workspace.clone();
+        let _swap = super::copy_tests::SelectedSourceGuard::install(move || {
+            let clone_dir = std::fs::read_dir(&workspace_for_swap)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with(".skill-catalog-"))
+                })
+                .expect("catalog clone must exist at the selected-source seam");
+            std::fs::rename(clone_dir.join("skills"), clone_dir.join("skills-original")).unwrap();
+            write_clean_skill(
+                &clone_dir.join("skills/demo-skill"),
+                "demo-skill",
+                "replacement external secret",
+            );
+        });
+
+        let (dest, _) = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "demo-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect("the retained selected handle must survive an ancestor path swap");
+
+        let installed = std::fs::read_to_string(dest.join("SKILL.md")).unwrap();
+        assert!(installed.contains("hermetic git-catalog fixture"));
+        assert!(!installed.contains("external secret"));
+        assert_no_install_staging(tmp.path());
+    }
+
+    #[test]
+    fn install_git_catalog_skill_source_reports_missing_skill_after_clone() {
+        // The main post-clone failure mode: the requested skill is not in the
+        // catalog. The error must name it and list what *is* available, and must
+        // not install anything.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = init_git_skill_catalog(tmp.path(), &["present-skill"]);
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "absent-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a skill missing from the catalog must error after clone");
+        let msg = err.to_string();
+        assert!(msg.contains("not found"), "got: {msg}");
+        assert!(
+            msg.contains("present-skill"),
+            "error should list the available skills; got: {msg}"
+        );
+        // Nothing installed, and the clone scratch dir is cleaned up.
+        assert!(!skills_path.join("absent-skill").exists());
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(!leftover, "clone scratch dir must be removed after failure");
+    }
+
+    /// Commit whatever is currently in `repo`'s worktree with a hermetic
+    /// identity, so tests can add symlink entries the fixture builder can't.
+    #[cfg(unix)]
+    fn git_commit_all(repo: &Path, message: &str) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git must be available");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["add", "-A"]);
+        run(&[
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            message,
+        ]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_does_not_follow_registry_sync_marker_symlink() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let external_marker = tmp.path().join("external-marker");
+        std::fs::write(&external_marker, "must remain unchanged").unwrap();
+
+        let catalog = init_git_skill_catalog(tmp.path(), &["demo-skill"]);
+        std::os::unix::fs::symlink(&external_marker, catalog.join(SKILLS_REGISTRY_SYNC_MARKER))
+            .unwrap();
+        git_commit_all(&catalog, "add hostile registry sync marker symlink");
+
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let (dest, _) = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "demo-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect("a catalog marker must not participate in transient clone state");
+
+        assert!(dest.join("SKILL.md").is_file());
+        assert_eq!(
+            std::fs::read_to_string(&external_marker).unwrap(),
+            "must remain unchanged",
+            "a catalog-controlled marker symlink must not redirect a host write"
+        );
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(!leftover, "clone scratch dir must be removed after install");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_skill_source_rejects_symlinked_selected_skill() {
+        // A catalog that commits `skills/<name>` as a symlink pointing outside
+        // the repo must be refused: `is_dir()` follows the link and
+        // `install_local_skill_source` would canonicalize it to the external
+        // target and audit/copy it. The out-of-clone directory here is itself a
+        // *clean* skill, proving the audit passing does not rescue containment.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A valid skill living outside the catalog — the escape target.
+        let outside = tmp.path().join("outside").join("secret-skill");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(
+            outside.join("SKILL.md"),
+            "---\nname: secret-skill\ndescription: outside the catalog\n---\n\n# secret\n",
+        )
+        .unwrap();
+
+        let catalog = init_git_skill_catalog(tmp.path(), &["present-skill"]);
+        // Commit an absolute symlink `skills/evil` -> the external skill dir.
+        std::os::unix::fs::symlink(&outside, catalog.join("skills").join("evil")).unwrap();
+        git_commit_all(&catalog, "add escaping symlink");
+
+        let skills_path = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "evil",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a symlinked catalog entry must be rejected");
+        assert!(
+            err.to_string().contains("symlink"),
+            "error should name the symlink; got: {err}"
+        );
+        // Nothing installed — neither the symlink name nor the escape target.
+        assert!(!skills_path.join("evil").exists());
+        assert!(!skills_path.join("secret-skill").exists());
+        // The escape target on disk is untouched.
+        assert!(outside.join("SKILL.md").is_file());
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(
+            !leftover,
+            "clone scratch dir must be removed after rejection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_skill_source_rejects_selection_escaping_via_symlinked_skills_dir() {
+        // Backstop for the case the symlink_metadata check alone misses: the
+        // selected `skills/<name>` is a real directory, but its parent `skills`
+        // is a symlink out of the clone. The final component is not a link, so
+        // only the canonicalize-and-contain check catches the escape.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        // External directory that `skills` will point at, holding a clean skill.
+        let external = tmp.path().join("external-skills");
+        let victim = external.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(
+            victim.join("SKILL.md"),
+            "---\nname: victim\ndescription: outside the catalog\n---\n\n# victim\n",
+        )
+        .unwrap();
+
+        // A repo whose entire `skills/` tree is a symlink to `external`.
+        let catalog = tmp.path().join("catalog");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::os::unix::fs::symlink(&external, catalog.join("skills")).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&catalog)
+            .output()
+            .expect("git init");
+        git_commit_all(&catalog, "symlink skills dir out of the repo");
+
+        let skills_path = tmp.path().join("dest-skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "victim",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a selection resolving outside the clone must be rejected");
+        assert!(
+            err.to_string().contains("outside") || err.to_string().contains("symlink"),
+            "error should describe the containment/symlink failure; got: {err}"
+        );
+        assert!(!skills_path.join("victim").exists());
+        assert!(victim.join("SKILL.md").is_file());
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(
+            !leftover,
+            "clone scratch dir must be removed after rejection"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_git_catalog_missing_skill_rejects_symlinked_skills_root_before_enumeration() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: git not available");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let external = tmp.path().join("external-skills");
+        let external_entry = external.join("external-private-name");
+        std::fs::create_dir_all(&external_entry).unwrap();
+        let external_manifest = external_entry.join("SKILL.md");
+        let external_contents =
+            "---\nname: external-private-name\ndescription: outside the catalog\n---\n";
+        std::fs::write(&external_manifest, external_contents).unwrap();
+
+        let catalog = tmp.path().join("catalog");
+        std::fs::create_dir_all(&catalog).unwrap();
+        std::os::unix::fs::symlink(&external, catalog.join("skills")).unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&catalog)
+            .output()
+            .expect("git init");
+        git_commit_all(&catalog, "symlink skills root out of the repo");
+
+        let skills_path = tmp.path().join("dest-skills");
+        std::fs::create_dir_all(&skills_path).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let err = install_git_catalog_skill_source(
+            catalog.to_str().unwrap(),
+            "missing-skill",
+            &skills_path,
+            false,
+            &workspace,
+        )
+        .expect_err("a symlinked catalog skills root must be rejected before enumeration");
+        let message = err.to_string();
+        assert!(message.contains("symlink"), "got: {message}");
+        assert!(
+            !message.contains("external-private-name"),
+            "external entry names must not be enumerated; got: {message}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&skills_path).unwrap().count(),
+            0,
+            "nothing may be installed after rejecting the catalog root"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&external_manifest).unwrap(),
+            external_contents,
+            "the external target must remain untouched"
+        );
+        let leftover = std::fs::read_dir(&workspace)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".skill-catalog-")
+            });
+        assert!(
+            !leftover,
+            "clone scratch dir must be removed after rejection"
+        );
     }
 
     #[test]
@@ -2965,6 +4432,26 @@ version = "0.1.0"
     }
 
     #[test]
+    fn load_skill_toml_parses_always_true() {
+        let tmp = TempDir::new().unwrap();
+        let path = write_manifest(
+            tmp.path(),
+            r#"
+[skill]
+name = "probe"
+description = "test"
+version = "0.1.0"
+always = true
+"#,
+        );
+        let skill = load_skill_toml(&path).unwrap();
+        assert!(
+            skill.always,
+            "always = true in SKILL.toml must set Skill.always"
+        );
+    }
+
+    #[test]
     fn load_skill_md_parses_slash_options_from_frontmatter() {
         let tmp = TempDir::new().unwrap();
         let md = r#"---
@@ -3013,6 +4500,34 @@ Write it.
         std::fs::write(&path, "---\nname: plain\ndescription: d\n---\n# Plain\n").unwrap();
         let skill = load_skill_md(&path, tmp.path()).unwrap();
         assert!(skill.slash_options.is_empty());
+    }
+
+    #[test]
+    fn load_skill_md_parses_always_true_from_frontmatter() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: policy\ndescription: Critical policy skill.\nalways: true\n---\n# Policy\n",
+        )
+        .unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+        assert!(
+            skill.always,
+            "always: true in frontmatter must set Skill.always"
+        );
+    }
+
+    #[test]
+    fn load_skill_md_defaults_always_to_false_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("SKILL.md");
+        std::fs::write(&path, "---\nname: plain\ndescription: d\n---\n# Plain\n").unwrap();
+        let skill = load_skill_md(&path, tmp.path()).unwrap();
+        assert!(
+            !skill.always,
+            "always must default to false when the key is absent"
+        );
     }
 
     #[test]
@@ -3096,10 +4611,6 @@ descriptin = "oops"
         );
     }
 
-    /// Positive control covering the new field × strictness intersection:
-    /// after the rebase onto master (which added `prompts: Vec<String>`
-    /// to `SkillMeta` per #5972), the field must continue to parse cleanly
-    /// under `#[serde(deny_unknown_fields)]`.
     #[test]
     fn accepts_prompts_in_skill_block_with_strictness() {
         let toml_str = r#"
@@ -3116,8 +4627,6 @@ prompts = ["one", "two"]
         );
     }
 
-    /// Hand-authored skills that don't carry SkillForge provenance must parse
-    /// without error — `forge` is `Option<ForgeMetadata>` with `default`.
     #[test]
     fn parses_skill_without_forge_block() {
         let toml_str = r#"
@@ -3134,9 +4643,6 @@ description = "no forge block"
         assert_eq!(manifest.skill.name, "hand-authored");
     }
 
-    /// Happy path: a SkillForge-emitted manifest with a fully populated
-    /// `[forge]` table, including the nested `[forge.requirements]` and
-    /// `[forge.metadata]` sub-tables.
     #[test]
     fn parses_skill_with_forge_block() {
         let toml_str = r#"
@@ -3186,9 +4692,6 @@ forge_timestamp = "2026-04-30T12:00:00Z"
         );
     }
 
-    /// `ForgeMetadata` carries `#[serde(deny_unknown_fields)]` — a typo at
-    /// the `[forge]` level (e.g. `licence` next to `license`) must surface
-    /// loudly the same way a typo in `[skill]` does.
     #[test]
     fn rejects_unknown_field_in_forge_block() {
         let toml_str = r#"
@@ -3209,72 +4712,6 @@ licence = true
         );
     }
 
-    /// Round-trip guard: the SkillForge integrator must emit `[forge]` keys
-    /// at the top level (sibling to `[skill]`), not inside `[skill]`. If a
-    /// future refactor moves these back, this test fails because the parsed
-    /// manifest's `forge` field would be `None` (and `SkillMeta` would
-    /// reject the unknown keys via `deny_unknown_fields`).
-    #[test]
-    fn integrate_round_trip_emits_top_level_forge() {
-        use crate::skillforge::scout::{ScoutResult, ScoutSource};
-        use chrono::Utc;
-        let candidate = ScoutResult {
-            name: "round-trip".into(),
-            url: "https://github.com/user/round-trip".into(),
-            description: "round-trip test".into(),
-            stars: 7,
-            language: Some("Rust".into()),
-            updated_at: Some(Utc::now()),
-            source: ScoutSource::GitHub,
-            owner: "user".into(),
-            has_license: true,
-        };
-
-        // Generate the TOML the integrator would write and parse it back.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let integrator = crate::skillforge::integrate::Integrator::new(
-            tmp.path().to_string_lossy().into_owned(),
-        );
-        let skill_dir = integrator.integrate(&candidate).unwrap();
-        let toml_str = std::fs::read_to_string(skill_dir.join("SKILL.toml")).unwrap();
-
-        let manifest: SkillManifest = toml::from_str(&toml_str).unwrap_or_else(|e| {
-            panic!(
-                "integrator output must parse against SkillManifest with strict SkillMeta + ForgeMetadata; \
-                 got error: {e}\n--- toml ---\n{toml_str}"
-            )
-        });
-        let forge = manifest
-            .forge
-            .expect("integrator must emit a [forge] table");
-        assert_eq!(forge.owner.as_deref(), Some("user"));
-        assert_eq!(forge.stars, Some(7));
-        assert_eq!(forge.license, Some(true));
-        assert!(
-            forge
-                .source
-                .as_deref()
-                .is_some_and(|s| s.contains("round-trip")),
-            "forge.source should carry the upstream URL"
-        );
-        // Crucial guard: none of the provenance keys leaked into [skill].
-        // A failure here means generate_toml regressed and is putting forge
-        // keys back inside `[skill]` — `deny_unknown_fields` on `SkillMeta`
-        // would have caught that already as a parse error, but assert
-        // explicitly so the failure is unambiguous in CI output.
-        assert_eq!(manifest.skill.name, "round-trip");
-        assert_eq!(manifest.skill.description, "round-trip test");
-    }
-
-    /// Behavioral assertion for the swallow-site fix: a SKILL.toml whose
-    /// `[skill]` block has a typo causes `load_skill_toml` to return `Err`,
-    /// and `load_skills_from_directory` skips it without panicking and
-    /// without including it in the loaded set. The accompanying
-    /// `tracing::warn!` call (with structured `path` and `err` fields) is
-    /// verified by source inspection — the codebase does not currently
-    /// pull in a `tracing-subscriber` test harness, and adding one purely
-    /// for this assertion would violate the AGENTS.md anti-pattern of
-    /// adding dependencies for minor convenience.
     #[test]
     fn workspace_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
@@ -3309,7 +4746,7 @@ description = "fine"
         )
         .unwrap();
 
-        let skills = load_skills_from_directory(&skills_dir, false);
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, false);
         // The bad skill is skipped (not panicked-on). The good skill loads.
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
         assert!(
@@ -3320,10 +4757,67 @@ description = "fine"
             !names.contains(&"bad"),
             "bad skill must be skipped, not silently accepted; got: {names:?}"
         );
+        // the skipped skill is surfaced as an audit drop, not silently lost.
+        assert_eq!(dropped.len(), 1, "the bad TOML skill must be reported");
+        assert_eq!(dropped[0].origin_hint, "workspace");
+        assert!(matches!(
+            dropped[0].reason,
+            SkillDropReason::ManifestParseError(_)
+        ));
     }
 
-    /// Behavioral assertion for the open-skills swallow-site fix.
-    /// Same shape as the workspace test above; covers `load_open_skills_from_directory`.
+    #[test]
+    fn workspace_script_bundling_skill_reported_as_scripts_blocked_drop() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        let script_dir = skills_dir.join("script-skill");
+        std::fs::create_dir_all(&script_dir).unwrap();
+        std::fs::write(
+            script_dir.join("SKILL.md"),
+            "---\nname: script-skill\ndescription: bundles a shell helper\n---\n# Script Skill\n",
+        )
+        .unwrap();
+        std::fs::write(script_dir.join("helper.sh"), "echo hi\n").unwrap();
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, false);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            !names.contains(&"script-skill"),
+            "script-bundling skill must be dropped at the secure default; got: {names:?}"
+        );
+        assert_eq!(dropped.len(), 1, "the script skill must be reported");
+        assert_eq!(dropped[0].origin_hint, "workspace");
+        match &dropped[0].reason {
+            SkillDropReason::AuditFindings {
+                summary,
+                scripts_blocked,
+            } => {
+                assert!(
+                    *scripts_blocked,
+                    "reason must flag scripts as the blocker; got: {summary}"
+                );
+                assert!(
+                    summary.contains("script-like files are blocked"),
+                    "summary must describe the script block; got: {summary}"
+                );
+            }
+            other => panic!("expected AuditFindings, got: {other:?}"),
+        }
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, true);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"script-skill"),
+            "script-bundling skill must load once allow_scripts=true; got: {names:?}"
+        );
+        assert!(
+            dropped.is_empty(),
+            "no drops expected with allow_scripts=true; got: {dropped:?}"
+        );
+    }
     #[test]
     fn open_skills_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
@@ -3356,8 +4850,10 @@ description = "fine"
         )
         .unwrap();
 
-        let skills = load_open_skills_from_directory(&skills_dir, false);
+        let (skills, dropped) = load_open_skills_from_directory(&skills_dir, false);
         let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(dropped.len(), 1, "the bad open-skill TOML must be reported");
+        assert_eq!(dropped[0].origin_hint, "open-skills");
         assert!(
             names.contains(&"good-open"),
             "good open-skill must load; got: {names:?}"
@@ -3387,10 +4883,6 @@ mod prompt_callable_name_tests {
         }
     }
 
-    /// The skills prompt must advertise the exact same callable name the tool
-    /// spec registers (both via `composed_tool_name`). A plugin-namespaced skill
-    /// with a dotted tool name would otherwise render a raw `skill__tool` the
-    /// model cannot invoke, which is the prompt half of #6678.
     #[test]
     fn prompt_callable_name_matches_registered_tool_name() {
         let skill = Skill {
@@ -3403,6 +4895,7 @@ mod prompt_callable_name_tests {
             tools: vec![tool("run.lint", "shell")],
             prompts: Vec::new(),
             slash_options: Vec::new(),
+            always: false,
             location: None,
         };
 
@@ -3422,6 +4915,173 @@ mod prompt_callable_name_tests {
         assert!(
             !prompt.contains("pr-review-toolkit:code-reviewer__run.lint"),
             "prompt advertised the raw, unsanitized composed name:\n{prompt}",
+        );
+    }
+
+    fn tool_with_target(name: &str, kind: &str, target: &str) -> SkillTool {
+        SkillTool {
+            target: Some(target.to_string()),
+            ..tool(name, kind)
+        }
+    }
+
+    #[test]
+    fn prompt_callable_predicate_matches_registration_preconditions() {
+        // shell/script/http always register -> always prompt-callable.
+        assert!(skill_tool_is_prompt_callable(&tool("run", "shell")));
+        assert!(skill_tool_is_prompt_callable(&tool("run", "script")));
+        assert!(skill_tool_is_prompt_callable(&tool("fetch", "http")));
+        // builtin/mcp are elevation wrappers: callable only WITH a target.
+        assert!(skill_tool_is_prompt_callable(&tool_with_target(
+            "gen",
+            "mcp",
+            "images__generate"
+        )));
+        assert!(skill_tool_is_prompt_callable(&tool_with_target(
+            "sh", "builtin", "shell"
+        )));
+        // ... and NOT callable without one (the converter's resolve_elevated_tool
+        // would return None, so advertising them callable lies to the model).
+        assert!(!skill_tool_is_prompt_callable(&tool("gen", "mcp")));
+        assert!(!skill_tool_is_prompt_callable(&tool("sh", "builtin")));
+        // A whitespace-only target is as good as absent.
+        assert!(!skill_tool_is_prompt_callable(&tool_with_target(
+            "gen", "mcp", "   "
+        )));
+        // unknown kinds are never callable.
+        assert!(!skill_tool_is_prompt_callable(&tool("x", "weird")));
+    }
+
+    #[test]
+    fn converter_skips_targetless_elevation_matching_the_prompt_predicate() {
+        // The end-to-end invariant the renderer relies on: the registry converter
+        // registers exactly the tools `skill_tool_is_prompt_callable` marks callable
+        // (for what is statically decidable). A target-less builtin/mcp elevation
+        // tool is skipped by the converter, so it must not be advertised callable.
+        let security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                tool("run", "shell"),  // always registers
+                tool("orphan", "mcp"), // no target -> skipped
+                tool("sh", "builtin"), // no target -> skipped
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+
+        let registered: Vec<String> =
+            crate::skills::skills_to_tools(std::slice::from_ref(&skill), security, &[])
+                .iter()
+                .map(|t| t.name().to_string())
+                .collect();
+
+        // shell registers; the target-less elevation tools do not - matching the
+        // prompt predicate for each.
+        for t in &skill.tools {
+            let composed = crate::tools::skill_tool::composed_tool_name(&skill.name, &t.name);
+            let in_registry = registered.iter().any(|n| n == &composed);
+            assert_eq!(
+                in_registry,
+                skill_tool_is_prompt_callable(t),
+                "prompt-callable and registry-registered must agree for {} ({}): registry={in_registry}",
+                t.name,
+                t.kind,
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_nat64_optional_seam_omits_http_but_keeps_shell() {
+        let skill = Skill {
+            name: "ops".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![tool("run", "shell"), tool("fetch", "http")],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+        let security = std::sync::Arc::new(crate::security::SecurityPolicy::default());
+        let registered = skills_to_tools_with_context_and_runtime_optional_nat64(
+            std::slice::from_ref(&skill),
+            security,
+            &[],
+            std::sync::Arc::new(crate::platform::NativeRuntime::new()),
+            None,
+        );
+        let names: Vec<&str> = registered.iter().map(|tool| tool.name()).collect();
+        assert!(names.contains(&"ops__run"));
+        assert!(!names.contains(&"ops__fetch"));
+    }
+
+    #[test]
+    fn prompt_lists_mcp_with_target_as_callable_and_targetless_as_not() {
+        let skill = Skill {
+            name: "imagegen".to_string(),
+            description: "d".to_string(),
+            description_localizations: Default::default(),
+            version: "1.0.0".to_string(),
+            author: None,
+            tags: Vec::new(),
+            tools: vec![
+                tool_with_target("generate", "mcp", "images__generate"),
+                tool("orphan", "mcp"), // no target -> not registered
+            ],
+            prompts: Vec::new(),
+            slash_options: Vec::new(),
+            always: false,
+            location: None,
+        };
+
+        let prompt = skills_to_prompt_with_mode(
+            std::slice::from_ref(&skill),
+            Path::new("/tmp"),
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+        );
+
+        // The callable block comes first, the unregistered <tools> block after.
+        let callable_idx = prompt
+            .find("<callable_tools")
+            .expect("callable_tools block");
+        let tools_at = prompt
+            .find("<tools>")
+            .expect("unregistered <tools> block present for the target-less mcp tool");
+        assert!(
+            callable_idx < tools_at,
+            "callable block precedes unregistered block"
+        );
+
+        // The targeted mcp tool is advertised as callable (composed name, under
+        // <callable_tools>, before the unregistered block).
+        let callable = crate::tools::skill_tool::composed_tool_name(&skill.name, "generate");
+        let callable_at = prompt
+            .find(&format!("<name>{callable}</name>"))
+            .expect("targeted mcp skill tool must be present as a callable name");
+        assert!(
+            callable_at > callable_idx && callable_at < tools_at,
+            "targeted mcp skill tool must render under <callable_tools>:\n{prompt}"
+        );
+
+        // The target-less mcp tool renders under the unregistered <tools> block
+        // (raw name, after the callable block) - the converter would skip it.
+        let orphan_at = prompt
+            .find("<name>orphan</name>")
+            .expect("target-less mcp skill tool must be present under <tools>");
+        assert!(
+            orphan_at > tools_at,
+            "target-less mcp skill tool must render as unregistered, not callable:\n{prompt}"
         );
     }
 }
@@ -3471,21 +5131,44 @@ version = "0.1.0"
         .unwrap();
     }
 
-    /// Regression test for #7236: `load_skills_for_agent_from_config` must
-    /// load skills from the per-agent workspace directory, not from `data_dir`.
-    ///
-    /// The bug: three call sites passed `&config.data_dir` instead of
-    /// `&config.agent_workspace_dir(agent_alias)`, causing skills placed in
-    /// `<install>/agents/<alias>/workspace/skills/` to be silently ignored.
-    ///
-    /// This test constructs a config where `data_dir` and
-    /// `agent_workspace_dir(agent_alias)` are distinct paths, places a skill
-    /// only in the agent workspace, and verifies:
-    /// 1. `load_skills_for_agent_from_config` finds the skill (correct behavior)
-    /// 2. Calling `load_skills_for_agent` with `data_dir` does NOT find the skill (the bug)
-    ///
-    /// The test would fail if `load_skills_for_agent_from_config` reverted to
-    /// using `config.data_dir` instead of `config.agent_workspace_dir(agent_alias)`.
+    #[test]
+    fn load_skills_for_agent_from_config_audited_returns_dropped() {
+        let install_root = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+        let agent_alias = "audit-agent";
+
+        write_test_skill(agent_workspace.path(), "clean-skill");
+        // A broken-manifest skill in the same workspace.
+        let broken = agent_workspace.path().join("skills").join("broken-skill");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(
+            broken.join("SKILL.toml"),
+            "[skill]\nname = \"broken-skill\"\ndescription = \"d\"\nbogus = true\n",
+        )
+        .unwrap();
+
+        let config = make_config_with_agent_workspace(
+            install_root.path(),
+            data_dir.path(),
+            agent_alias,
+            agent_workspace.path().to_path_buf(),
+        );
+
+        cache::invalidate();
+        let (skills, dropped, _shadows) =
+            load_skills_for_agent_from_config_audited(&config, agent_alias);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"clean-skill"), "got: {names:?}");
+        assert!(!names.contains(&"broken-skill"), "got: {names:?}");
+        assert_eq!(dropped.len(), 1, "the broken skill must be reported");
+        assert_eq!(dropped[0].origin_hint, "workspace");
+        assert!(matches!(
+            dropped[0].reason,
+            SkillDropReason::ManifestParseError(_)
+        ));
+    }
+
     #[test]
     fn load_skills_for_agent_from_config_uses_workspace_dir_not_data_dir() {
         let install_root = TempDir::new().unwrap();
@@ -3536,10 +5219,6 @@ version = "0.1.0"
         );
     }
 
-    /// Verifies that `load_skills_for_agent_from_config` with an empty
-    /// `skill_bundles` list falls back to the install-wide skill set from
-    /// the workspace dir. This pins the contract that the helper resolves
-    /// the correct workspace directory regardless of bundle configuration.
     #[test]
     fn load_skills_for_agent_from_config_empty_bundles_uses_workspace_dir() {
         let install_root = TempDir::new().unwrap();

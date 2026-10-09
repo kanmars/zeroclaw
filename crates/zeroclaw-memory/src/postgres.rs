@@ -1,13 +1,4 @@
 //! PostgreSQL-backed memory implementation.
-//!
-//! Compiled in only when the crate is built with `--features memory-postgres`.
-//! Selected at runtime by setting `[memory].backend = "postgres"` and
-//! supplying `db_url` under `[storage.model_provider.config]`. Optional pgvector
-//! support is enabled via `[memory.postgres].vector_enabled`.
-//!
-//! Designed for multi-instance deployments where several agents need to share
-//! a single durable memory store with concurrent writes — the SQLite backend
-//! cannot serve that use case.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry, normalize_recent_recall_query};
 use anyhow::{Context, Result};
@@ -24,12 +15,6 @@ use zeroclaw_api::session_keys::sanitize_session_key;
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
-/// Drops its inner value on a background OS thread.
-///
-/// `postgres::Client::drop` calls `Runtime::block_on` internally to send a
-/// clean-shutdown message. That panics if called from inside an existing Tokio
-/// runtime. Wrapping the `Arc<Mutex<Client>>` in this type ensures the final
-/// drop always happens on a plain OS thread.
 struct DropOnThread<T: Send + 'static>(Option<T>);
 
 impl<T: Send + 'static> DropOnThread<T> {
@@ -67,12 +52,6 @@ impl<T: Send + 'static> Drop for DropOnThread<T> {
     }
 }
 
-/// PostgreSQL-backed persistent memory.
-///
-/// Reliable CRUD and keyword recall via SQL. Hybrid keyword + vector recall
-/// is available when pgvector is installed and `vector_enabled = true`;
-/// otherwise the backend falls back to keyword-only recall and logs a
-/// warning at construction.
 pub struct PostgresMemory {
     alias: String,
     client: DropOnThread<Arc<Mutex<Client>>>,
@@ -98,44 +77,35 @@ impl PostgresMemory {
         let qualified_table = format!("{schema_ident}.{table_ident}");
         let qualified_agents = format!("{schema_ident}.agents");
 
-        let client = Self::initialize_client(
+        let pgvector = if pgvector_enabled.unwrap_or(false) {
+            Some(pgvector_dimensions.unwrap_or(1536))
+        } else {
+            None
+        };
+
+        let (client, pgvector_ok) = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
             schema_ident.clone(),
             qualified_table.clone(),
+            pgvector,
         )?;
 
-        let pgvector_enabled = pgvector_enabled.unwrap_or(false);
-        let pgvector_dimensions = pgvector_dimensions.unwrap_or(1536);
-
-        if pgvector_enabled {
-            let client_ref = Arc::new(Mutex::new(client));
-            let ext_ok = {
-                let mut c = client_ref.lock();
-                Self::try_enable_pgvector(&mut c, &qualified_table, pgvector_dimensions).is_ok()
-            };
-            if !ext_ok {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    "pgvector extension not available; falling back to keyword-only recall"
-                );
-            }
-            Ok(Self {
-                alias: alias.to_string(),
-                client: DropOnThread::new(client_ref),
-                qualified_table,
-                qualified_agents,
-            })
-        } else {
-            Ok(Self {
-                alias: alias.to_string(),
-                client: DropOnThread::new(Arc::new(Mutex::new(client))),
-                qualified_table,
-                qualified_agents,
-            })
+        if !pgvector_ok {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "pgvector extension not available; falling back to keyword-only recall"
+            );
         }
+
+        Ok(Self {
+            alias: alias.to_string(),
+            client: DropOnThread::new(Arc::new(Mutex::new(client))),
+            qualified_table,
+            qualified_agents,
+        })
     }
 
     fn initialize_client(
@@ -143,10 +113,11 @@ impl PostgresMemory {
         connect_timeout_secs: Option<u64>,
         schema_ident: String,
         qualified_table: String,
-    ) -> Result<Client> {
+        pgvector: Option<usize>,
+    ) -> Result<(Client, bool)> {
         let init_handle = std::thread::Builder::new()
             .name("postgres-memory-init".to_string())
-            .spawn(move || -> Result<Client> {
+            .spawn(move || -> Result<(Client, bool)> {
                 let mut config: postgres::Config = db_url
                     .parse()
                     .context("invalid PostgreSQL connection URL")?;
@@ -166,7 +137,16 @@ impl PostgresMemory {
                     &schema_ident,
                     &qualified_table,
                 )?;
-                Ok(client)
+                // The synchronous postgres client uses block_on internally,
+                // so pgvector setup must also stay on this plain OS thread —
+                // calling it from a Tokio runtime thread panics.
+                let pgvector_ok = match pgvector {
+                    Some(dimensions) => {
+                        Self::try_enable_pgvector(&mut client, &qualified_table, dimensions).is_ok()
+                    }
+                    None => true,
+                };
+                Ok((client, pgvector_ok))
             })
             .context("failed to spawn PostgreSQL initializer thread")?;
 
@@ -211,15 +191,6 @@ impl PostgresMemory {
         Ok(())
     }
 
-    /// One-shot, idempotent normalization of `memories.session_id`.
-    ///
-    /// Mirrors the SQLite path: the orchestrator sanitizes session keys at
-    /// the source so the runtime HashMap, on-disk JSONL filename, and the
-    /// `session_id` filter for recall all agree. Rows written before that
-    /// fix retained the raw, un-sanitized form (e.g. `slack_C123_1.2_user one`)
-    /// and would be invisible to the new sanitized recall filter. Rewrite
-    /// them once at startup; later runs find nothing to update because
-    /// `sanitize_session_key` is idempotent.
     fn migrate_session_ids_to_sanitized(client: &mut Client, qualified_table: &str) -> Result<()> {
         let select = format!(
             "SELECT DISTINCT session_id FROM {qualified_table} WHERE session_id IS NOT NULL"
@@ -311,6 +282,7 @@ impl PostgresMemory {
         let timestamp: DateTime<Utc> = row.get("created_at");
 
         Ok(MemoryEntry {
+            principal_id: None,
             id: row.get("id"),
             key: row.get("key"),
             content: row.get("content"),
@@ -323,17 +295,15 @@ impl PostgresMemory {
                 .unwrap_or_else(|_| "default".into()),
             importance: row.try_get("importance").ok(),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: row.try_get("agent_alias").ok(),
             agent_id: row.try_get("agent_id").ok(),
         })
     }
 }
 
-/// Run a blocking closure on a plain OS thread to avoid nested Tokio runtime
-/// panics. The sync `postgres` crate internally calls `Runtime::block_on()`,
-/// which conflicts with `tokio::task::spawn_blocking` threads that are still
-/// associated with the Tokio runtime's blocking pool. Plain OS threads have no
-/// runtime context, so the nested `block_on` succeeds.
 async fn run_on_os_thread<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -360,7 +330,7 @@ where
     })?
 }
 
-fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
+pub(super) fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("{field_name} must not be empty");
     }
@@ -383,8 +353,24 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn quote_identifier(value: &str) -> String {
+pub(super) fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
+}
+
+fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> String {
+    match (since, until) {
+        (true, true) => format!(
+            " AND m.created_at >= ${first_placeholder}::TIMESTAMPTZ AND m.created_at <= ${}::TIMESTAMPTZ",
+            first_placeholder + 1
+        ),
+        (true, false) => {
+            format!(" AND m.created_at >= ${first_placeholder}::TIMESTAMPTZ")
+        }
+        (false, true) => {
+            format!(" AND m.created_at <= ${first_placeholder}::TIMESTAMPTZ")
+        }
+        (false, false) => String::new(),
+    }
 }
 
 #[async_trait]
@@ -400,12 +386,6 @@ impl Memory for PostgresMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> Result<()> {
-        // Trait-level `store` has no agent context. Route through
-        // `store_with_agent` so the row is attributed to the default
-        // agent (the NOT NULL FK on `agent_id` rejects unattributed
-        // inserts; un-attributed callers like the heartbeat memory
-        // path land under the synthesized `default` agent rather than
-        // surfacing a constraint violation).
         self.store_with_agent(key, content, category, session_id, None, None, None)
             .await
     }
@@ -431,14 +411,7 @@ impl Memory for PostgresMemory {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            let time_filter: String = match (since_ref, until_ref) {
-                (Some(_), Some(_)) => {
-                    " AND created_at >= $4::TIMESTAMPTZ AND created_at <= $5::TIMESTAMPTZ".into()
-                }
-                (Some(_), None) => " AND created_at >= $4::TIMESTAMPTZ".into(),
-                (None, Some(_)) => " AND created_at <= $4::TIMESTAMPTZ".into(),
-                (None, None) => String::new(),
-            };
+            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 4);
 
             let stmt = format!(
                 "
@@ -656,12 +629,6 @@ impl Memory for PostgresMemory {
 
         run_on_os_thread(move || -> Result<usize> {
             let mut client = client.lock();
-            // Memory rows ride `agent_id` (FK → agents.id); only the alias moves.
-            // Collision-safety (see the SQLite impl): `agents.alias` is UNIQUE and
-            // delete leaves an orphan agents row, so a bare UPDATE onto a
-            // previously-used-then-deleted `to` alias would violate the
-            // constraint. Run inside a transaction: refuse if `to` still owns
-            // memory rows (a real conflict), else drop the orphan `to` row first.
             let mut tx = client.transaction()?;
             let to_rows: i64 = tx
                 .query_one(
@@ -752,11 +719,6 @@ impl Memory for PostgresMemory {
         run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
             let mut client = client.lock();
-            // `agent_id = COALESCE($8, default-agent-uuid)` so callers
-            // without an agent context still satisfy the NOT NULL FK
-            // by attributing to the synthesized default agent. The
-            // subquery is indexed (UNIQUE alias) so the lookup is
-            // metadata-cached after the first call.
             let stmt = format!(
                 "
                 INSERT INTO {qualified_table}
@@ -812,20 +774,7 @@ impl Memory for PostgresMemory {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            // The agent_id filter lives in the WHERE clause so the
-            // backend never returns a foreign-agent row to the caller;
-            // post-fetch attribution lookups in earlier impls were the
-            // privacy escape Audacity flagged. The NOT NULL FK on
-            // `memories.agent_id` means there are no legacy
-            // unattributed rows to special-case.
-            let time_filter: String = match (since_ref, until_ref) {
-                (Some(_), Some(_)) => {
-                    " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ".into()
-                }
-                (Some(_), None) => " AND m.created_at >= $5::TIMESTAMPTZ".into(),
-                (None, Some(_)) => " AND m.created_at <= $5::TIMESTAMPTZ".into(),
-                (None, None) => String::new(),
-            };
+            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 5);
 
             let stmt = format!(
                 "
@@ -907,6 +856,42 @@ impl ::zeroclaw_api::attribution::Attributable for PostgresMemory {
 mod tests {
     use super::*;
 
+    fn postgres_test_url() -> String {
+        std::env::var("ZEROCLAW_TEST_POSTGRES_URL")
+            .expect("set ZEROCLAW_TEST_POSTGRES_URL to run ignored PostgreSQL tests")
+    }
+
+    #[test]
+    fn recall_time_filter_qualifies_alias_and_preserves_placeholder_order() {
+        let cases = [
+            (false, false, 4, ""),
+            (true, false, 4, " AND m.created_at >= $4::TIMESTAMPTZ"),
+            (false, true, 4, " AND m.created_at <= $4::TIMESTAMPTZ"),
+            (
+                true,
+                true,
+                4,
+                " AND m.created_at >= $4::TIMESTAMPTZ AND m.created_at <= $5::TIMESTAMPTZ",
+            ),
+            (false, false, 5, ""),
+            (true, false, 5, " AND m.created_at >= $5::TIMESTAMPTZ"),
+            (false, true, 5, " AND m.created_at <= $5::TIMESTAMPTZ"),
+            (
+                true,
+                true,
+                5,
+                " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ",
+            ),
+        ];
+
+        for (since, until, first_placeholder, expected) in cases {
+            assert_eq!(
+                recall_time_filter(since, until, first_placeholder),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn valid_identifiers_pass_validation() {
         assert!(validate_identifier("public", "schema").is_ok());
@@ -939,13 +924,6 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn drop_on_thread_drops_value_on_plain_os_thread() {
-        // Regression for the nested-runtime drop path: DropOnThread must ensure
-        // its wrapped value's destructor runs on a plain OS thread, not on the
-        // Tokio runtime thread, even when dropped from within a runtime context.
-        //
-        // Before this patch, PostgresMemory::drop released the Arc<Mutex<Client>>
-        // inline, which called postgres::Client::drop → Runtime::block_on and
-        // panicked. This test fails on that old behavior and passes with DropOnThread.
         let (tx, rx) = oneshot::channel::<bool>();
 
         struct DropGuard(Option<oneshot::Sender<bool>>);
@@ -990,14 +968,136 @@ mod tests {
         );
     }
 
-    // ── session_id migration ──────────────────────────────────────
-    //
-    // End-to-end migration coverage requires a live PostgreSQL instance, and
-    // the crate's existing Postgres test suite does not run one in CI. The
-    // unit tests below exercise the rewrite plan against the same
-    // `sanitize_session_key` helper used by the migration SQL, which is
-    // sufficient to verify the contract that `migrate_session_ids_to_sanitized`
-    // relies on: which values change, which stay, and idempotence on re-run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn new_with_pgvector_enabled_does_not_panic_inside_tokio_runtime() {
+        let outcome = std::panic::catch_unwind(|| {
+            PostgresMemory::new(
+                "test",
+                "postgres://zeroclaw:password@127.0.0.1:1/zeroclaw",
+                "public",
+                "memories",
+                Some(1),
+                Some(true),
+                Some(4),
+            )
+        });
+
+        assert!(
+            outcome.is_ok(),
+            "PostgresMemory::new should not panic with pgvector enabled"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "PostgresMemory::new should return a connect error for an unreachable endpoint"
+        );
+    }
+
+    struct TestSchema {
+        admin: Client,
+        name: String,
+    }
+
+    impl TestSchema {
+        fn create(database_url: &str, purpose: &str) -> Self {
+            let name = format!("zc_mem_{purpose}_{}", std::process::id());
+            let mut admin = Client::connect(database_url, NoTls).unwrap();
+            admin
+                .batch_execute(&format!(
+                    "DROP SCHEMA IF EXISTS {0} CASCADE; CREATE SCHEMA {0}",
+                    quote_identifier(&name)
+                ))
+                .unwrap();
+            Self { admin, name }
+        }
+    }
+
+    impl Drop for TestSchema {
+        fn drop(&mut self) {
+            let _ = self.admin.batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS {} CASCADE",
+                quote_identifier(&self.name)
+            ));
+        }
+    }
+
+    /// Live regression for the nested-runtime panic in the pgvector-enabled
+    /// construction path: `try_enable_pgvector` must run inside the
+    /// `postgres-memory-init` OS thread, because the synchronous postgres
+    /// client calls `block_on` internally and panics on a Tokio runtime
+    /// thread. The pgvector extension does not need to be installed in the
+    /// target database — an unavailable extension takes the graceful
+    /// keyword-only fallback, while the pre-fix code panics before that
+    /// fallback is reached.
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_new_with_pgvector_enabled_from_tokio_runtime_does_not_panic() {
+        let database_url = std::env::var("ZEROCLAW_TEST_POSTGRES_URL")
+            .expect("set ZEROCLAW_TEST_POSTGRES_URL to run ignored PostgreSQL tests");
+        let schema = TestSchema::create(&database_url, "vec");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let memory = runtime.block_on(async {
+            PostgresMemory::new(
+                "test",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                Some(true),
+                Some(4),
+            )
+        });
+
+        let memory =
+            memory.expect("pgvector-enabled construction from a Tokio runtime should succeed");
+        drop(memory);
+        drop(runtime);
+    }
+
+    #[test]
+    #[ignore = "requires ZEROCLAW_TEST_POSTGRES_URL"]
+    fn postgres_backend_round_trip_uses_isolated_schema() {
+        let database_url = postgres_test_url();
+        let schema = TestSchema::create(&database_url, "round_trip");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let memory = PostgresMemory::new(
+                "ci",
+                &database_url,
+                &schema.name,
+                "memories",
+                Some(5),
+                Some(false),
+                None,
+            )
+            .unwrap();
+
+            memory
+                .store(
+                    "ci_key",
+                    "PostgreSQL CI value",
+                    MemoryCategory::Core,
+                    Some("ci_session"),
+                )
+                .await
+                .unwrap();
+            let stored = memory.get("ci_key").await.unwrap().unwrap();
+            assert_eq!(stored.content, "PostgreSQL CI value");
+            assert_eq!(memory.count().await.unwrap(), 1);
+            assert!(memory.health_check().await);
+            assert!(memory.forget("ci_key").await.unwrap());
+            assert_eq!(memory.count().await.unwrap(), 0);
+        });
+    }
 
     #[test]
     fn rewrites_only_values_that_change_under_sanitization() {

@@ -1,5 +1,6 @@
 use crate::cmd::mdbook::refs::{build_api, build_refs};
 use crate::util::*;
+use anyhow::Context as _;
 use std::path::Path;
 use std::process::Command;
 
@@ -13,7 +14,6 @@ pub fn run(tag: Option<&str>) -> anyhow::Result<()> {
     ensure_cargo_tool("mdbook-gettext", "mdbook-i18n-helpers")?;
     ensure_cargo_tool("mdbook-mermaid", "mdbook-mermaid")?;
 
-    build_refs(&root)?;
     build_api(&root)?;
     build_locales(&root, tag)?;
     crate::cmd::mdbook::linkcheck::check_internal_links(&root, tag.unwrap_or(DEFAULT_TAG))?;
@@ -40,18 +40,10 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
             .collect::<Vec<_>>()
             .join(" ")
     );
-    inject_lang_switcher_locales(&book, &entries)?;
-    crate::cmd::mdbook::themes::run(root)?;
-    crate::cmd::mdbook::keymap::run(root)?;
-    crate::cmd::mdbook::hardware::run(root)?;
+    prepare_generated_book_inputs(root, &entries)?;
     let mdbook = mdbook_program()?;
-    let preprocessor_env = peer_groups_preprocessor_env();
+    let preprocessor_env = mdbook_xtask_preprocessor_env();
     let tag_dir = tag.unwrap_or(DEFAULT_TAG);
-    // Search is enabled only for the primary locale. Per-locale searchindex is
-    // high-entropy (~6-7 MB raw each) and does not delta-compress across
-    // versions, so building it for every locale dominates gh-pages clone size.
-    // The primary locale (first in locales.toml, English) keeps full search;
-    // translated locales build without a search index or search box.
     let primary_locale = entries.first().map(|e| e.code.clone());
     for entry in &entries {
         let dest = format!("book/{}/{}", tag_dir, entry.code);
@@ -62,11 +54,66 @@ pub fn build_locales(root: &std::path::Path, tag: Option<&str>) -> anyhow::Resul
         if Some(&entry.code) != primary_locale.as_ref() {
             cmd.env("MDBOOK_OUTPUT__HTML__SEARCH__ENABLE", "false");
         }
-        if let Some((key, value)) = &preprocessor_env {
-            cmd.env(key, value);
+        if let Some(env) = &preprocessor_env {
+            cmd.envs(env.iter().map(|(key, value)| (key, value)));
         }
         run_cmd(&mut cmd)?;
     }
+    if let Some(primary) = primary_locale.as_deref() {
+        build_llms(root, tag, primary)?;
+    }
+    Ok(())
+}
+
+/// Emit `llms.txt` and `llms-full.txt` beside the primary locale's HTML by
+/// running mdBook once more with only the in-tree `llms` backend. The
+/// preprocessors that support that renderer (gettext, peer-groups,
+/// placeholders) run again so the text matches the rendered pages; mermaid
+/// serves the HTML renderer only, so diagram source stays fenced. No HTML
+/// backend runs, so the output already in `dest` is untouched. `serve` does
+/// not call this, and an HTML watch rebuild of `dest` discards the pair.
+pub fn build_llms(root: &Path, tag: Option<&str>, locale: &str) -> anyhow::Result<()> {
+    use crate::cmd::mdbook::llms;
+    let tag_dir = tag.unwrap_or(DEFAULT_TAG);
+    let dest = format!("book/{tag_dir}/{locale}");
+    println!(
+        "==> Writing {} and {} for {locale}",
+        llms::INDEX_FILE,
+        llms::FULL_FILE
+    );
+    let exe = std::env::current_exe().context("resolve xtask binary for the llms backend")?;
+    let mut cmd = Command::new(mdbook_program()?);
+    cmd.args(["build", "-d", &dest])
+        .env("MDBOOK_BOOK__LANGUAGE", locale)
+        .env("MDBOOK_OUTPUT", llms_output_table(&exe.to_string_lossy()))
+        .env(llms::BASE_URL_ENV, llms::base_url_for(tag_dir, locale))
+        .current_dir(book_dir(root));
+    if let Some(env) = mdbook_xtask_preprocessor_env() {
+        cmd.envs(env.iter().map(|(key, value)| (key, value)));
+    }
+    run_cmd(&mut cmd)
+}
+
+/// JSON for `MDBOOK_OUTPUT`: replaces the whole `output` table from
+/// `book.toml` so this pass runs the `llms` backend alone. With a single
+/// backend mdBook writes straight into `-d`, not `<dest>/llms/`.
+fn llms_output_table(helper_path: &str) -> String {
+    let quoted =
+        shlex::try_quote(helper_path).map_or_else(|_| helper_path.to_string(), |q| q.into_owned());
+    serde_json::json!({ "llms": { "command": format!("{quoted} llms") } }).to_string()
+}
+
+/// Generate every gitignored input that mdBook sources or hashes while
+/// rendering. Keep all entrypoints on this helper so a warm working tree cannot
+/// hide a missing generator from clean-checkout builds.
+pub fn prepare_generated_book_inputs(root: &Path, entries: &[LocaleEntry]) -> anyhow::Result<()> {
+    build_refs(root)?;
+    inject_lang_switcher_locales(&book_dir(root), entries)?;
+    crate::cmd::mdbook::themes::run(root)?;
+    crate::cmd::mdbook::keymap::run(root)?;
+    crate::cmd::mdbook::hardware::run(root)?;
+    crate::cmd::mdbook::feature_matrix::run(root)?;
+    crate::cmd::mdbook::plugins::run(root)?;
     Ok(())
 }
 
@@ -206,11 +253,6 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
         return Ok(());
     }
 
-    // Map each hashed chrome file (path relative to the locale dir, e.g.
-    // `theme/custom-abc12345.css`) to its unhashed `_shared`-relative path
-    // (e.g. `theme/custom.css`). The `../` prefix is applied per HTML file
-    // below, because a page's correct depth to the version root — and thus to
-    // `_shared` at the gh-pages root — depends on how deep the page sits.
     let mut replacements = Vec::new();
     let prefixes = [
         "css/chrome",
@@ -248,11 +290,20 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
             if !prefixes.iter().any(|p| rel_str.starts_with(p)) {
                 continue;
             }
-            let file_name = file.file_name().unwrap().to_string_lossy();
+            let file_name = file
+                .file_name()
+                .with_context(|| format!("asset path has no file name: {}", file.display()))?
+                .to_string_lossy();
             if let Some(unhashed_name) = strip_chrome_hash(&file_name) {
-                let dest_rel = rel.parent().unwrap().join(unhashed_name);
+                let dest_rel = rel
+                    .parent()
+                    .with_context(|| format!("asset path has no parent: {}", rel.display()))?
+                    .join(unhashed_name);
                 let dest = shared_dir.join(&dest_rel);
-                std::fs::create_dir_all(dest.parent().unwrap())?;
+                let dest_parent = dest.parent().with_context(|| {
+                    format!("shared asset destination has no parent: {}", dest.display())
+                })?;
+                std::fs::create_dir_all(dest_parent)?;
                 std::fs::copy(&file, &dest)?;
                 let dest_rel_str = dest_rel.to_string_lossy().replace('\\', "/");
                 // Store (locale-relative hashed path, unhashed shared-relative path).
@@ -264,13 +315,6 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
     for entry in locale_entries() {
         let loc_dir = version_dir.join(&entry.code);
         for file in walk_dir(&loc_dir) {
-            // Depth of this HTML file below the locale dir. mdBook emits chrome
-            // refs as `<../ × (locale_depth + page_depth)>theme/foo-HASH.css`
-            // for an HTML page `page_depth` levels under the locale dir; the
-            // matching `_shared` ref needs the same total `../` count plus one
-            // to clear the version dir up to the gh-pages root where `_shared`
-            // lives. Concretely: page directly in `<tag>/<locale>/` -> `../../`,
-            // one level deeper -> `../../../`, and so on.
             let page_depth = file
                 .strip_prefix(&loc_dir)
                 .ok()
@@ -313,7 +357,19 @@ pub fn extract_shared_chrome(version_dir: &Path, shared_dir: &Path) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use super::{strip_chrome_hash, strip_source_anchors};
+    use super::{llms_output_table, strip_chrome_hash, strip_source_anchors};
+
+    #[test]
+    fn llms_output_table_names_only_the_llms_backend() {
+        let table: serde_json::Value =
+            serde_json::from_str(&llms_output_table("/t/x task")).unwrap();
+        assert_eq!(table["llms"]["command"], "'/t/x task' llms");
+        assert_eq!(
+            table.as_object().unwrap().len(),
+            1,
+            "html must not run in this pass"
+        );
+    }
 
     #[test]
     fn strips_single_extension_hash() {

@@ -1,14 +1,3 @@
-#![allow(dead_code)]
-
-/// A single help entry: one or more keys that trigger the same action.
-///
-/// The renderer joins keys with " / " so you don't have to format manually.
-/// An entry with all-empty keys/action renders as a blank spacer row.
-///
-/// Keys are owned `String`s so callers can pass live chord displays resolved
-/// from the keymap (`Action::Variant.resolved()[..].display()`) instead of
-/// hardcoded literals — the help always reflects the actual bindings, including
-/// user overrides.
 #[derive(Debug, Clone, Default)]
 pub struct HelpEntry {
     /// Keys that trigger this action, e.g. ["↑", "k"]. Rendered labels,
@@ -60,21 +49,6 @@ impl HelpEntry {
     }
 }
 
-/// A node in the help context tree.
-///
-/// The help system cascades: Pane → Tab → Widget (or Screen → Tab → Widget
-/// for the config pane). Each level produces one `HelpNode`. The modal renders
-/// them depth-first:
-///
-///   [title]
-///   [description, soft-wrapped]
-///   key   action
-///   key   action
-///   ── dim separator ──
-///   [child title]
-///   ...
-///
-/// Any field may be empty/None — the renderer skips it cleanly.
 #[derive(Debug, Clone, Default)]
 pub struct HelpNode {
     /// Short label shown as a dim section header (e.g. "Tab", "Widget"). None = no header.
@@ -91,6 +65,15 @@ impl HelpNode {
     /// Leaf node with just keybindings.
     pub fn entries(entries: Vec<HelpEntry>) -> Self {
         Self {
+            entries,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn titled(title: impl Into<String>, entries: Vec<HelpEntry>) -> Self {
+        Self {
+            title: Some(title.into()),
             entries,
             ..Default::default()
         }
@@ -117,44 +100,64 @@ use ratatui::{
 };
 
 /// A one-row context-window usage bar.
-///
 /// Renders left-aligned into whatever `Rect` you hand it.
 /// Returns `None` from `widget()` when there is nothing to show.
 pub struct CtxBar {
     pub input_tokens: Option<u64>,
+    /// Preemptive-trim budget: the point where history trimming triggers.
     pub max_tokens: Option<u64>,
+    /// Model's full context window. When present it is the bar denominator, and
+    /// `max_tokens` is drawn as a marker (`|`) inside the bar. When absent the
+    /// bar falls back to filling toward `max_tokens` (legacy behavior).
+    pub model_window: Option<u64>,
 }
 
 impl CtxBar {
-    pub fn new(input_tokens: Option<u64>, max_tokens: Option<u64>) -> Self {
+    pub fn new(
+        input_tokens: Option<u64>,
+        max_tokens: Option<u64>,
+        model_window: Option<u64>,
+    ) -> Self {
         Self {
             input_tokens,
             max_tokens,
+            model_window,
         }
-    }
-
-    /// `true` when there is something worth rendering.
-    pub fn has_content(&self) -> bool {
-        self.input_tokens.is_some() || self.max_tokens.is_some()
     }
 
     /// Build a `Paragraph` widget, or `None` if there is nothing to show.
     pub fn widget(&self) -> Option<Paragraph<'static>> {
-        let (text, pct_opt) = match (self.input_tokens, self.max_tokens) {
-            (Some(used), Some(max)) if max > 0 => {
-                let pct = (used as f64 / max as f64 * 100.0).min(100.0);
+        // Denominator preference: full model window, else the trim budget.
+        let denom = self.model_window.or(self.max_tokens);
+        let (text, pct_opt) = match (self.input_tokens, denom) {
+            (Some(used), Some(total)) if total > 0 => {
+                let pct = (used as f64 / total as f64 * 100.0).min(100.0);
                 let bar_width: usize = 16;
                 let filled = ((pct / 100.0) * bar_width as f64).round() as usize;
                 let empty = bar_width.saturating_sub(filled);
-                let bar = format!(
-                    "[{}{}]",
-                    "\u{2588}".repeat(filled),
-                    "\u{2591}".repeat(empty)
-                );
+                // When a distinct trim budget sits below the window, mark its
+                // position in the bar so the user sees where trimming triggers.
+                let marker_pos = match (self.model_window, self.max_tokens) {
+                    (Some(win), Some(budget)) if win > 0 && budget > 0 && budget < win => {
+                        Some(((budget as f64 / win as f64) * bar_width as f64).round() as usize)
+                    }
+                    _ => None,
+                };
+                let mut cells: Vec<char> = "\u{2588}"
+                    .repeat(filled)
+                    .chars()
+                    .chain("\u{2591}".repeat(empty).chars())
+                    .collect();
+                if let Some(pos) = marker_pos
+                    && let Some(cell) = cells.get_mut(pos.min(bar_width.saturating_sub(1)))
+                {
+                    *cell = '\u{2502}'; // │ trim-budget marker
+                }
+                let bar: String = cells.into_iter().collect();
                 let label = format!(
-                    " ctx: {:>7} / {:>7}  {}  {:.0}%",
+                    " ctx: {:>7} / {:>7}  [{}]  {:.0}%",
                     fmt_tokens(used),
-                    fmt_tokens(max),
+                    fmt_tokens(total),
                     bar,
                     pct,
                 );
@@ -190,6 +193,39 @@ fn fmt_tokens(n: u64) -> String {
         out.push(ch);
     }
     out.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod context_bar_tests {
+    use super::*;
+    use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+    fn render(bar: CtxBar) -> String {
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buffer = Buffer::empty(area);
+        bar.widget()
+            .expect("context bar should render")
+            .render(area, &mut buffer);
+        (0..area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn model_window_is_denominator_and_budget_is_marker() {
+        let rendered = render(CtxBar::new(Some(100_000), Some(180_000), Some(200_000)));
+        assert!(rendered.contains("100,000 / 200,000"));
+        assert!(rendered.contains('│'));
+        assert!(rendered.contains("50%"));
+    }
+
+    #[test]
+    fn missing_model_window_keeps_legacy_budget_denominator() {
+        let rendered = render(CtxBar::new(Some(16_000), Some(32_000), None));
+        assert!(rendered.contains("16,000 /  32,000"));
+        assert!(!rendered.contains('│'));
+        assert!(rendered.contains("50%"));
+    }
 }
 
 // ── InfoBar ─────────────────────────────────────────────────────────────────
@@ -261,6 +297,7 @@ impl<'a> InfoBar<'a> {
         Self { message }
     }
 
+    #[cfg(test)]
     pub fn has_content(&self) -> bool {
         self.message.is_some()
     }
@@ -284,20 +321,28 @@ impl<'a> InfoBar<'a> {
 }
 
 /// Truncate `s` to at most `width` display columns, appending an ellipsis when
-/// it overflows. Approximates width by `char` count — adequate for the
-/// single-line status text the info bar carries.
-fn truncate_to_width(s: &str, width: usize) -> String {
+/// it overflows. Grapheme boundaries and terminal display width stay aligned
+/// with the renderer and hit geometry.
+pub(crate) fn truncate_to_width(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if s.chars().count() <= width {
+    if crate::display_width::display_width(s) <= width {
         return s.to_string();
     }
     if width == 1 {
         return "\u{2026}".to_string();
     }
     let keep = width - 1;
-    let mut out: String = s.chars().take(keep).collect();
+    let mut used = 0usize;
+    let mut out = String::new();
+    for (_, grapheme, grapheme_width) in crate::display_width::grapheme_widths(s) {
+        if used + grapheme_width > keep {
+            break;
+        }
+        out.push_str(grapheme);
+        used += grapheme_width;
+    }
     out.push('\u{2026}');
     out
 }
@@ -309,12 +354,8 @@ use ratatui::{
     layout::Rect,
     widgets::{Block, Borders, Clear, List, ListItem, ListState},
 };
+use unicode_width::UnicodeWidthStr;
 
-/// A reusable centered modal list picker over a `Vec<String>`. Owns its items,
-/// cursor, and an optional title; renders a bordered, scrollable list with the
-/// highlighted row styled. The caller owns the state (see [`PickerState`]) and
-/// keys; this type is the renderer plus cursor-movement helpers so other
-/// surfaces can reuse it.
 pub struct PickerModal<'a> {
     title: &'a str,
     items: &'a [String],
@@ -339,10 +380,10 @@ impl<'a> PickerModal<'a> {
         // on the same rows the user sees.
         let longest = items
             .iter()
-            .map(|s| s.chars().count())
+            .map(|s| UnicodeWidthStr::width(s.as_str()))
             .max()
             .unwrap_or(0)
-            .max(title.chars().count());
+            .max(UnicodeWidthStr::width(title));
         let inner_w = longest + 2; // 1 col padding each side
         let box_w = (inner_w + 2).clamp(12, area.width as usize) as u16;
         let box_h = (items.len() + 2).clamp(3, area.height as usize) as u16;
@@ -413,6 +454,7 @@ impl PickerState {
         Self { items, cursor }
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -463,6 +505,13 @@ mod info_bar_tests {
     }
 
     #[test]
+    fn truncate_respects_wide_grapheme_columns() {
+        let truncated = truncate_to_width("agent界界", 7);
+        assert_eq!(truncated, "agent\u{2026}");
+        assert_eq!(crate::display_width::display_width(&truncated), 6);
+    }
+
+    #[test]
     fn fresh_message_is_not_expired() {
         let m = InfoMessage::info("hi");
         assert!(!m.is_expired());
@@ -494,6 +543,25 @@ mod info_bar_tests {
 #[cfg(test)]
 mod picker_tests {
     use super::*;
+
+    #[test]
+    fn area_for_uses_display_width_for_wide_items() {
+        let items = vec!["界界界界界界".to_string()];
+
+        let area = PickerModal::area_for("Pick", &items, Rect::new(0, 0, 80, 24)).unwrap();
+
+        assert_eq!(area.width, 16);
+    }
+
+    #[test]
+    fn area_for_uses_display_width_for_wide_title() {
+        let items = vec!["one".to_string()];
+
+        let area =
+            PickerModal::area_for("界界界界界界界", &items, Rect::new(0, 0, 80, 24)).unwrap();
+
+        assert_eq!(area.width, 18);
+    }
 
     #[test]
     fn new_defaults_to_first_when_no_default() {

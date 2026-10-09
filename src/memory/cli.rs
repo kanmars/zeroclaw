@@ -1,7 +1,7 @@
 use super::traits::{Memory, MemoryCategory};
 use super::{
     MemoryBackendKind, backend_kind_from_dotted, classify_memory_backend,
-    create_memory_for_migration, create_memory_with_storage_and_routes,
+    create_memory_for_migration, create_memory_from_config,
 };
 use crate::config::Config;
 use anyhow::{Result, bail};
@@ -55,27 +55,12 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
     }
 }
 
-/// Create a memory backend with the configured embedder wired in.
-///
-/// Unlike `create_cli_memory`, which skips embedding setup for pure
-/// read/delete operations, this factory is used by commands that must
-/// actually compute embeddings (e.g. `reindex`). Mirrors the gateway's
-/// memory construction so the same model provider / route resolution
-/// applies. Removed `model_providers.fallback`; the embedder API key falls
-/// back to the first configured model provider, matching how the gateway
-/// resolves it (`crates/zeroclaw-gateway/src/lib.rs` `fallback`).
 fn create_memory_with_embedder(config: &Config) -> Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
     if matches!(classify_memory_backend(&backend), MemoryBackendKind::None) {
         bail!("Memory backend is 'none' (disabled). No entries to manage.");
     }
-    create_memory_with_storage_and_routes(
-        &config.memory,
-        &config.embedding_routes,
-        config.resolve_active_storage(),
-        &config.data_dir,
-        None,
-    )
+    create_memory_from_config(config, None)
 }
 
 async fn handle_reindex(config: &Config) -> Result<()> {
@@ -101,11 +86,6 @@ async fn handle_reindex(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Create a lightweight memory backend for CLI management operations.
-///
-/// CLI commands (list/get/stats/clear) never use vector search, so we skip
-/// embedding model_provider initialisation for local backends by using the
-/// migration factory.
 fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
     let backend = backend_kind_from_dotted(&config.memory.backend);
 
@@ -113,7 +93,7 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
         MemoryBackendKind::None => {
             bail!("Memory backend is 'none' (disabled). No entries to manage.");
         }
-        _ => create_memory_for_migration(&backend, &config.data_dir),
+        _ => create_memory_for_migration(config),
     }
 }
 
@@ -491,6 +471,53 @@ fn truncate_content(s: &str, max_len: usize) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(feature = "agent-runtime")]
+    #[tokio::test]
+    async fn list_does_not_run_hygiene_on_retention_protected_row() {
+        use rusqlite::params;
+        use zeroclaw_memory::SqliteMemory;
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.data_dir = tmp.path().to_path_buf();
+        config.memory.backend = "sqlite".into();
+        config.memory.hygiene_enabled = true;
+        config.memory.conversation_retention_days = 30;
+        config
+            .memory
+            .policy
+            .retention_days_by_category
+            .insert("conversation".into(), 0);
+
+        let seed = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        seed.store(
+            "protected",
+            "an old conversation",
+            MemoryCategory::Conversation,
+            None,
+        )
+        .await
+        .unwrap();
+        drop(seed);
+        let db_path = tmp.path().join("memory/brain.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE memories SET updated_at = ?1 WHERE key = ?2",
+            params!["2020-01-01T00:00:00+00:00", "protected"],
+        )
+        .unwrap();
+        drop(conn);
+
+        handle_list(&config, None, None, 10, 0).await.unwrap();
+
+        let reopened = SqliteMemory::new("sqlite", tmp.path()).unwrap();
+        assert!(reopened.get("protected").await.unwrap().is_some());
+        assert!(
+            !tmp.path().join("state/memory_hygiene_state.json").exists(),
+            "CLI inspection must not start runtime hygiene"
+        );
+    }
 
     #[test]
     fn parse_category_known_variants() {

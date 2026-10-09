@@ -1,11 +1,10 @@
 //! A [`ModelProvider`] that replays scripted LLM responses from an [`LlmTrace`].
-//!
 //! Promoted from the test-only trace-replay helper so the same deterministic
 //! engine backs both the shipped `zeroclaw eval` command and the test suite.
 
 use async_trait::async_trait;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
 use zeroclaw_api::model_provider::{
     ChatRequest, ChatResponse, ModelProvider, TokenUsage, ToolCall,
@@ -20,20 +19,13 @@ struct ReplayState {
     current: usize,
 }
 
-/// Replays the steps of an [`LlmTrace`], scoped to one conversation turn at a time.
-///
-/// Each call to [`ModelProvider::chat`] returns the next scripted step **of the
-/// current turn**. Steps are FIFO *within* a turn, but turn boundaries are enforced
-/// rather than flattened: a turn can neither borrow steps from the next one nor
-/// leave its own steps unconsumed.
-///
-/// - `chat` errors if the current turn runs out of steps (the trace *under*-specifies
-///   that turn's LLM round-trips).
-/// - The runner calls [`ReplayHandle::finish_turn`] between turns; it errors if the
-///   finished turn left steps behind (the trace *over*-specifies them).
-///
-/// Either mismatch surfaces as a clear, turn-scoped error instead of silently
-/// bleeding responses across turn boundaries.
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
 pub struct TraceLlmProvider {
     state: Arc<Mutex<ReplayState>>,
     trace_name: String,
@@ -63,7 +55,6 @@ impl TraceLlmProvider {
 }
 
 /// Runner-side handle for advancing the replay cursor between conversation turns.
-///
 /// Shares the provider's queues (the same `Arc` the agent holds), so the runner can
 /// assert per-turn consumption without owning the boxed provider.
 pub struct ReplayHandle {
@@ -75,7 +66,7 @@ impl ReplayHandle {
     /// Assert the just-finished turn consumed all of its scripted steps, then advance
     /// the cursor to the next turn. Errors if any steps were left unconsumed.
     pub fn finish_turn(&self, turn_index: usize) -> anyhow::Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = lock_recover(&self.state);
         let leftover = state.turns.get(state.current).map_or(0, |q| q.len());
         if leftover > 0 {
             anyhow::bail!(
@@ -118,7 +109,7 @@ impl ModelProvider for TraceLlmProvider {
         _temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let step = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = lock_recover(&self.state);
             let current = state.current;
             match state.turns.get_mut(current).and_then(|q| q.pop_front()) {
                 Some(step) => step,
@@ -140,6 +131,7 @@ impl ModelProvider for TraceLlmProvider {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(output_tokens),
                     cached_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
                 reasoning_content: None,
             }),
@@ -164,6 +156,7 @@ impl ModelProvider for TraceLlmProvider {
                         input_tokens: Some(input_tokens),
                         output_tokens: Some(output_tokens),
                         cached_input_tokens: None,
+                        cache_creation_input_tokens: None,
                     }),
                     reasoning_content: None,
                 })

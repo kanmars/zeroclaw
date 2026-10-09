@@ -1,5 +1,4 @@
 //! Native macOS permission checks via FFI.
-//!
 //! Each function returns one of: `"granted"`, `"denied"`, or `"not_determined"`.
 //! These map directly to the macOS authorization status enums.
 
@@ -7,6 +6,9 @@ use std::process::Command;
 
 // ── Accessibility ──────────────────────────────────────────────────────────
 
+// SAFETY: these declarations match the parameter-free Boolean signatures in
+// Apple's ApplicationServices accessibility API. The framework is linked by
+// name on macOS, the only target that compiles this module.
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
@@ -21,6 +23,9 @@ pub fn check_accessibility() -> &'static str {
 
 // ── Screen Recording ───────────────────────────────────────────────────────
 
+// SAFETY: these declarations match the parameter-free Boolean signatures in
+// Apple's CoreGraphics screen-capture permission API. The framework is linked
+// by name on macOS, the only target that compiles this module.
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
@@ -40,16 +45,6 @@ pub fn request_screen_recording() -> &'static str {
     let granted = unsafe { CGRequestScreenCaptureAccess() };
     if granted { "granted" } else { "denied" }
 }
-
-// ── Camera & Microphone (AVFoundation) ─────────────────────────────────────
-//
-// AVCaptureDevice.authorizationStatus(for:) returns an enum:
-//   0 = notDetermined, 1 = restricted, 2 = denied, 3 = authorized
-//
-// We use a small inline AppleScript/ObjC bridge via osascript because linking
-// AVFoundation from pure Rust FFI requires significant boilerplate.  The
-// osascript approach is reliable for permission *checks* and keeps the binary
-// lean.
 
 fn check_av_permission(media_type: &str) -> &'static str {
     // Use swift CLI to check AVCaptureDevice authorization status.
@@ -130,12 +125,9 @@ print(result)
     }
 }
 
-// ── Input Monitoring (IOKit) ───────────────────────────────────────────────
-//
-// IOHIDCheckAccess returns one of:
-//   0 = granted, 1 = denied, 2 = unknown / not yet determined.
-// IOHIDRequestAccess triggers the system dialog on first call.
-
+// SAFETY: these declarations match the `IOHIDCheckAccess` and
+// `IOHIDRequestAccess` signatures in the macOS IOKit HID API; the request type
+// is the SDK-defined integer enum value passed by value.
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
     fn IOHIDCheckAccess(requestType: u32) -> u32;
@@ -165,7 +157,6 @@ pub fn request_input_monitoring() -> &'static str {
 }
 
 // ── Full Disk Access ───────────────────────────────────────────────────────
-//
 // No programmatic request API exists. Probe by attempting to read TCC.db,
 // which is gated by FDA. EACCES ⇒ denied; success ⇒ granted.
 
@@ -184,7 +175,6 @@ pub fn check_full_disk_access() -> &'static str {
 }
 
 // ── Local Network ──────────────────────────────────────────────────────────
-//
 // macOS prompts on first mDNS / Bonjour use; there is no reliable read-only
 // probe today. Surface as not_determined and rely on the deep-link.
 
@@ -194,7 +184,6 @@ pub fn check_local_network() -> &'static str {
 }
 
 // ── Notifications ──────────────────────────────────────────────────────────
-//
 // UNUserNotificationCenter authorization status:
 //   0 = notDetermined, 1 = denied, 2 = authorized, 3 = provisional, 4 = ephemeral
 
@@ -226,7 +215,6 @@ print(result)
 }
 
 // ── Speech Recognition ─────────────────────────────────────────────────────
-//
 // SFSpeechRecognizer.authorizationStatus():
 //   0 = notDetermined, 1 = denied, 2 = restricted, 3 = authorized
 
@@ -247,7 +235,6 @@ pub fn check_speech_recognition() -> &'static str {
 }
 
 // ── Automation (AppleScript) ───────────────────────────────────────────────
-//
 // Automation permission is checked per-target-app.  A general check tests
 // against System Events (the most common automation target).
 

@@ -6,7 +6,7 @@ use crate::stream_guard::AbortOnDrop;
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
-    StreamResult, ToolCall as ProviderToolCall,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -36,7 +36,14 @@ pub struct OpenAiCodexModelProvider {
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
     reasoning_effort: Option<String>,
-    client: Client,
+    /// The configured `[multimodal]` policy.
+    ///
+    /// This provider normalizes image markers on its own boundary, and that
+    /// normalization decodes pixels and applies `max_images` /
+    /// `max_image_size_mb`. Holding the configured policy keeps the boundary
+    /// pass on the same rules the runtime already applied instead of silently
+    /// reverting to defaults and re-trimming an accepted history.
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
 #[derive(Debug, Serialize)]
@@ -63,7 +70,9 @@ pub(crate) struct ResponsesToolSpec {
     pub(crate) kind: String,
     pub(crate) name: String,
     pub(crate) description: String,
-    pub(crate) parameters: Value,
+    /// `Arc`-shared with the tool registry's stored schema — serialized
+    /// transparently, never deep-cloned per request
+    pub(crate) parameters: std::sync::Arc<Value>,
     pub(crate) strict: bool,
 }
 
@@ -84,17 +93,21 @@ struct ResponsesResponse {
     output: Vec<Value>,
     #[serde(default)]
     output_text: Option<String>,
+    #[serde(default)]
+    usage: Option<Value>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct ResponsesStreamState {
     pub(crate) saw_text_delta: bool,
+    pub(crate) saw_completion: bool,
     pub(crate) text_accumulator: String,
     pub(crate) fallback_text: Option<String>,
     pub(crate) tool_calls: HashMap<String, PendingToolCall>,
     pub(crate) emitted_tool_call_ids: HashSet<String>,
     pub(crate) collected_tool_calls: Vec<ProviderToolCall>,
     pub(crate) output_items: Vec<Value>,
+    pub(crate) usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -110,6 +123,7 @@ pub(crate) struct ResponsesTurnResult {
     pub(crate) text: Option<String>,
     pub(crate) tool_calls: Vec<ProviderToolCall>,
     pub(crate) reasoning_content: Option<String>,
+    pub(crate) usage: Option<TokenUsage>,
 }
 
 impl OpenAiCodexModelProvider {
@@ -133,12 +147,16 @@ impl OpenAiCodexModelProvider {
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
-            client: Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .read_timeout(std::time::Duration::from_secs(300))
-                .build()
-                .unwrap_or_else(|_| Client::new()),
+            multimodal: options.multimodal.clone(),
         })
+    }
+
+    fn http_client(&self) -> Client {
+        zeroclaw_config::schema::build_runtime_proxy_client_with_read_timeout(
+            "model_provider.openai",
+            300,
+            10,
+        )
     }
 }
 
@@ -226,6 +244,10 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
+pub(crate) fn has_turn_tools(tools: Option<&Vec<ResponsesToolSpec>>) -> bool {
+    tools.as_ref().is_some_and(|t| !t.is_empty())
+}
+
 pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesToolSpec>> {
     let items = tools?;
     if items.is_empty() {
@@ -239,7 +261,7 @@ pub(crate) fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesT
                 kind: "function".to_string(),
                 name: tool.name.clone(),
                 description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
+                parameters: std::sync::Arc::clone(&tool.parameters),
                 strict: false,
             })
             .collect(),
@@ -320,6 +342,22 @@ fn decode_responses_history_items(reasoning_content: &str) -> Option<Vec<Value>>
     (!items.is_empty()).then_some(items)
 }
 
+/// Build a single Responses-API `function_call` input item from a parsed
+/// `ProviderToolCall`. The `arguments` field is routed through the shared
+/// `sanitize_tool_arguments` helper so the openai_codex call site inherits
+/// the same malformed-JSON → `"{}"` contract as the other four typed
+/// providers. Factored out so the call-site behavior is testable without
+/// running the full input builder.
+pub(crate) fn build_function_call_item(call: ProviderToolCall) -> Value {
+    let name = call.name;
+    serde_json::json!({
+        "type": "function_call",
+        "call_id": call.id,
+        "name": name,
+        "arguments": crate::compatible::sanitize_tool_arguments(&name, &call.arguments),
+    })
+}
+
 pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
@@ -328,7 +366,8 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
         match msg.role.as_str() {
             "system" => system_parts.push(&msg.content),
             "user" => {
-                let (cleaned_text, image_refs) = multimodal::parse_image_markers(&msg.content);
+                let (cleaned_text, image_refs) =
+                    multimodal::parse_user_message_image_refs(&msg.content);
 
                 let mut content_items = Vec::new();
 
@@ -404,12 +443,7 @@ pub(crate) fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Va
                     }
 
                     for call in parsed_calls {
-                        input.push(serde_json::json!({
-                            "type": "function_call",
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": call.arguments,
-                        }));
+                        input.push(build_function_call_item(call));
                     }
                 } else if !msg.content.trim().is_empty() {
                     input.push(response_message_item(
@@ -574,7 +608,30 @@ fn responses_turn_from_response(response: &ResponsesResponse) -> ResponsesTurnRe
         text: extract_responses_text(response),
         tool_calls,
         reasoning_content,
+        usage: parse_responses_usage(response.usage.as_ref()),
     }
+}
+
+/// Parses usage from a Responses response without rejecting an otherwise valid
+/// response when optional usage fields are absent or malformed.
+pub(crate) fn parse_responses_usage(usage: Option<&Value>) -> Option<TokenUsage> {
+    let usage = usage?.as_object()?;
+    let input_tokens = usage.get("input_tokens").and_then(Value::as_u64);
+    let output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
+    let cached_input_tokens = usage
+        .get("input_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64);
+
+    (input_tokens.is_some() || output_tokens.is_some() || cached_input_tokens.is_some()).then_some(
+        TokenUsage {
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens: None,
+        },
+    )
 }
 
 fn record_responses_output_item(state: &mut ResponsesStreamState, item: Value) {
@@ -811,7 +868,9 @@ pub(crate) fn process_responses_stream_event(
                 }
             }
         }
-        Some("response.completed" | "response.done") => {
+        Some(event_type @ ("response.completed" | "response.done")) => {
+            state.saw_completion = true;
+            let is_completed = event_type == "response.completed";
             if let Some(response) = event
                 .get("response")
                 .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok())
@@ -824,6 +883,11 @@ pub(crate) fn process_responses_stream_event(
                     if let Some(tool_call) = emit_tool_call(state, tool_call) {
                         emitted.push(StreamEvent::ToolCall(tool_call));
                     }
+                }
+                if is_completed && let Some(usage) = parse_responses_usage(response.usage.as_ref())
+                {
+                    state.usage = Some(usage.clone());
+                    emitted.push(StreamEvent::Usage(usage));
                 }
             }
         }
@@ -849,6 +913,9 @@ pub(crate) fn process_sse_chunk(
     let joined = data_lines.join("\n");
     let trimmed = joined.trim();
     if trimmed.is_empty() || trimmed == "[DONE]" {
+        if trimmed == "[DONE]" {
+            state.saw_completion = true;
+        }
         return Ok(Vec::new());
     }
 
@@ -860,6 +927,9 @@ pub(crate) fn process_sse_chunk(
     for line in data_lines {
         let line = line.trim();
         if line.is_empty() || line == "[DONE]" {
+            if line == "[DONE]" {
+                state.saw_completion = true;
+            }
             continue;
         }
         let event = serde_json::from_str::<Value>(line).map_err(|err| {
@@ -910,6 +980,7 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
             !state.collected_tool_calls.is_empty(),
         ),
         tool_calls: state.collected_tool_calls,
+        usage: state.usage,
     })
 }
 
@@ -1064,12 +1135,6 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     })
 }
 
-/// Read the response body incrementally via `bytes_stream()` to avoid
-/// buffering the entire SSE payload in memory.  The previous implementation
-/// used `response.text().await?` which holds the HTTP connection open until
-/// every byte has arrived — on high-latency links the long-lived connection
-/// often drops mid-read, producing the "error decoding response body" failure
-/// reported in #3544.
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<ResponsesTurnResult> {
     let mut body = String::new();
     let mut pending_utf8 = Vec::new();
@@ -1175,6 +1240,11 @@ impl OpenAiCodexModelProvider {
             Err(err) => return Err(err),
         };
 
+        // Distinguish "no credentials at all" from "credentials present but
+        // unusable" (expired / could not be refreshed) so the call-time error
+        // stops blaming a missing profile when the real fix is re-authentication.
+        let had_profile = profile.is_some();
+
         let account_id = profile.and_then(|p| p.account_id).or_else(|| {
             oauth_access_token
                 .as_deref()
@@ -1185,16 +1255,35 @@ impl OpenAiCodexModelProvider {
             oauth_access_token
         } else {
             Some(oauth_access_token.ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"missing": "oauth_access_token"})),
-                    "openai_codex: auth profile not found"
-                );
-                anyhow::Error::msg(
-                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.",
-                )
+                if had_profile {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "missing": "oauth_access_token",
+                                "had_profile": true,
+                            })),
+                        "openai_codex: auth profile present but no usable access token"
+                    );
+                    anyhow::Error::msg(
+                        "OpenAI Codex credentials are present but expired or could not be refreshed. Re-run `zeroclaw auth login --model-provider openai-codex` to sign in again.",
+                    )
+                } else {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "missing": "oauth_access_token",
+                                "had_profile": false,
+                            })),
+                        "openai_codex: no auth profile found"
+                    );
+                    anyhow::Error::msg(
+                        "No OpenAI Codex credentials found. Run `zeroclaw auth login --model-provider openai-codex` to sign in.",
+                    )
+                }
             })?)
         };
 
@@ -1210,7 +1299,7 @@ impl OpenAiCodexModelProvider {
                     "openai_codex: account_id not found in profile/token"
                 );
                 anyhow::Error::msg(
-                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again.",
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --model-provider openai-codex` again.",
                 )
             })?)
         };
@@ -1238,7 +1327,7 @@ impl OpenAiCodexModelProvider {
         request: &ResponsesRequest,
     ) -> reqwest::RequestBuilder {
         let mut request_builder = self
-            .client
+            .http_client()
             .post(&self.responses_url)
             .header("Authorization", format!("Bearer {bearer_token}"))
             .header("OpenAI-Beta", "responses=experimental")
@@ -1276,7 +1365,7 @@ impl OpenAiCodexModelProvider {
         let normalized_model = normalize_model_id(model);
 
         let tools_count = tools.as_ref().map_or(0, Vec::len);
-        let has_tools = tools.is_some();
+        let has_tools = has_turn_tools(tools.as_ref());
         let mut request = ResponsesRequest {
             model: normalized_model.to_string(),
             input,
@@ -1421,9 +1510,10 @@ impl ModelProvider for OpenAiCodexModelProvider {
         }
         messages.push(ChatMessage::user(message));
 
-        // Normalize images: convert file paths to data URIs
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
+        // Normalize images: convert file paths to data URIs, under the
+        // configured policy rather than defaults.
+        let prepared =
+            crate::multimodal::prepare_messages_for_provider(&messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, None, model)
@@ -1437,9 +1527,10 @@ impl ModelProvider for OpenAiCodexModelProvider {
         model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        // Normalize image markers: convert file paths to data URIs
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
-        let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
+        // Normalize image markers: convert file paths to data URIs, under the
+        // configured policy rather than defaults.
+        let prepared =
+            crate::multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, None, model)
@@ -1453,9 +1544,9 @@ impl ModelProvider for OpenAiCodexModelProvider {
         model: &str,
         _temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
         let prepared =
-            crate::multimodal::prepare_messages_for_provider(request.messages, &config).await?;
+            crate::multimodal::prepare_messages_for_provider(request.messages, &self.multimodal)
+                .await?;
         let (instructions, input) = build_responses_input(&prepared.messages);
         let response = self
             .send_responses_request(input, instructions, convert_tools(request.tools), model)
@@ -1464,7 +1555,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
         Ok(ProviderChatResponse {
             text: response.text,
             tool_calls: response.tool_calls,
-            usage: None,
+            usage: response.usage,
             reasoning_content: response.reasoning_content,
         })
     }
@@ -1496,17 +1587,20 @@ impl ModelProvider for OpenAiCodexModelProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            let config = zeroclaw_config::schema::MultimodalConfig::default();
-            let prepared =
-                match crate::multimodal::prepare_messages_for_provider(&messages, &config).await {
-                    Ok(prepared) => prepared,
-                    Err(err) => {
-                        let _ = tx
-                            .send(Err(StreamError::ModelProvider(err.to_string())))
-                            .await;
-                        return;
-                    }
-                };
+            let prepared = match crate::multimodal::prepare_messages_for_provider(
+                &messages,
+                &provider.multimodal,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::ModelProvider(err.to_string())))
+                        .await;
+                    return;
+                }
+            };
 
             let creds = match provider.resolve_credentials().await {
                 Ok(c) => c,
@@ -1522,7 +1616,7 @@ impl ModelProvider for OpenAiCodexModelProvider {
             let normalized_model = normalize_model_id(&model);
             let tools = convert_tools(tools.as_deref());
             let tools_count = tools.as_ref().map_or(0, Vec::len);
-            let has_tools = tools.is_some();
+            let has_tools = has_turn_tools(tools.as_ref());
             let request = ResponsesRequest {
                 model: normalized_model.to_string(),
                 input,
@@ -1572,7 +1666,13 @@ impl ModelProvider for OpenAiCodexModelProvider {
                 )
                 .json(&request);
 
-            crate::openai::run_responses_sse(request_builder, &tx, count_tokens).await;
+            crate::openai::run_responses_sse(
+                request_builder,
+                &tx,
+                count_tokens,
+                crate::StreamIdleBound::Fixed(crate::STREAM_IDLE_TIMEOUT),
+            )
+            .await;
         });
 
         let guard = AbortOnDrop::new(handle.abort_handle());
@@ -1613,6 +1713,7 @@ mod tests {
         std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         tokio::task::JoinHandle<()>,
         tempfile::TempDir,
+        crate::RuntimeProxyTestGuard,
     ) {
         use axum::http::header;
         use axum::response::IntoResponse;
@@ -1621,6 +1722,7 @@ mod tests {
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
 
+        let proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
         let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_clone = Arc::clone(&captured);
         let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
@@ -1671,7 +1773,147 @@ mod tests {
         };
         let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
 
-        (provider, captured, server_handle, temp_dir)
+        (provider, captured, server_handle, temp_dir, proxy_guard)
+    }
+
+    #[test]
+    fn provider_construction_carries_operator_multimodal_policy() {
+        let multimodal = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 2,
+            ..Default::default()
+        };
+
+        let options = ModelProviderRuntimeOptions {
+            multimodal,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, None).unwrap();
+
+        // Every `prepare_messages_for_provider` call in this adapter uses this
+        // field; defaults would drop the operator's image limits.
+        assert_eq!(provider.multimodal.max_images, 1);
+        assert_eq!(provider.multimodal.max_image_size_mb, 2);
+    }
+
+    #[tokio::test]
+    async fn codex_responses_provider_honors_runtime_proxy_after_construction() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
+
+        async fn proxy_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "proxied",
+                "output": []
+            }))
+        }
+
+        async fn direct_response(State(hits): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+            hits.fetch_add(1, Ordering::SeqCst);
+            Json(serde_json::json!({
+                "output_text": "direct",
+                "output": []
+            }))
+        }
+
+        let _proxy_guard = crate::RuntimeProxyTestGuard::acquire().await;
+
+        let proxy_hits = Arc::new(AtomicUsize::new(0));
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_app = Router::new()
+            .fallback(proxy_response)
+            .with_state(Arc::clone(&proxy_hits));
+        let proxy_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(proxy_listener, proxy_app).await.unwrap();
+        });
+
+        let direct_hits = Arc::new(AtomicUsize::new(0));
+        let direct_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_addr = direct_listener.local_addr().unwrap();
+        let direct_app = Router::new()
+            .route("/responses", post(direct_response))
+            .with_state(Arc::clone(&direct_hits));
+        let direct_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(direct_listener, direct_app).await.unwrap();
+        });
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let options = ModelProviderRuntimeOptions {
+            provider_api_url: Some(format!("http://{direct_addr}")),
+            zeroclaw_dir: Some(temp_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..ModelProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
+
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some(format!("http://{proxy_addr}")),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.openai".to_string()],
+            ..Default::default()
+        });
+
+        let request = ResponsesRequest {
+            model: "gpt-5".to_string(),
+            input: vec![serde_json::json!({
+                "role": "user",
+                "content": "hello"
+            })],
+            instructions: DEFAULT_CODEX_INSTRUCTIONS.to_string(),
+            store: false,
+            stream: true,
+            text: ResponsesTextOptions {
+                verbosity: "medium".to_string(),
+            },
+            reasoning: ResponsesReasoningOptions {
+                effort: "medium".to_string(),
+                summary: "auto".to_string(),
+            },
+            include: vec!["reasoning.encrypted_content".to_string()],
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+        };
+        let request_builder =
+            provider.responses_request_builder("test-key", None, None, true, &request);
+        set_runtime_proxy_config(ProxyConfig::default());
+
+        let response_body: serde_json::Value = request_builder
+            .json(&request)
+            .send()
+            .await
+            .expect("codex Responses request should succeed through runtime proxy")
+            .json()
+            .await
+            .expect("proxy should return a Responses-shaped JSON body");
+
+        proxy_server.abort();
+        direct_server.abort();
+
+        assert_eq!(
+            response_body
+                .get("output_text")
+                .and_then(serde_json::Value::as_str),
+            Some("proxied")
+        );
+        assert_eq!(
+            proxy_hits.load(Ordering::SeqCst),
+            1,
+            "runtime proxy server should receive the Codex Responses request"
+        );
+        assert_eq!(
+            direct_hits.load(Ordering::SeqCst),
+            0,
+            "direct Codex Responses endpoint must not be contacted when runtime proxy applies"
+        );
     }
 
     #[test]
@@ -1679,6 +1921,7 @@ mod tests {
         let response = ResponsesResponse {
             output: vec![],
             output_text: Some("hello".into()),
+            usage: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("hello"));
     }
@@ -1697,8 +1940,206 @@ mod tests {
                 ]
             })],
             output_text: None,
+            usage: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
+    }
+
+    #[test]
+    fn parses_responses_usage_without_synthesizing_missing_fields() {
+        let usage = parse_responses_usage(Some(&serde_json::json!({
+            "input_tokens": 120,
+            "input_tokens_details": {"cached_tokens": 45},
+            "output_tokens": 30
+        })))
+        .expect("valid usage should be reported");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.cached_input_tokens, Some(45));
+        assert_eq!(usage.output_tokens, Some(30));
+
+        let partial = parse_responses_usage(Some(&serde_json::json!({
+            "input_tokens": "not-a-number",
+            "output_tokens": 7,
+            "input_tokens_details": {"cached_tokens": null}
+        })))
+        .expect("a valid optional field should survive malformed siblings");
+        assert_eq!(partial.input_tokens, None);
+        assert_eq!(partial.cached_input_tokens, None);
+        assert_eq!(partial.output_tokens, Some(7));
+        assert!(parse_responses_usage(None).is_none());
+        assert!(parse_responses_usage(Some(&serde_json::json!({}))).is_none());
+    }
+
+    #[test]
+    fn completed_stream_event_emits_authoritative_usage() {
+        let mut state = ResponsesStreamState::default();
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"done\",\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":45},\"output_tokens\":30}}}",
+            &mut state,
+        )
+        .expect("completed event should parse");
+
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Usage(TokenUsage {
+                input_tokens: Some(120),
+                cached_input_tokens: Some(45),
+                cache_creation_input_tokens: None,
+                output_tokens: Some(30),
+            })]
+        ));
+        assert_eq!(
+            state.usage.as_ref().and_then(|usage| usage.input_tokens),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn completed_stream_event_omits_usage_when_provider_does_not_report_it() {
+        let mut state = ResponsesStreamState::default();
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"done\"}}",
+            &mut state,
+        )
+        .expect("completed event should parse");
+
+        assert!(events.is_empty());
+        assert!(state.usage.is_none());
+    }
+
+    #[test]
+    fn completed_stream_event_orders_fallback_tool_call_before_usage() {
+        let mut state = ResponsesStreamState::default();
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{}\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}",
+            &mut state,
+        )
+        .expect("completed event should parse");
+
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::ToolCall(_), StreamEvent::Usage(_)]
+        ));
+    }
+
+    #[test]
+    fn done_alias_does_not_emit_usage() {
+        let mut state = ResponsesStreamState::default();
+        let events = process_sse_chunk(
+            "data: {\"type\":\"response.done\",\"response\":{\"output_text\":\"done\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}",
+            &mut state,
+        )
+        .expect("done alias should parse");
+
+        assert!(events.is_empty());
+        assert!(state.usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn chat_propagates_non_streaming_responses_usage() {
+        let (provider, _captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
+                "output_text": "ok",
+                "output": [],
+                "usage": {
+                    "input_tokens": 120,
+                    "input_tokens_details": {"cached_tokens": 45},
+                    "output_tokens": 30
+                }
+            }))])
+            .await;
+        let messages = vec![ChatMessage::user("hello")];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect("chat should succeed");
+
+        let usage = response
+            .usage
+            .expect("provider-reported usage should propagate");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.cached_input_tokens, Some(45));
+        assert_eq!(usage.output_tokens, Some(30));
+        server_handle.abort();
+    }
+
+    #[test]
+    fn has_turn_tools_returns_false_for_empty_and_none() {
+        // Pure unit test on the gate helper, complementing the end-to-end
+        // `chat()`-based regression below. Asserts the four boundary
+        // cases of the `is_some_and(!is_empty())` invariant.
+        assert!(!has_turn_tools(None));
+        assert!(!has_turn_tools(Some(&vec![])));
+        assert!(has_turn_tools(Some(&vec![make_test_tool_spec("echo")])));
+        // A non-empty list still passes even when all entries are
+        // syntactically distinct from each other; the helper does not
+        // dedupe.
+        let two = vec![make_test_tool_spec("a"), make_test_tool_spec("b")];
+        assert!(has_turn_tools(Some(&two)));
+    }
+
+    fn make_test_tool_spec(name: &str) -> ResponsesToolSpec {
+        ResponsesToolSpec {
+            kind: "function".to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}).into(),
+            strict: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_with_empty_tools_list_omits_tool_choice_and_parallel_tool_calls() {
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![MockCodexReply::Json(serde_json::json!({
+                "output_text": "ok",
+                "output": []
+            }))])
+            .await;
+
+        let messages = vec![ChatMessage::user("hello")];
+        let empty_tools: Vec<zeroclaw_api::tool::ToolSpec> = vec![];
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&empty_tools),
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect("chat() should succeed with an empty tool list");
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1, "expected exactly one captured request");
+        let body = &requests[0];
+        assert!(
+            body.get("tool_choice").is_none(),
+            "empty tools list must produce a request body without `tool_choice`; got: {body}"
+        );
+        assert!(
+            body.get("parallel_tool_calls").is_none(),
+            "empty tools list must produce a request body without `parallel_tool_calls`; got: {body}"
+        );
+        // Sanity: a non-empty tool list still produces both fields.
+        assert!(
+            body.get("tools").is_none() || body["tools"].as_array().is_none_or(|a| a.is_empty()),
+            "empty input list should produce a no-tools request; got: {body}"
+        );
+
+        server_handle.abort();
     }
 
     #[test]
@@ -1761,14 +2202,15 @@ mod tests {
 
     #[tokio::test]
     async fn codex_retries_non_streaming_when_stream_decode_fails() {
-        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
-            MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
-            MockCodexReply::Json(serde_json::json!({
-                "output_text": "fallback ok",
-                "output": []
-            })),
-        ])
-        .await;
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+            mock_codex_provider(vec![
+                MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
+                MockCodexReply::Json(serde_json::json!({
+                    "output_text": "fallback ok",
+                    "output": []
+                })),
+            ])
+            .await;
 
         let messages = vec![ChatMessage::user("hello")];
         let response = provider
@@ -1796,7 +2238,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_retries_non_streaming_when_stream_contains_malformed_frame_after_text() {
-        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
             MockCodexReply::Sse(
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\ndata: not-json\n\ndata: [DONE]\n",
             ),
@@ -1833,7 +2275,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_does_not_retry_stream_api_error_events() {
-        let (provider, captured, server_handle, _temp_dir) = mock_codex_provider(vec![
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
             MockCodexReply::Sse(
                 "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"quota exceeded\"}}}\n\ndata: [DONE]\n",
             ),
@@ -1866,7 +2308,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_does_not_retry_failed_http_status() {
-        let (provider, captured, server_handle, _temp_dir) =
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![MockCodexReply::Status(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "server down",
@@ -1963,6 +2405,35 @@ data: [DONE]
             parse_sse_turn(payload).unwrap().text.as_deref(),
             Some("Hello world")
         );
+    }
+
+    #[test]
+    fn process_sse_chunk_marks_completion_on_response_completed() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"hi\"}}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_marks_completion_on_done_sentinel() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk("data: [DONE]", &mut state).unwrap();
+        assert!(state.saw_completion);
+    }
+
+    #[test]
+    fn process_sse_chunk_leaves_completion_unset_on_text_delta() {
+        let mut state = ResponsesStreamState::default();
+        let _ = process_sse_chunk(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}",
+            &mut state,
+        )
+        .unwrap();
+        assert!(!state.saw_completion);
     }
 
     #[test]
@@ -2268,10 +2739,10 @@ data: [DONE]
 
     #[test]
     fn convert_tools_opts_out_of_responses_strict_mode() {
-        let tools = vec![ToolSpec {
-            name: "jira".to_string(),
-            description: "Interact with Jira".to_string(),
-            parameters: serde_json::json!({
+        let tools = vec![ToolSpec::new(
+            "jira",
+            "Interact with Jira",
+            serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": { "type": "string" },
@@ -2279,7 +2750,7 @@ data: [DONE]
                 },
                 "required": ["action"]
             }),
-        }];
+        )];
 
         let converted = convert_tools(Some(&tools)).expect("tool should convert");
         let value = serde_json::to_value(&converted[0]).expect("tool should serialize");
@@ -2380,5 +2851,38 @@ data: [DONE]
 
         assert!(provider.supports_streaming());
         assert!(provider.supports_streaming_tool_events());
+    }
+
+    #[test]
+    fn build_function_call_item_sanitizes_invalid_arguments_to_empty_object() {
+        // Pins that the openai_codex call site of `sanitize_tool_arguments`
+        // is wired in. The helper contract itself is covered in
+        // `compatible::tests::sanitize_tool_arguments_*`.
+        let call = ProviderToolCall {
+            id: "call_bad".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"rm -rf"#.to_string(),
+            extra_content: None,
+        };
+
+        let item = build_function_call_item(call);
+        assert_eq!(item["type"], "function_call");
+        assert_eq!(item["call_id"], "call_bad");
+        assert_eq!(item["name"], "shell");
+        assert_eq!(item["arguments"], "{}");
+    }
+
+    #[test]
+    fn build_function_call_item_passes_through_valid_arguments() {
+        // Companion regression: valid JSON must round-trip byte-for-byte.
+        let call = ProviderToolCall {
+            id: "call_ok".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+            extra_content: None,
+        };
+
+        let item = build_function_call_item(call);
+        assert_eq!(item["arguments"], r#"{"command":"pwd"}"#);
     }
 }

@@ -1,21 +1,7 @@
 //! Thinking/Reasoning Level Control
-//!
-//! Allows users to control how deeply the model reasons per message,
-//! trading speed for depth. Levels range from `Off` (fastest, most concise)
-//! to `Max` (deepest reasoning, slowest).
-//!
-//! Users can set the level via:
-//! - Inline directive: `/think:high` at the start of a message
-//! - Agent config: `[agent.thinking]` section with `default_level`
-//!
-//! Resolution hierarchy (highest priority first):
-//! 1. Inline directive (`/think:<level>`)
-//! 2. Session override (reserved for future use)
-//! 3. Agent config (`agent.thinking.default_level`)
-//! 4. Global default (`Medium`)
 
 // Re-exported from zeroclaw-config.
-pub use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
+pub use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingDisplayMode, ThinkingLevel};
 
 /// Parameters derived from a thinking level, applied to the LLM request.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,11 +17,6 @@ pub struct ThinkingParams {
     pub native_thinking: Option<zeroclaw_config::scattered_types::NativeThinkingParams>,
 }
 
-/// Parse a `/think:<level>` directive from the start of a message.
-///
-/// Returns `Some((level, remaining_message))` if a directive is found,
-/// or `None` if no directive is present. The remaining message has
-/// leading whitespace after the directive trimmed.
 pub fn parse_thinking_directive(message: &str) -> Option<(ThinkingLevel, String)> {
     let trimmed = message.trim_start();
     if !trimmed.starts_with("/think:") {
@@ -53,6 +34,13 @@ pub fn parse_thinking_directive(message: &str) -> Option<(ThinkingLevel, String)
 
     let remaining = after_prefix[level_end..].trim_start().to_string();
     Some((level, remaining))
+}
+
+pub fn strip_thinking_directive(message: &str) -> std::borrow::Cow<'_, str> {
+    match parse_thinking_directive(message) {
+        Some((_, remaining)) => std::borrow::Cow::Owned(remaining),
+        None => std::borrow::Cow::Borrowed(message),
+    }
 }
 
 /// Convert a `ThinkingLevel` into concrete parameters for the LLM request.
@@ -142,16 +130,12 @@ pub fn apply_thinking_level_with_config(
         }
         params.native_thinking = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
             budget_tokens: clamped,
+            display: config.display.to_display(),
         });
     }
     params
 }
 
-/// Resolve the effective thinking level using the priority hierarchy:
-/// 1. Inline directive (if present)
-/// 2. Session override (reserved, currently always `None`)
-/// 3. Agent config default
-/// 4. Global default (`Medium`)
 pub fn resolve_thinking_level(
     inline_directive: Option<ThinkingLevel>,
     session_override: Option<ThinkingLevel>,
@@ -334,6 +318,69 @@ mod tests {
         assert!(parse_thinking_directive("Hello /think:high world").is_none());
     }
 
+    // ── strip_thinking_directive ──────────────────────────────────
+
+    #[test]
+    fn strip_directive_returns_remainder_when_directive_present() {
+        assert_eq!(
+            strip_thinking_directive("/think:high What is Rust?"),
+            "What is Rust?"
+        );
+        assert_eq!(strip_thinking_directive("/think:off"), "");
+        assert_eq!(strip_thinking_directive("  /think:low  body"), "body");
+    }
+
+    #[test]
+    fn strip_directive_is_noop_when_directive_absent() {
+        // Borrows the input slice (Cow::Borrowed) to avoid cloning when no
+        // directive is present — callers in the per-turn tool-filter path
+        // care about this because they forward the result straight to
+        // `compute_excluded_mcp_tools` which only reads it.
+        let input = "Hello /think:high world";
+        let out = strip_thinking_directive(input);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), "Hello /think:high world");
+    }
+
+    #[test]
+    fn strip_directive_preserves_invalid_level_input_unchanged() {
+        assert_eq!(
+            strip_thinking_directive("/think:turbo search"),
+            "/think:turbo search"
+        );
+    }
+
+    #[test]
+    fn strip_directive_yields_same_tool_filter_signal_as_stripped_caller() {
+        // Operator configured keyword "high" in a dynamic tool_filter_group.
+        let raw = "/think:high please look up data";
+        let stripped = strip_thinking_directive(raw).into_owned();
+
+        let msg_lower_raw = raw.to_ascii_lowercase();
+        let msg_lower_stripped = stripped.to_ascii_lowercase();
+        let raw_matches = msg_lower_raw.contains("high");
+        let stripped_matches = msg_lower_stripped.contains("high");
+        assert!(
+            raw_matches,
+            "raw message contains the keyword (the bug case)"
+        );
+        assert!(
+            !stripped_matches,
+            "stripped message no longer contains the keyword"
+        );
+
+        // The fix: prompt-construction callers must pass the stripped
+        // message so both sides agree on the keyword presence.
+        let prompt_filter_view = strip_thinking_directive(raw);
+        let request_filter_view = stripped.as_str();
+        assert_eq!(
+            prompt_filter_view.as_ref(),
+            request_filter_view,
+            "prompt-side and request-side filter inputs must be identical after the fix",
+        );
+        assert!(!prompt_filter_view.to_ascii_lowercase().contains("high"));
+    }
+
     // ── Level application ────────────────────────────────────────
 
     #[test]
@@ -448,6 +495,7 @@ mod tests {
             default_level: ThinkingLevel::High,
             native_thinking: true,
             budget_tokens: overrides,
+            ..ThinkingConfig::default()
         };
         let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
         let native = params
@@ -465,12 +513,43 @@ mod tests {
             default_level: ThinkingLevel::High,
             native_thinking: true,
             budget_tokens: overrides,
+            ..ThinkingConfig::default()
         };
         let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
         let native = params
             .native_thinking
             .expect("native thinking should be set");
         assert_eq!(native.budget_tokens, 8_000);
+    }
+
+    #[test]
+    fn display_mode_propagates_into_native_params() {
+        use zeroclaw_api::model_provider::ThinkingDisplay;
+        use zeroclaw_config::scattered_types::ThinkingDisplayMode;
+
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::High,
+            native_thinking: true,
+            display: ThinkingDisplayMode::Updates,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        let native = params
+            .native_thinking
+            .expect("native thinking should be set");
+        assert_eq!(native.display, Some(ThinkingDisplay::Updates));
+
+        // Default config (`display: off`) must leave the wire field unset.
+        let config = ThinkingConfig {
+            default_level: ThinkingLevel::High,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
+        let native = params
+            .native_thinking
+            .expect("native thinking should be set");
+        assert_eq!(native.display, None);
     }
 
     #[test]
@@ -483,6 +562,7 @@ mod tests {
             default_level: ThinkingLevel::High,
             native_thinking: true,
             budget_tokens: overrides,
+            ..ThinkingConfig::default()
         };
         let params = apply_thinking_level_with_config(ThinkingLevel::High, &config);
         let native = params
@@ -497,7 +577,28 @@ mod tests {
     fn thinking_config_deserializes_from_toml() {
         let toml_str = r#"default_level = "high""#;
         let config: ThinkingConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.display, ThinkingDisplayMode::Off);
+
+        let toml_str = r#"
+default_level = "high"
+native_thinking = true
+display = "updates"
+"#;
+        let config: ThinkingConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.default_level, ThinkingLevel::High);
+        assert!(config.native_thinking);
+        assert_eq!(config.display, ThinkingDisplayMode::Updates);
+        assert_eq!(
+            config.display.to_display(),
+            Some(zeroclaw_api::model_provider::ThinkingDisplay::Updates)
+        );
+
+        // Round-trip: serialization keeps the knob settable again.
+        let serialized = toml::to_string(&config).expect("ThinkingConfig must serialize");
+        let reparsed: ThinkingConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.display, ThinkingDisplayMode::Updates);
+        assert_eq!(reparsed.default_level, ThinkingLevel::High);
+        assert!(reparsed.native_thinking);
     }
 
     #[test]
@@ -514,18 +615,12 @@ mod tests {
         assert_eq!(json, "\"high\"");
     }
 
-    /// Regression test for the wiring fix in PR #5652: when
-    /// `NATIVE_THINKING_OVERRIDE.scope(params, fut)` is installed by the
-    /// dispatch sites in `loop_.rs`, the inner `try_with(Clone::clone)`
-    /// read-back used by `consume_provider_streaming_response` must
-    /// recover the same params. Without this, `agent.thinking.native_thinking
-    /// = true` is a no-op even though `apply_thinking_level_with_config`
-    /// populates the params correctly.
     #[tokio::test]
     async fn native_thinking_override_round_trips_through_scope() {
         use zeroclaw_config::scattered_types::NativeThinkingParams;
         let installed = Some(NativeThinkingParams {
             budget_tokens: 32_000,
+            display: None,
         });
         let read_back = zeroclaw_api::NATIVE_THINKING_OVERRIDE
             .scope(installed, async {
@@ -541,11 +636,6 @@ mod tests {
         );
     }
 
-    /// Regression test: outside any `NATIVE_THINKING_OVERRIDE.scope(...)`,
-    /// the read-back must produce `None` (not panic, not a stale value
-    /// from a previous task). This is the original fallback path —
-    /// `agent.thinking.native_thinking = false` users keep prompt-based
-    /// reasoning with no provider-side `thinking` block.
     #[tokio::test]
     async fn native_thinking_override_returns_none_outside_scope() {
         let read_back = async {
@@ -561,13 +651,6 @@ mod tests {
         );
     }
 
-    /// Regression test: `validate_thinking_config` is called once at agent
-    /// initialization (from `loop_::run` and `loop_::process_message`) so a
-    /// typo such as an unknown `agent.thinking.budget_tokens.foo` key warns
-    /// once at startup instead of being silently ignored. The function must
-    /// accept arbitrary configs without panicking — including unknown keys,
-    /// empty configs, and configs with all valid keys — since it runs in
-    /// the request-processing hot path's startup section.
     #[test]
     fn validate_thinking_config_accepts_arbitrary_inputs_without_panicking() {
         let mut cfg_with_unknown_key = ThinkingConfig::default();

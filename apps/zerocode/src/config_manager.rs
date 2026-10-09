@@ -11,25 +11,64 @@ use crossterm::{
         PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
+    style::Print,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
-    backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
     style::Modifier,
     text::{Line, Span},
     widgets::{List, ListItem, ListState, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::client::{ConfigSectionEntry, ConfigTemplateEntry, RpcClient};
+use crate::terminal_backend::WideCellCleanupBackend;
 use crate::theme;
 
-pub(crate) type Term = Terminal<CrosstermBackend<Stdout>>;
+pub(crate) type Term = Terminal<WideCellCleanupBackend<Stdout>>;
 
 fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         | KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+}
+
+/// Ask terminals implementing XTSHIFTESCAPE to report Shift-modified mouse
+/// events to the application instead of reserving Shift for local selection.
+pub(crate) fn mouse_shift_capture_sequence(capture: bool) -> &'static str {
+    if capture { "\x1b[>1s" } else { "\x1b[>0s" }
+}
+
+fn type_template_label(template: &ConfigTemplateEntry) -> String {
+    template
+        .path
+        .rsplit('.')
+        .next()
+        .unwrap_or(&template.path)
+        .to_string()
+}
+
+fn is_direct_child_path(path: &str, prefix: &str) -> bool {
+    path.strip_prefix(prefix)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .is_some_and(|relative| !relative.is_empty() && !relative.contains('.'))
+}
+
+fn model_field_catalog_reference(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split('.').collect();
+    match segments.as_slice() {
+        ["providers", "models", family, alias, "model"]
+            if !family.is_empty() && !alias.is_empty() =>
+        {
+            Some(format!("{family}.{alias}"))
+        }
+        _ => None,
+    }
+}
+
+fn retain_direct_children(fields: &mut Vec<ConfigFieldEntry>, prefix: &str) {
+    fields.retain(|field| is_direct_child_path(&field.path, prefix));
 }
 
 pub(crate) fn init_terminal() -> Result<Term> {
@@ -39,23 +78,23 @@ pub(crate) fn init_terminal() -> Result<Term> {
         stdout,
         EnterAlternateScreen,
         EnableMouseCapture,
+        Print(mouse_shift_capture_sequence(true)),
         EnableBracketedPaste,
     )?;
-    // Keyboard progressive enhancement (Kitty protocol) is optional — it
-    // enables key-release/repeat reporting on capable terminals. Legacy
-    // Windows consoles (conhost) don't support it and return an error; treat
-    // it as best-effort so an unsupported console degrades gracefully instead
-    // of aborting startup.
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
             PushKeyboardEnhancementFlags(keyboard_enhancement_flags())
         );
     }
-    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+    Ok(Terminal::new(WideCellCleanupBackend::new(stdout))?)
 }
 
 pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
+    // Terminal status is not screen content: leaving the alternate screen does
+    // not clear it, so hand it back explicitly. First, because every step below
+    // can fail and return, and a tab left reading as busy outlives the process.
+    crate::osc_status::release();
     disable_raw_mode()?;
     // Pop the enhancement flags best-effort — if they were never pushed (or the
     // terminal doesn't support them), popping is a harmless no-op we ignore.
@@ -63,6 +102,7 @@ pub(crate) fn restore_terminal(term: &mut Term) -> Result<()> {
     execute!(
         term.backend_mut(),
         DisableBracketedPaste,
+        Print(mouse_shift_capture_sequence(false)),
         DisableMouseCapture,
         LeaveAlternateScreen
     )?;
@@ -149,7 +189,6 @@ impl ConfigSection {
 }
 
 // ── Keymap-derived chord glyphs (footers + help) ─────────────────
-//
 // Footer hints and the help overlay must show the live, possibly-overridden
 // chord for each action — never a hardcoded glyph.
 
@@ -183,6 +222,123 @@ fn editor_key(action: crate::keymap::ConfigEditorAction) -> String {
         .unwrap_or_default()
 }
 
+fn scalar_validation_status_key(kind: PropKind, value: &str) -> Option<&'static str> {
+    match kind {
+        PropKind::Integer => value
+            .parse::<i64>()
+            .err()
+            .map(|_| "zc-config-status-invalid-integer"),
+        PropKind::Float => value
+            .parse::<f64>()
+            .err()
+            .map(|_| "zc-config-status-invalid-float"),
+        _ => None,
+    }
+}
+
+fn scalar_validation_status(kind: PropKind, value: &str, prop: &str) -> Option<String> {
+    scalar_validation_status_key(kind, value).map(|key| crate::i18n::t_args(key, &[("prop", prop)]))
+}
+
+fn config_i18n_key(kind: &str, stable_key: &str, suffix: Option<&str>) -> String {
+    let normalized = stable_key.replace(['.', '_'], "-");
+    match suffix {
+        Some(suffix) => format!("zc-config-{kind}-{normalized}-{suffix}"),
+        None => format!("zc-config-{kind}-{normalized}"),
+    }
+}
+
+fn translated_config_value(
+    key: String,
+    fallback: &str,
+    translate: &impl Fn(&str) -> Option<String>,
+) -> String {
+    translate(&key).unwrap_or_else(|| fallback.to_string())
+}
+
+const LEGACY_GROUPS: &[(&str, &str)] = &[
+    ("Foundation", "foundation"),
+    ("Agent", "agent"),
+    ("Multi-agent", "multi_agent"),
+    ("Tools", "tools"),
+    ("Integrations", "integrations"),
+    ("Network", "network"),
+    ("Storage", "storage"),
+    ("Operations", "operations"),
+    ("Other", "other"),
+];
+
+fn legacy_group_key(label: &str) -> Option<&'static str> {
+    LEGACY_GROUPS
+        .iter()
+        .find_map(|(legacy, key)| (*legacy == label).then_some(*key))
+}
+
+fn section_group_key(section: &ConfigSectionEntry) -> Option<&str> {
+    if section.group_key.is_empty() {
+        legacy_group_key(&section.group)
+    } else {
+        Some(&section.group_key)
+    }
+}
+
+fn localized_group_label(
+    section: &ConfigSectionEntry,
+    translate: &impl Fn(&str) -> Option<String>,
+) -> String {
+    let fallback = if section.group.is_empty() {
+        "Other"
+    } else {
+        &section.group
+    };
+    section_group_key(section).map_or_else(
+        || fallback.to_string(),
+        |key| translated_config_value(config_i18n_key("group", key, None), fallback, translate),
+    )
+}
+
+fn localized_section_label(
+    section: &ConfigSectionEntry,
+    translate: &impl Fn(&str) -> Option<String>,
+) -> String {
+    translated_config_value(
+        config_i18n_key("section", &section.key, Some("label")),
+        &section.label,
+        translate,
+    )
+}
+
+fn localized_section_help(
+    section: &ConfigSectionEntry,
+    translate: &impl Fn(&str) -> Option<String>,
+) -> String {
+    translated_config_value(
+        config_i18n_key("section", &section.key, Some("help")),
+        &section.help,
+        translate,
+    )
+}
+
+fn localize_section_metadata_with(
+    section: &mut ConfigSectionEntry,
+    translate: &impl Fn(&str) -> Option<String>,
+) {
+    if section.group_key.is_empty()
+        && let Some(key) = legacy_group_key(&section.group)
+    {
+        section.group_key = key.to_string();
+    }
+    if !section.group.is_empty() || !section.group_key.is_empty() {
+        section.group = localized_group_label(section, translate);
+    }
+    section.label = localized_section_label(section, translate);
+    section.help = localized_section_help(section, translate);
+}
+
+fn localize_section_metadata(section: &mut ConfigSectionEntry) {
+    localize_section_metadata_with(section, &crate::i18n::try_t_locale);
+}
+
 /// Joined up/down display chords for list navigation footers.
 fn nav_keys() -> String {
     use crate::keymap::ConfigTabAction as A;
@@ -211,11 +367,6 @@ fn switch_tabs_keys() -> Vec<String> {
         .collect()
 }
 
-/// Display form of a config directory. Replaces the user's home prefix with
-/// "~" so a long path like "/home/alice/.zeroclaw" reads as
-/// "~/.zeroclaw" in the Config header. Falls back to the original path
-/// representation when the path is not under the current home directory or
-/// when the home directory cannot be resolved.
 fn shorten_home(path: &Path) -> String {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let Some(home) = home else {
@@ -278,6 +429,7 @@ pub(crate) struct App {
     field_cursor: usize,
     // Edit state
     edit_buf: String,
+    edit_cursor: usize,
     // Enum/bool select state
     select_cursor: usize,
     select_items: Vec<String>,
@@ -350,6 +502,7 @@ impl App {
             fields: Vec::new(),
             field_cursor: 0,
             edit_buf: String::new(),
+            edit_cursor: 0,
             select_cursor: 0,
             select_items: Vec::new(),
             status_msg: None,
@@ -386,54 +539,16 @@ impl App {
     /// Load initial data from the daemon. Call once before draw/handle_key.
     pub(crate) async fn init(&mut self) -> Result<()> {
         self.sections = self.rpc.config_sections().await?;
-        // Group the section list for display: stable sort by group rank
-        // keeps the canonical (dependency-correct) order within each
-        // group. Daemons that predate group plumbing send "" for every
-        // entry — all ranks tie, the sort is a no-op, and the pane
-        // renders the flat list exactly as before.
-        self.sections.sort_by_key(|s| Self::group_rank(&s.group));
+        for section in &mut self.sections {
+            localize_section_metadata(section);
+        }
+        self.sections.sort_by_key(Self::group_rank);
         self.templates = self.rpc.config_templates().await?;
         // Eagerly load the first section so the right pane previews content on
         // first paint, matching the zerocode Config tab.
         if !self.sections.is_empty() {
             self.load_section_content(self.section_cursor).await?;
         }
-        Ok(())
-    }
-
-    pub(crate) async fn open_agent_config(&mut self, alias: &str) -> Result<()> {
-        self.section = ConfigSection::Zeroclaw;
-        self.zeroclaw_pane = ZeroclawPane::Detail;
-        self.deactivate_filter();
-
-        let Some(section_idx) = self.sections.iter().position(|s| s.key == "agents") else {
-            return Ok(());
-        };
-
-        self.section_cursor = section_idx;
-        self.loaded_section = Some(section_idx);
-        self.load_aliases("agents").await?;
-
-        let Some(alias_idx) = self.aliases.iter().position(|a| a == alias) else {
-            self.alias_cursor = 0;
-            self.screen = Screen::AliasList {
-                section_idx,
-                map_path: "agents".to_string(),
-                breadcrumb: vec!["agents".to_string()],
-            };
-            self.status_msg = None;
-            return Ok(());
-        };
-
-        self.alias_cursor = alias_idx;
-        let prefix = format!("agents.{alias}");
-        self.load_fields(&prefix).await?;
-        self.screen = Screen::FieldList {
-            section_idx,
-            prefix,
-            breadcrumb: vec!["agents".to_string(), alias.to_string()],
-        };
-        self.status_msg = None;
         Ok(())
     }
 
@@ -458,9 +573,9 @@ impl App {
             return;
         }
 
-        // Unified bottom-left help indicator, matching the Dashboard/Logs panes.
+        // Unified bottom-left action hint, matching the Dashboard/Logs panes.
         frame.render_widget(
-            Paragraph::new(Span::styled(" ?=help", theme::dim_style())),
+            Paragraph::new(Span::styled(self.bottom_hint(), theme::dim_style())),
             chunks[2],
         );
 
@@ -522,27 +637,124 @@ impl App {
         }
     }
 
-    /// Highlight style + symbol for the right (detail) pane lists.
-    ///
-    /// Three visual states are intentionally separated so a *selected* field
-    /// in the field list is no longer mistaken for an *editable* input:
-    ///
-    /// 1. FieldList (selection) — the row is highlighted with the selection
-    ///    background but kept dim and un-bolded. The arrow gutter is a thin
-    ///    ">" instead of the bold "› " reserved for active editing.
-    /// 2. FieldEdit (active editing) — bold + bright foreground on the
-    ///    selection background with the "› " gutter, matching the rest of
-    ///    the editor's active surfaces.
-    /// 3. Other screens / section-list holds focus — dim "you are here"
-    ///    marker, identical to the previous behavior.
-    fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
-        match (&self.screen, self.zeroclaw_pane) {
-            (Screen::FieldEdit { .. }, _) => (theme::selected_style(), "\u{203a} "),
-            (Screen::FieldList { .. }, ZeroclawPane::Detail) => {
-                (theme::selected_inactive_style(), ">")
+    fn bottom_hint(&self) -> String {
+        use crate::keymap::{ConfigEditorAction as E, ConfigTabAction as T};
+
+        let default = || format!(" ?={}", crate::i18n::t("zc-config-footer-action-help"));
+
+        match &self.screen {
+            Screen::FieldList { .. } if self.zeroclaw_pane == ZeroclawPane::Detail => {
+                if self.filter.is_some() {
+                    let help = crate::i18n::t("zc-config-footer-action-help");
+                    format!(
+                        " {}  {}={}  {}={}  ?={}",
+                        nav_keys(),
+                        tab_key(T::Enter),
+                        crate::i18n::t("zc-config-footer-action-edit"),
+                        tab_key(T::Back),
+                        crate::i18n::t("zc-config-footer-action-clear-filter"),
+                        help,
+                    )
+                } else if self.is_composite_tab() {
+                    match self.tab_names.get(self.active_tab) {
+                        Some(ConfigTab::Personality) if self.personality_active_file.is_some() => {
+                            format!(
+                                " {}={}  {}={}",
+                                editor_key(E::Save),
+                                crate::i18n::t("zc-config-footer-action-save"),
+                                editor_key(E::Cancel),
+                                crate::i18n::t("zc-config-footer-action-back-to-files"),
+                            )
+                        }
+                        Some(ConfigTab::Skills) if self.skills_active.is_some() => {
+                            format!(
+                                " {}={}  {}={}",
+                                editor_key(E::Save),
+                                crate::i18n::t("zc-config-footer-action-save"),
+                                editor_key(E::Cancel),
+                                crate::i18n::t("zc-config-footer-action-back-to-skills"),
+                            )
+                        }
+                        _ => default(),
+                    }
+                } else {
+                    let help = crate::i18n::t("zc-config-footer-action-help");
+                    format!(
+                        " {}={}  {}={}  ?={}",
+                        tab_key(T::Enter),
+                        crate::i18n::t("zc-config-footer-action-edit"),
+                        tab_key(T::DeleteRow),
+                        crate::i18n::t("zc-config-footer-action-reset"),
+                        help,
+                    )
+                }
             }
-            _ => (theme::selected_inactive_style(), "  "),
+            Screen::AliasCreate { .. } => {
+                format!(
+                    " {}={}  {}={}",
+                    editor_key(E::Confirm),
+                    crate::i18n::t("zc-config-footer-action-create"),
+                    editor_key(E::Cancel),
+                    crate::i18n::t("zc-config-footer-action-cancel"),
+                )
+            }
+            Screen::FieldEdit { field_idx, .. } => {
+                if self.is_select_edit() {
+                    if self.filter.is_some() {
+                        let help = crate::i18n::t("zc-config-footer-action-help");
+                        format!(
+                            " {}  {}={}  {}={}  ?={}",
+                            nav_keys(),
+                            tab_key(T::Enter),
+                            crate::i18n::t("zc-config-footer-action-save"),
+                            tab_key(T::Back),
+                            crate::i18n::t("zc-config-footer-action-clear-filter"),
+                            help,
+                        )
+                    } else {
+                        format!(
+                            " {}={}  {}={}",
+                            tab_key(T::Enter),
+                            crate::i18n::t("zc-config-footer-action-save"),
+                            tab_key(T::Back),
+                            crate::i18n::t("zc-config-footer-action-cancel"),
+                        )
+                    }
+                } else if self.fields[*field_idx].kind == PropKind::StringArray {
+                    format!(
+                        " {}={}  {}={}  {}={}",
+                        editor_key(E::Confirm),
+                        crate::i18n::t("zc-config-footer-action-new-line"),
+                        editor_key(E::Save),
+                        crate::i18n::t("zc-config-footer-action-save"),
+                        editor_key(E::Cancel),
+                        crate::i18n::t("zc-config-footer-action-cancel"),
+                    )
+                } else {
+                    format!(
+                        " {}={}  {}={}",
+                        editor_key(E::Confirm),
+                        crate::i18n::t("zc-config-footer-action-save"),
+                        editor_key(E::Cancel),
+                        crate::i18n::t("zc-config-footer-action-cancel"),
+                    )
+                }
+            }
+            _ => default(),
         }
+    }
+
+    /// Highlight style + symbol for the right (detail) pane lists, mirroring
+    /// `zerocode_pane::ZerocodePane::detail_highlight`: the active selection
+    /// style and "› " gutter when the detail pane holds focus, the dim "you
+    /// are here" marker when focus has stepped back to the section list.
+    fn detail_highlight(&self) -> (ratatui::style::Style, &'static str) {
+        let focused = matches!(
+            (&self.screen, self.zeroclaw_pane),
+            (Screen::FieldEdit { .. }, _) | (_, ZeroclawPane::Detail)
+        );
+        let symbol = if focused { "\u{203a} " } else { "  " };
+        (theme::selection_highlight(focused, false), symbol)
     }
 
     fn draw_section_tab_bar(&self, frame: &mut Frame, area: Rect) {
@@ -585,19 +797,26 @@ impl App {
         // Tab / Shift+Tab cycle the outer Config section (zeroclaw ↔
         // zerocode) from anywhere — neither is bound inside the daemon
         // editor or the zerocode pane, so there is no shadowing.
-        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
-            self.cycle_section(1);
-            self.sync_zerocode_locales().await;
-            return Ok(false);
-        }
-        if key.code == KeyCode::BackTab {
-            self.cycle_section(-1);
-            self.sync_zerocode_locales().await;
-            return Ok(false);
+        if let Some(action) = crate::keymap::ConfigTabAction::from_chord(&key) {
+            use crate::keymap::ConfigTabAction;
+            if action == ConfigTabAction::SectionNext {
+                self.cycle_section(1);
+                self.sync_zerocode_locales().await;
+                return Ok(false);
+            }
+            if action == ConfigTabAction::SectionPrev {
+                self.cycle_section(-1);
+                self.sync_zerocode_locales().await;
+                return Ok(false);
+            }
         }
 
         if self.section == ConfigSection::Zerocode {
-            self.zerocode.handle_key(key);
+            if !self.zerocode.handle_key(key) {
+                // Left/Back at the zerocode section level was not consumed:
+                // cross back to the outer left (zeroclaw) pane.
+                self.cycle_section(-1);
+            }
             self.sync_zerocode_locales().await;
             return Ok(false);
         }
@@ -674,11 +893,6 @@ impl App {
             }
         }
 
-        // The zerocode pane owns its own mouse handling. Drain the locale
-        // sync afterward so a mouse-driven "Download locale file" (or a
-        // click into the Locale tab) triggers the lazy list/fetch RPC the
-        // same way the key path does — otherwise the request is queued and
-        // never sent, leaving the tab stuck on "loading locales…".
         if self.section == ConfigSection::Zerocode {
             self.zerocode.handle_mouse(mouse);
             self.sync_zerocode_locales().await;
@@ -724,11 +938,6 @@ impl App {
                     && mouse::in_rect(mouse.column, mouse.row, tab_rect)
                 {
                     let labels: Vec<&str> = self.tab_names.iter().map(|t| t.label()).collect();
-                    // Each rendered label is "▸ <label>" (active, +2 chars) or
-                    // "<label>" (inactive). For hit testing we use the plain
-                    // label width + 2 for the active tab's prefix. However
-                    // `tab_click_index` just walks fixed widths, so build
-                    // display labels matching what draw_field_list renders.
                     let display: Vec<String> = labels
                         .iter()
                         .enumerate()
@@ -845,12 +1054,8 @@ impl App {
                 let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
                 self.filtered_indices(&labels).len()
             }
-            Screen::TypeList { .. } => {
-                let names: Vec<String> = self
-                    .types
-                    .iter()
-                    .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-                    .collect();
+            Screen::TypeList { section_idx } => {
+                let names = self.type_list_labels(*section_idx);
                 self.filtered_indices(&names).len()
             }
             Screen::AliasList { .. } => {
@@ -951,15 +1156,11 @@ impl App {
                         .unwrap_or(0)
                 }
             }
-            Screen::TypeList { .. } => {
+            Screen::TypeList { section_idx } => {
                 if self.filter.is_some() {
                     self.filter_cursor
                 } else {
-                    let names: Vec<String> = self
-                        .types
-                        .iter()
-                        .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-                        .collect();
+                    let names = self.type_list_labels(*section_idx);
                     self.filtered_indices(&names)
                         .iter()
                         .position(|&i| i == self.type_cursor)
@@ -1024,12 +1225,8 @@ impl App {
                     self.section_cursor = orig;
                 }
             }
-            Screen::TypeList { .. } => {
-                let names: Vec<String> = self
-                    .types
-                    .iter()
-                    .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-                    .collect();
+            Screen::TypeList { section_idx } => {
+                let names = self.type_list_labels(*section_idx);
                 let visible = self.filtered_indices(&names);
                 if self.filter.is_some() {
                     self.filter_cursor = pos.min(visible.len().saturating_sub(1));
@@ -1096,6 +1293,20 @@ impl App {
         }
     }
 
+    fn selected_type_row(&self) -> Option<usize> {
+        let Screen::TypeList { section_idx } = &self.screen else {
+            return None;
+        };
+        let names = self.type_list_labels(*section_idx);
+        let visible = self.filtered_indices(&names);
+        let cursor = if self.filter.is_some() {
+            self.filter_cursor
+        } else {
+            visible.iter().position(|&i| i == self.type_cursor)?
+        };
+        visible.get(cursor).copied()
+    }
+
     /// Activate the currently selected item (double-click equivalent of Enter).
     async fn activate_mouse(&mut self, term: &mut Term) -> Result<()> {
         match &self.screen {
@@ -1104,8 +1315,9 @@ impl App {
                 self.enter_section(idx).await?;
             }
             Screen::TypeList { .. } => {
-                let idx = self.type_cursor;
-                self.enter_type(idx).await?;
+                if let Some(idx) = self.selected_type_row() {
+                    self.enter_type(idx).await?;
+                }
             }
             Screen::AliasList { .. } => {
                 if self.alias_list_has_tabs() && self.alias_tab == 1 {
@@ -1155,6 +1367,43 @@ impl App {
             .filter(|t| t.path.starts_with(&prefix))
             .cloned()
             .collect()
+    }
+
+    fn section_has_root_settings_row(&self, section_idx: usize) -> bool {
+        self.sections.get(section_idx).is_some_and(|section| {
+            section.shape == Some(SectionShape::TypedFamilyMap) && section.key == "channels"
+        })
+    }
+
+    fn type_list_labels(&self, section_idx: usize) -> Vec<String> {
+        let has_root_row = self.section_has_root_settings_row(section_idx);
+        let root_count = usize::from(has_root_row);
+        let mut labels = Vec::with_capacity(self.types.len() + root_count);
+        if has_root_row {
+            labels.push(format!("[{}]", self.sections[section_idx].key));
+        }
+        labels.extend(self.types.iter().map(type_template_label));
+        labels
+    }
+
+    fn type_list_len(&self, section_idx: usize) -> usize {
+        self.types.len() + usize::from(self.section_has_root_settings_row(section_idx))
+    }
+
+    fn template_idx_for_type_row(&self, section_idx: usize, row_idx: usize) -> Option<usize> {
+        if self.section_has_root_settings_row(section_idx) {
+            row_idx.checked_sub(1).filter(|&idx| idx < self.types.len())
+        } else if row_idx < self.types.len() {
+            Some(row_idx)
+        } else {
+            None
+        }
+    }
+
+    fn is_typed_family_root_field_list(&self, section_idx: usize, prefix: &str) -> bool {
+        self.sections.get(section_idx).is_some_and(|section| {
+            section.shape == Some(SectionShape::TypedFamilyMap) && section.key == prefix
+        })
     }
 
     async fn load_type_alias_counts(&mut self) -> Result<()> {
@@ -1278,12 +1527,6 @@ impl App {
         Ok(())
     }
 
-    /// Pre-fill a freshly created cost-rate resource from the live provider
-    /// catalog, matching the web Costs editor. Reuses the existing
-    /// `catalog_models` RPC (same payload the gateway serves the dashboard);
-    /// only the `models` category carries token pricing, so other categories
-    /// are left for manual entry. Best-effort: any miss leaves the sheet
-    /// empty rather than surfacing an error.
     async fn prefill_cost_rates_from_catalog(&self, base_path: &str, resource: &str) {
         let Some(provider_type) = base_path.strip_prefix("cost.rates.providers.models.") else {
             return;
@@ -1315,6 +1558,9 @@ impl App {
 
     async fn load_fields(&mut self, prefix: &str) -> Result<()> {
         self.fields = self.rpc.config_list(Some(prefix)).await?;
+        if prefix == "channels" {
+            retain_direct_children(&mut self.fields, prefix);
+        }
         self.field_cursor = 0;
         // Compute distinct tab names in field-declaration order.
         let mut tabs = Vec::new();
@@ -1386,6 +1632,9 @@ impl App {
         // fields so tab_field_indices() keeps finding them.
         let has_settings_tab = self.tab_names.contains(&ConfigTab::Settings);
         let mut new_fields = new_fields;
+        if prefix == "channels" {
+            retain_direct_children(&mut new_fields, prefix);
+        }
         if has_settings_tab {
             for f in &mut new_fields {
                 if f.tab == ConfigTab::None {
@@ -1551,8 +1800,8 @@ impl App {
     /// clamped to the loaded list length.
     fn restore_top_cursor(&mut self, pos: usize) {
         match &self.screen {
-            Screen::TypeList { .. } => {
-                self.type_cursor = pos.min(self.types.len().saturating_sub(1));
+            Screen::TypeList { section_idx } => {
+                self.type_cursor = pos.min(self.type_list_len(*section_idx).saturating_sub(1));
             }
             Screen::AliasList { breadcrumb, .. } if breadcrumb.len() <= 1 => {
                 self.alias_cursor = pos.min(self.aliases.len().saturating_sub(1));
@@ -1564,11 +1813,6 @@ impl App {
         }
     }
 
-    /// Load the highlighted section's content into the right pane for preview,
-    /// without moving keyboard focus off the section list. Re-previewing the
-    /// already-loaded section is a no-op so its cursor is preserved; switching to
-    /// a different section saves the outgoing cursor and restores the incoming
-    /// section's remembered position.
     async fn preview_section(&mut self, idx: usize) -> Result<()> {
         if self.loaded_section == Some(idx) {
             return Ok(());
@@ -1656,11 +1900,11 @@ impl App {
     // ── Type list (TypedFamilyMap) ───────────────────────────────
 
     async fn handle_type_list(&mut self, key: KeyEvent) -> Result<()> {
-        let type_names: Vec<String> = self
-            .types
-            .iter()
-            .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-            .collect();
+        let section_idx = match &self.screen {
+            Screen::TypeList { section_idx } => *section_idx,
+            _ => return Ok(()),
+        };
+        let type_names = self.type_list_labels(section_idx);
         let visible = self.filtered_indices(&type_names);
 
         match self.handle_filter_key(key, visible.len()) {
@@ -1685,7 +1929,9 @@ impl App {
             Some(ConfigTabAction::Up) => {
                 self.type_cursor = self.type_cursor.saturating_sub(1);
             }
-            Some(ConfigTabAction::Down) if self.type_cursor + 1 < self.types.len() => {
+            Some(ConfigTabAction::Down)
+                if self.type_cursor + 1 < self.type_list_len(section_idx) =>
+            {
                 self.type_cursor += 1;
             }
             Some(ConfigTabAction::Enter | ConfigTabAction::TabRight) => {
@@ -1697,13 +1943,28 @@ impl App {
     }
 
     async fn enter_type(&mut self, orig_idx: usize) -> Result<()> {
-        if let (Some(tmpl), Screen::TypeList { section_idx }) =
-            (self.types.get(orig_idx), &self.screen)
-        {
+        if let Screen::TypeList { section_idx } = &self.screen {
             let section_idx = *section_idx;
-            let map_path = tmpl.path.clone();
-            let type_name = map_path.rsplit('.').next().unwrap_or(&map_path).to_string();
             let section_key = self.sections[section_idx].key.clone();
+            if self.section_has_root_settings_row(section_idx) && orig_idx == 0 {
+                self.load_fields(&section_key).await?;
+                self.screen = Screen::FieldList {
+                    section_idx,
+                    prefix: section_key.clone(),
+                    breadcrumb: vec![section_key.clone(), format!("[{section_key}]")],
+                };
+                self.status_msg = None;
+                return Ok(());
+            }
+
+            let Some(template_idx) = self.template_idx_for_type_row(section_idx, orig_idx) else {
+                return Ok(());
+            };
+            let Some(tmpl) = self.types.get(template_idx) else {
+                return Ok(());
+            };
+            let map_path = tmpl.path.clone();
+            let type_name = type_template_label(tmpl);
             self.load_aliases(&map_path).await?;
             self.screen = Screen::AliasList {
                 section_idx,
@@ -1722,15 +1983,14 @@ impl App {
         let has_tabs = self.alias_list_has_tabs();
 
         // Aliases/Costs tab switching reuses the same TabLeft/TabRight chords
-        // the FieldList tab bar uses. On these screens those chords no longer
-        // mean back/into; Back is the only way out to the type list.
+        // the FieldList tab bar uses. TabRight steps into Costs; TabLeft steps
+        // back toward Aliases, then on the leftmost tab walks out to the type
+        // list (the opposite of "into"), mirroring the FieldList sub-tab gesture.
         if has_tabs && let Some(action) = ConfigTabAction::from_chord(&key) {
             match action {
-                ConfigTabAction::TabLeft => {
-                    if self.alias_tab > 0 {
-                        self.alias_tab -= 1;
-                        self.deactivate_filter();
-                    }
+                ConfigTabAction::TabLeft if self.alias_tab > 0 => {
+                    self.alias_tab -= 1;
+                    self.deactivate_filter();
                     return Ok(());
                 }
                 ConfigTabAction::TabRight => {
@@ -1772,15 +2032,12 @@ impl App {
 
         let add_pos = visible.len(); // position of [+ Add] in the rendered list
         let action = ConfigTabAction::from_chord(&key);
-        // With tabs present, TabLeft no longer doubles as Back.
-        let back = if has_tabs {
-            matches!(action, Some(ConfigTabAction::Back))
-        } else {
-            matches!(
-                action,
-                Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
-            )
-        };
+        // With tabs, TabLeft is consumed for tab switching while alias_tab > 0;
+        // it only reaches here on the leftmost tab, where it walks out like Back.
+        let back = matches!(
+            action,
+            Some(ConfigTabAction::Back | ConfigTabAction::TabLeft)
+        );
         let into = if has_tabs {
             matches!(action, Some(ConfigTabAction::Enter))
         } else {
@@ -2130,13 +2387,14 @@ impl App {
             Some(ConfigEditorAction::Backspace) => {
                 self.edit_buf.pop();
             }
-            _ => {
+            None => {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     self.edit_buf.push(c);
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -2201,13 +2459,17 @@ impl App {
                 let screen = std::mem::replace(&mut self.screen, Screen::SectionList);
                 if let Screen::FieldList {
                     section_idx,
+                    prefix,
                     breadcrumb,
                     ..
                 } = screen
-                    && breadcrumb.len() >= 2
                 {
-                    self.restore_alias_list_from_field_back(section_idx, breadcrumb)
-                        .await?;
+                    if self.is_typed_family_root_field_list(section_idx, &prefix) {
+                        self.screen = Screen::TypeList { section_idx };
+                    } else if breadcrumb.len() >= 2 {
+                        self.restore_alias_list_from_field_back(section_idx, breadcrumb)
+                            .await?;
+                    }
                 }
                 self.status_msg = None;
             }
@@ -2264,6 +2526,33 @@ impl App {
     }
 
     // ── Composite tab helpers ──────────────────────────────────────
+
+    /// Drop the cached composite-tab data for a section prefix, without
+    /// issuing any request. A save inside a composite section can retarget
+    /// the data its Skills or Personality tab shows (a bundle's directory,
+    /// an agent's workspace.path); clearing the cached list lets
+    /// on_tab_switched refetch it on the next tab entry, so no request is
+    /// issued unless the user goes there. Invalidate on every successful
+    /// save in the section rather than only when the saved field is the
+    /// retargeting one: a field-name check is brittle, and the cost of a
+    /// wrong guess is one lazy list request.
+    fn invalidate_composite_state(&mut self, prefix: &str) {
+        if prefix.starts_with("agents.") {
+            self.personality_files.clear();
+            self.personality_active_file = None;
+            self.personality_cursor = 0;
+            self.personality_content.clear();
+            self.personality_loaded.clear();
+        } else if prefix.starts_with("skill-bundles.") {
+            self.skills_list.clear();
+            self.skills_active = None;
+            self.skills_cursor = 0;
+            self.skills_body.clear();
+            self.skills_body_loaded.clear();
+            self.skills_frontmatter = Default::default();
+            self.skills_frontmatter_loaded = Default::default();
+        }
+    }
 
     /// Called after ←/→ tab switch — loads data for composite tabs.
     async fn on_tab_switched(&mut self, term: &mut Term) -> Result<()> {
@@ -2556,13 +2845,14 @@ impl App {
             Some(ConfigEditorAction::Backspace) => {
                 self.personality_content.pop();
             }
-            _ => {
+            None => {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     self.personality_content.push(c);
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -2762,13 +3052,14 @@ impl App {
             Some(ConfigEditorAction::Backspace) => {
                 self.skills_body.pop();
             }
-            _ => {
+            None => {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
                     self.skills_body.push(c);
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -2784,36 +3075,34 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if field_path.ends_with(".model") && field_path.starts_with("providers.models.") {
-            // providers.models.<family>.<alias>.model → segment at index 2
-            let segments: Vec<&str> = field_path.split('.').collect();
-            if segments.len() >= 4 {
-                let family = segments[2].to_string();
+        if let Some(provider_ref) = model_field_catalog_reference(&field_path) {
+            let family = provider_ref
+                .split_once('.')
+                .map_or(provider_ref.as_str(), |(family, _)| family)
+                .to_string();
 
-                // Show loading indicator before the blocking RPC call.
-                self.status_msg = Some(crate::i18n::t_args(
-                    "zc-config-status-fetching-models",
-                    &[("family", &family)],
-                ));
-                let _ = self.draw(term);
+            // Show loading indicator before the blocking RPC call.
+            self.status_msg = Some(crate::i18n::t_args(
+                "zc-config-status-fetching-models",
+                &[("family", &family)],
+            ));
+            let _ = self.draw(term);
 
-                match self.rpc.catalog_models(&family).await {
-                    Ok(res) if !res.models.is_empty() => {
-                        self.select_cursor = res
-                            .models
-                            .iter()
-                            .position(|m| m == &field_current)
-                            .unwrap_or(0);
-                        self.select_items = res.models;
-                        self.status_msg = None;
-                    }
-                    Ok(_) => {
-                        self.status_msg = Some(crate::i18n::t("zc-config-status-no-models"));
-                    }
-                    Err(_) => {
-                        self.status_msg =
-                            Some(crate::i18n::t("zc-config-status-model-fetch-failed"));
-                    }
+            match self.rpc.catalog_models(&provider_ref).await {
+                Ok(res) if !res.models.is_empty() => {
+                    self.select_cursor = res
+                        .models
+                        .iter()
+                        .position(|m| m == &field_current)
+                        .unwrap_or(0);
+                    self.select_items = res.models;
+                    self.status_msg = None;
+                }
+                Ok(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-models"));
+                }
+                Err(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-model-fetch-failed"));
                 }
             }
         }
@@ -2857,11 +3146,15 @@ impl App {
 
     fn prepare_edit_at(&mut self, idx: usize) {
         let kind = self.fields[idx].kind;
-        let value = self.fields[idx]
-            .value
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        let value = if self.fields[idx].populated {
+            self.fields[idx]
+                .value
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        } else {
+            None
+        };
         let variants = self.fields[idx].enum_variants.clone();
 
         match kind {
@@ -2895,6 +3188,7 @@ impl App {
                 self.edit_buf = value.unwrap_or_default();
             }
         }
+        self.edit_cursor = self.edit_buf.len();
     }
 
     fn is_select_edit(&self) -> bool {
@@ -2929,28 +3223,21 @@ impl App {
     }
 
     fn handle_filter_key(&mut self, key: KeyEvent, filtered_len: usize) -> FilterAction {
-        use crate::keymap::Chord;
+        use crate::keymap::{ConfigTabAction, SearchBoxAction};
         if self.filter.is_none() {
-            return match key.code {
-                KeyCode::Char('/') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.activate_filter();
-                    FilterAction::Consumed
-                }
-                _ => FilterAction::Passthrough,
-            };
+            if ConfigTabAction::from_chord(&key) == Some(ConfigTabAction::BeginSearch) {
+                self.activate_filter();
+                return FilterAction::Consumed;
+            }
+            return FilterAction::Passthrough;
         }
-        let editor_chord = if Chord::key(KeyCode::Esc).matches(&key) {
-            Some(FilterEditAction::Cancel)
-        } else if Chord::key(KeyCode::Enter).matches(&key) {
-            Some(FilterEditAction::Accept)
-        } else if Chord::key(KeyCode::Backspace).matches(&key) {
-            Some(FilterEditAction::Backspace)
-        } else if Chord::key(KeyCode::Up).matches(&key) {
-            Some(FilterEditAction::CursorUp)
-        } else if Chord::key(KeyCode::Down).matches(&key) {
-            Some(FilterEditAction::CursorDown)
-        } else {
-            None
+        let editor_chord = match SearchBoxAction::from_chord(&key) {
+            Some(SearchBoxAction::Cancel) => Some(FilterEditAction::Cancel),
+            Some(SearchBoxAction::Accept) => Some(FilterEditAction::Accept),
+            Some(SearchBoxAction::Backspace) => Some(FilterEditAction::Backspace),
+            Some(SearchBoxAction::Up) => Some(FilterEditAction::CursorUp),
+            Some(SearchBoxAction::Down) => Some(FilterEditAction::CursorDown),
+            None => None,
         };
         match editor_chord {
             Some(FilterEditAction::Cancel) => {
@@ -2992,6 +3279,48 @@ impl App {
 
     // ── Field edit ───────────────────────────────────────────────
 
+    fn insert_scalar_edit_text(&mut self, text: &str) {
+        self.edit_buf.insert_str(self.edit_cursor, text);
+        self.edit_cursor += text.len();
+        self.edit_cursor =
+            crate::text_navigation::normalize_grapheme_cursor(&self.edit_buf, self.edit_cursor);
+    }
+
+    fn backspace_scalar_edit(&mut self) {
+        let previous =
+            crate::text_navigation::previous_grapheme_boundary(&self.edit_buf, self.edit_cursor);
+        self.edit_buf.replace_range(previous..self.edit_cursor, "");
+        self.edit_cursor =
+            crate::text_navigation::normalize_grapheme_cursor(&self.edit_buf, previous);
+    }
+
+    fn move_scalar_edit_cursor(&mut self, action: crate::keymap::ConfigEditorAction) {
+        use crate::keymap::ConfigEditorAction;
+        self.edit_cursor = match action {
+            ConfigEditorAction::CursorLeft => {
+                crate::text_navigation::previous_grapheme_boundary(&self.edit_buf, self.edit_cursor)
+            }
+            ConfigEditorAction::CursorRight => {
+                crate::text_navigation::next_grapheme_boundary(&self.edit_buf, self.edit_cursor)
+            }
+            ConfigEditorAction::CursorWordLeft => {
+                crate::text_navigation::previous_word_boundary(&self.edit_buf, self.edit_cursor)
+            }
+            ConfigEditorAction::CursorWordRight => {
+                crate::text_navigation::next_word_boundary(&self.edit_buf, self.edit_cursor)
+            }
+            ConfigEditorAction::CursorStart => 0,
+            ConfigEditorAction::CursorEnd => self.edit_buf.len(),
+            _ => self.edit_cursor,
+        };
+    }
+
+    fn is_scalar_field_edit(&self) -> bool {
+        matches!(&self.screen, Screen::FieldEdit { field_idx, .. }
+            if !self.is_select_edit()
+                && self.fields.get(*field_idx).is_some_and(|field| field.kind != PropKind::StringArray))
+    }
+
     async fn handle_field_edit(&mut self, key: KeyEvent) -> Result<()> {
         if self.is_select_edit() {
             return self.handle_select_edit(key).await;
@@ -3015,12 +3344,8 @@ impl App {
                     self.edit_buf.pop();
                 }
                 Some(ConfigEditorAction::Save) => {
-                    if let Screen::FieldEdit {
-                        prefix, field_idx, ..
-                    } = &self.screen
-                    {
+                    if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                         let prop = self.fields[*field_idx].path.clone();
-                        let prefix = prefix.clone();
                         let entries: Vec<String> = self
                             .edit_buf
                             .lines()
@@ -3037,7 +3362,6 @@ impl App {
                                     "zc-config-status-field-set",
                                     &[("prop", &prop)],
                                 ));
-                                self.load_fields(&prefix).await?;
                                 self.pop_to_field_list_keep_cursor().await?;
                             }
                             Err(e) => {
@@ -3049,13 +3373,14 @@ impl App {
                         }
                     }
                 }
-                _ => {
+                None => {
                     if let KeyCode::Char(c) = key.code
                         && !key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         self.edit_buf.push(c);
                     }
                 }
+                _ => {}
             }
             return Ok(());
         }
@@ -3065,21 +3390,22 @@ impl App {
                 self.pop_to_field_list().await?;
             }
             Some(ConfigEditorAction::Confirm) => {
-                if let Screen::FieldEdit {
-                    prefix, field_idx, ..
-                } = &self.screen
-                {
+                if let Screen::FieldEdit { field_idx, .. } = &self.screen {
                     let field = &self.fields[*field_idx];
+                    if let Some(status) =
+                        scalar_validation_status(field.kind, &self.edit_buf, &field.path)
+                    {
+                        self.status_msg = Some(status);
+                        return Ok(());
+                    }
                     let prop = field.path.clone();
                     let value = serde_json::Value::String(self.edit_buf.clone());
-                    let prefix = prefix.clone();
                     match self.rpc.config_set(&prop, value).await {
                         Ok(()) => {
                             self.status_msg = Some(crate::i18n::t_args(
                                 "zc-config-status-field-set",
                                 &[("prop", &prop)],
                             ));
-                            self.load_fields(&prefix).await?;
                             self.pop_to_field_list_keep_cursor().await?;
                         }
                         Err(e) => {
@@ -3092,15 +3418,27 @@ impl App {
                 }
             }
             Some(ConfigEditorAction::Backspace) => {
-                self.edit_buf.pop();
+                self.backspace_scalar_edit();
             }
-            _ => {
+            Some(
+                action @ (ConfigEditorAction::CursorLeft
+                | ConfigEditorAction::CursorRight
+                | ConfigEditorAction::CursorWordLeft
+                | ConfigEditorAction::CursorWordRight
+                | ConfigEditorAction::CursorStart
+                | ConfigEditorAction::CursorEnd),
+            ) => {
+                self.move_scalar_edit_cursor(action);
+            }
+            None => {
                 if let KeyCode::Char(c) = key.code
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                 {
-                    self.edit_buf.push(c);
+                    let mut encoded = [0; 4];
+                    self.insert_scalar_edit_text(c.encode_utf8(&mut encoded));
                 }
             }
+            _ => {}
         }
         Ok(())
     }
@@ -3145,20 +3483,16 @@ impl App {
 
     async fn commit_select(&mut self, orig_idx: usize) -> Result<()> {
         if let Some(chosen) = self.select_items.get(orig_idx)
-            && let Screen::FieldEdit {
-                prefix, field_idx, ..
-            } = &self.screen
+            && let Screen::FieldEdit { field_idx, .. } = &self.screen
         {
             let prop = self.fields[*field_idx].path.clone();
             let value = serde_json::Value::String(chosen.clone());
-            let prefix = prefix.clone();
             match self.rpc.config_set(&prop, value).await {
                 Ok(()) => {
                     self.status_msg = Some(crate::i18n::t_args(
                         "zc-config-status-field-set",
                         &[("prop", &prop)],
                     ));
-                    self.load_fields(&prefix).await?;
                     self.pop_to_field_list_keep_cursor().await?;
                 }
                 Err(e) => {
@@ -3199,8 +3533,13 @@ impl App {
             field_idx,
         } = std::mem::replace(&mut self.screen, Screen::SectionList)
         {
-            // Silent refresh — preserves cursor below.
+            // This silent reload is the only refresh after a successful save.
+            // Callers must not run load_fields() first: it resets active_tab
+            // and the composite-tab state and issues a second config/list.
+            // The composite-tab state is invalidated right after it for the
+            // same reason: the removed load_fields() call used to clear it.
             self.reload_fields_silent(&prefix).await;
+            self.invalidate_composite_state(&prefix);
             self.field_cursor = field_idx.min(self.fields.len().saturating_sub(1));
             self.screen = Screen::FieldList {
                 section_idx,
@@ -3221,31 +3560,11 @@ impl App {
         Ok(())
     }
 
-    /// Persistent left pane: the section list. `active` is true while the
-    /// SectionList screen holds focus (bright highlight); once a section is
-    /// entered the list dims to a "you are here" marker.
-    /// Display rank of a section-group label. Mirror of
-    /// `zeroclaw_config::sections::SECTION_GROUPS` — zerocode talks to
-    /// remote daemons over the wire, so like the dashboard's
-    /// `GROUP_ORDER` (web/src/pages/Config.tsx) it carries its own copy
-    /// of the order instead of linking the config crate. Unknown and
-    /// empty labels rank with "Other" so nothing ever vanishes.
-    fn group_rank(label: &str) -> usize {
-        const ORDER: &[&str] = &[
-            "Foundation",
-            "Agent",
-            "Multi-agent",
-            "Tools",
-            "Integrations",
-            "Network",
-            "Storage",
-            "Operations",
-            "Other",
-        ];
-        ORDER
+    fn group_rank(section: &ConfigSectionEntry) -> usize {
+        LEGACY_GROUPS
             .iter()
-            .position(|g| *g == label)
-            .unwrap_or(ORDER.len() - 1)
+            .position(|(_, key)| section_group_key(section) == Some(*key))
+            .unwrap_or(LEGACY_GROUPS.len() - 1)
     }
 
     fn draw_sections_pane(&mut self, frame: &mut Frame, area: Rect, active: bool) {
@@ -3271,13 +3590,11 @@ impl App {
         let labels: Vec<String> = self.sections.iter().map(|s| s.label.clone()).collect();
         let visible = self.filtered_indices(&labels);
 
-        // Grouped display: dim header rows between groups, sections
-        // beneath. Active only when the daemon sent group labels and no
-        // filter narrows the list — filtering and old daemons render the
-        // flat all-sections list unchanged. `row_map` records what each
-        // display row is so the cursor and mouse hit-testing resolve
-        // through it instead of assuming row == section position.
-        let grouped = self.filter.is_none() && self.sections.iter().any(|s| !s.group.is_empty());
+        let grouped = self.filter.is_none()
+            && self
+                .sections
+                .iter()
+                .any(|s| !s.group_key.is_empty() || !s.group.is_empty());
         let mut row_map: Vec<Option<usize>> = Vec::with_capacity(visible.len());
         let mut items: Vec<ListItem> = Vec::with_capacity(visible.len());
         let mut last_group: Option<&str> = None;
@@ -3322,9 +3639,9 @@ impl App {
         }
 
         let (style, symbol) = if active {
-            (theme::selected_style(), "› ")
+            (theme::selection_highlight(true, false), "\u{203a} ")
         } else {
-            (theme::selected_inactive_style(), "  ")
+            (theme::selection_highlight(false, false), "  ")
         };
 
         frame.render_stateful_widget(
@@ -3394,18 +3711,17 @@ impl App {
             );
         }
 
-        let type_names: Vec<String> = self
-            .types
-            .iter()
-            .map(|t| t.path.rsplit('.').next().unwrap_or(&t.path).to_string())
-            .collect();
+        let type_names = self.type_list_labels(section_idx);
         let visible = self.filtered_indices(&type_names);
 
         let items: Vec<ListItem> = visible
             .iter()
             .map(|&i| {
                 let name = &type_names[i];
-                let count = self.type_alias_counts.get(i).copied().unwrap_or(0);
+                let count = self
+                    .template_idx_for_type_row(section_idx, i)
+                    .and_then(|template_idx| self.type_alias_counts.get(template_idx).copied())
+                    .unwrap_or(0);
                 let mut spans = vec![Span::styled(name.to_string(), theme::body_style())];
                 if count > 0 {
                     spans.push(Span::styled(format!("  ({count})"), theme::accent_style()));
@@ -3441,17 +3757,7 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = None;
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=open  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+        self.draw_status(frame, r);
     }
 
     fn draw_alias_list(
@@ -3564,17 +3870,7 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=open  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+        self.draw_status(frame, r);
     }
 
     /// Costs-tab body: the resource rate sheets under
@@ -3619,7 +3915,7 @@ impl App {
         self.last_main_area = r.main;
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
-        self.draw_footer(frame, r, "?=help");
+        self.draw_status(frame, r);
     }
 
     fn draw_alias_create(&mut self, frame: &mut Frame, area: Rect, breadcrumb: &[String]) {
@@ -3646,14 +3942,7 @@ impl App {
         .block(theme::panel_block(" Alias name "));
         frame.render_widget(input, r.main);
 
-        let footer = format!(
-            "{}={}  {}={}",
-            editor_key(crate::keymap::ConfigEditorAction::Confirm),
-            crate::i18n::t("zc-config-footer-action-create"),
-            editor_key(crate::keymap::ConfigEditorAction::Cancel),
-            crate::i18n::t("zc-config-footer-action-cancel"),
-        );
-        self.draw_footer(frame, r, &footer);
+        self.draw_status(frame, r);
     }
 
     fn draw_field_list(
@@ -3766,15 +4055,6 @@ impl App {
                 };
 
                 let env_marker = if f.is_env_overridden { " [env]" } else { "" };
-                // In the field list (selection) screen, the row is only
-                // *selected*; it is not yet editable. Make this explicit so the
-                // affordance no longer mimics an active text input. The press
-                // hint is derived from the same row used for ListState
-                // selection, so it stays aligned with the highlight even when
-                // a field-list filter is active. The key name is resolved from
-                // the current keymap so rebinding ConfigTabAction::Enter is
-                // reflected here, and the prose is rendered through Fluent for
-                // localization.
                 let press_hint = if Some(i) == selected_field {
                     let enter_key = tab_key(crate::keymap::ConfigTabAction::Enter);
                     format!(
@@ -3813,17 +4093,7 @@ impl App {
         self.last_list_offset = state.offset();
         self.last_tab_area = tab_area;
 
-        let hints = if self.filter.is_some() {
-            format!(
-                "{}  {}=edit  {}=clear filter",
-                nav_keys(),
-                tab_key(crate::keymap::ConfigTabAction::Enter),
-                tab_key(crate::keymap::ConfigTabAction::Back),
-            )
-        } else {
-            "?=help".to_string()
-        };
-        self.draw_footer(frame, r, &hints);
+        self.draw_status(frame, r);
     }
 
     // ── Composite tab draw methods ──────────────────────────────
@@ -3863,14 +4133,7 @@ impl App {
                 r.main,
             );
 
-            let footer = format!(
-                "{}={}  {}={}",
-                editor_key(crate::keymap::ConfigEditorAction::Save),
-                crate::i18n::t("zc-config-footer-action-save"),
-                editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                crate::i18n::t("zc-config-footer-action-back-to-files"),
-            );
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         } else {
             // File picker mode.
             frame.render_widget(
@@ -3925,8 +4188,7 @@ impl App {
             self.last_main_area = r.main;
             self.last_list_offset = state.offset();
 
-            let footer = format!("?={}", crate::i18n::t("zc-config-footer-action-help"));
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         }
     }
 
@@ -3964,14 +4226,7 @@ impl App {
                 r.main,
             );
 
-            let footer = format!(
-                "{}={}  {}={}",
-                editor_key(crate::keymap::ConfigEditorAction::Save),
-                crate::i18n::t("zc-config-footer-action-save"),
-                editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                crate::i18n::t("zc-config-footer-action-back-to-skills"),
-            );
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         } else {
             // Skill picker mode.
             frame.render_widget(
@@ -4022,8 +4277,7 @@ impl App {
             self.last_main_area = r.main;
             self.last_list_offset = state.offset();
 
-            let footer = format!("?={}", crate::i18n::t("zc-config-footer-action-help"));
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         }
     }
 
@@ -4086,8 +4340,8 @@ impl App {
             frame.render_stateful_widget(
                 List::new(items)
                     .block(theme::panel_block(&title))
-                    .highlight_style(theme::selected_style())
-                    .highlight_symbol("› "),
+                    .highlight_style(theme::selection_highlight(true, false))
+                    .highlight_symbol("\u{203a} "),
                 r.main,
                 &mut state,
             );
@@ -4095,17 +4349,7 @@ impl App {
             self.last_list_offset = state.offset();
             self.last_tab_area = None;
 
-            let hints = if self.filter.is_some() {
-                format!(
-                    "{}  {}=save  {}=clear filter",
-                    nav_keys(),
-                    tab_key(crate::keymap::ConfigTabAction::Enter),
-                    tab_key(crate::keymap::ConfigTabAction::Back),
-                )
-            } else {
-                "?=help".to_string()
-            };
-            self.draw_footer(frame, r, &hints);
+            self.draw_status(frame, r);
         } else {
             // Text input (masked for secrets) — help text always visible.
             frame.render_widget(
@@ -4149,24 +4393,12 @@ impl App {
                     ))),
                     r.main,
                 );
-                let footer = format!(
-                    "{}={}  {}={}  {}={}",
-                    editor_key(crate::keymap::ConfigEditorAction::Confirm),
-                    crate::i18n::t("zc-config-footer-action-new-line"),
-                    editor_key(crate::keymap::ConfigEditorAction::Save),
-                    crate::i18n::t("zc-config-footer-action-save"),
-                    editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                    crate::i18n::t("zc-config-footer-action-cancel"),
-                );
-                self.draw_footer(frame, r, &footer);
+                self.draw_status(frame, r);
                 return;
             }
 
-            let input_display = if field.is_secret {
-                format!("{}█", "•".repeat(self.edit_buf.len()))
-            } else {
-                format!("{}█", self.edit_buf)
-            };
+            let input_display =
+                scalar_edit_display(&self.edit_buf, self.edit_cursor, field.is_secret);
 
             let input = Paragraph::new(vec![
                 Line::from(Span::styled(&kind_hint, theme::dim_style())),
@@ -4176,21 +4408,13 @@ impl App {
 
             frame.render_widget(input, r.main);
 
-            let footer = format!(
-                "{}={}  {}={}",
-                editor_key(crate::keymap::ConfigEditorAction::Confirm),
-                crate::i18n::t("zc-config-footer-action-save"),
-                editor_key(crate::keymap::ConfigEditorAction::Cancel),
-                crate::i18n::t("zc-config-footer-action-cancel"),
-            );
-            self.draw_footer(frame, r, &footer);
+            self.draw_status(frame, r);
         }
     }
 
-    fn draw_footer(&self, frame: &mut Frame, r: Regions, _hints: &str) {
-        // The help indicator is unified at the pane bottom (draw_into); per-screen
-        // hint strings are no longer rendered here. Only the transient status
-        // message remains inline.
+    fn draw_status(&self, frame: &mut Frame, r: Regions) {
+        // The action hint is unified at the pane bottom; only transient status
+        // messages render inline with the active detail pane.
         if let Some(msg) = &self.status_msg {
             frame.render_widget(
                 Paragraph::new(Span::styled(msg.as_str(), theme::warn_style())),
@@ -4243,12 +4467,8 @@ impl App {
                     self.edit_buf.push_str(&cleaned);
                 } else {
                     // Scalar fields: strip newlines.
-                    for c in cleaned.chars() {
-                        if c == '\n' {
-                            continue;
-                        }
-                        self.edit_buf.push(c);
-                    }
+                    let scalar: String = cleaned.chars().filter(|c| *c != '\n').collect();
+                    self.insert_scalar_edit_text(&scalar);
                 }
             }
             Screen::FieldList { .. } => {
@@ -4279,14 +4499,47 @@ impl App {
             _ => false,
         }
     }
+
+    pub(crate) fn claims_pane_navigation(&self, key: &KeyEvent) -> bool {
+        self.section == ConfigSection::Zeroclaw
+            && self.zeroclaw_pane == ZeroclawPane::Detail
+            && self.is_scalar_field_edit()
+            && matches!(
+                crate::keymap::ConfigEditorAction::from_chord(key),
+                Some(
+                    crate::keymap::ConfigEditorAction::CursorWordLeft
+                        | crate::keymap::ConfigEditorAction::CursorWordRight
+                )
+            )
+    }
+}
+
+fn scalar_edit_display(text: &str, cursor: usize, secret: bool) -> String {
+    let cursor = crate::text_navigation::normalize_grapheme_cursor(text, cursor);
+    if secret {
+        let before = text[..cursor].graphemes(true).count();
+        let after = text[cursor..].graphemes(true).count();
+        let mut display = String::with_capacity((before + after + 1) * '•'.len_utf8());
+        for _ in 0..before {
+            display.push('•');
+        }
+        display.push('█');
+        for _ in 0..after {
+            display.push('•');
+        }
+        display
+    } else {
+        format!("{}█{}", &text[..cursor], &text[cursor..])
+    }
 }
 
 impl crate::widgets::HelpContext for App {
     fn help_context(&self) -> crate::widgets::HelpNode {
+        use crate::keymap::ConfigTabAction as A;
         use crate::widgets::HelpEntry as E;
         // Section switch is available in either sub-tab.
         let section_nav = E::new(
-            vec!["Tab", "Shift+Tab"],
+            [tab_keys(A::SectionNext), tab_keys(A::SectionPrev)].concat(),
             crate::i18n::t("zc-config-help-switch-section"),
         );
         if self.section == ConfigSection::Zerocode {
@@ -4308,8 +4561,18 @@ impl App {
         // All chords resolve from the live keymap so overrides/vim/emacs show.
         let nav = || E::new(nav_keys_split(), crate::i18n::t("zc-config-help-navigate"));
         let k = |a: A, label: &str| E::new(tab_keys(a), crate::i18n::t(label));
-        let help = || E::key("?", crate::i18n::t("zc-config-help-this-help"));
-        let filter = || E::key("/", crate::i18n::t("zc-config-help-filter"));
+        let help = || {
+            E::new(
+                crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
+                crate::i18n::t("zc-config-help-this-help"),
+            )
+        };
+        let filter = || {
+            E::new(
+                tab_keys(A::BeginSearch),
+                crate::i18n::t("zc-config-help-filter"),
+            )
+        };
         let clear_filter = || k(A::Back, "zc-config-help-clear-filter");
         let back = || k(A::Back, "zc-config-help-back");
         let mouse_open = || E::key("Mouse", crate::i18n::t("zc-config-help-mouse-open"));
@@ -4561,12 +4824,18 @@ impl App {
             tab_keys(A::DeleteRow),
             crate::i18n::t("zc-config-help-reset-default"),
         ));
-        entries.push(E::key("/", crate::i18n::t("zc-config-help-filter")));
+        entries.push(E::new(
+            tab_keys(A::BeginSearch),
+            crate::i18n::t("zc-config-help-filter"),
+        ));
         entries.push(E::new(
             tab_keys(A::Back),
             crate::i18n::t("zc-config-help-back"),
         ));
-        entries.push(E::key("?", crate::i18n::t("zc-config-help-this-help")));
+        entries.push(E::new(
+            crate::keymap::action_key_labels(crate::keymap::GlobalAction::Help),
+            crate::i18n::t("zc-config-help-this-help"),
+        ));
         entries.push(E::spacer());
         let mouse = if has_tabs {
             crate::i18n::t("zc-config-help-mouse-tabs-edit")
@@ -4654,6 +4923,7 @@ fn edit_in_external_editor(
     let _ = execute!(
         term.backend_mut(),
         PopKeyboardEnhancementFlags,
+        Print(mouse_shift_capture_sequence(false)),
         LeaveAlternateScreen
     );
     let _ = disable_raw_mode();
@@ -4667,7 +4937,11 @@ fn edit_in_external_editor(
 
     // Restore TUI.
     let _ = enable_raw_mode();
-    let _ = execute!(term.backend_mut(), EnterAlternateScreen);
+    let _ = execute!(
+        term.backend_mut(),
+        EnterAlternateScreen,
+        Print(mouse_shift_capture_sequence(true))
+    );
     if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             term.backend_mut(),
@@ -4700,11 +4974,778 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mouse_shift_capture_uses_xtshiftescape_sequences() {
+        assert_eq!(mouse_shift_capture_sequence(true), "\x1b[>1s");
+        assert_eq!(mouse_shift_capture_sequence(false), "\x1b[>0s");
+    }
+
+    #[test]
+    fn model_field_catalog_reference_preserves_typed_alias() {
+        assert_eq!(
+            model_field_catalog_reference("providers.models.hailo_ollama.edge.model"),
+            Some("hailo_ollama.edge".to_string())
+        );
+        assert_eq!(
+            model_field_catalog_reference("providers.models.openai.default.model"),
+            Some("openai.default".to_string())
+        );
+        assert_eq!(
+            model_field_catalog_reference("providers.models.ollama.default"),
+            None
+        );
+    }
+
+    #[test]
+    fn config_scalar_validation_rejects_invalid_integer() {
+        assert_eq!(
+            scalar_validation_status_key(PropKind::Integer, "20a"),
+            Some("zc-config-status-invalid-integer")
+        );
+        assert_eq!(scalar_validation_status_key(PropKind::Integer, "20"), None);
+    }
+
+    #[test]
+    fn config_scalar_validation_rejects_invalid_float() {
+        assert_eq!(
+            scalar_validation_status_key(PropKind::Float, "0.7x"),
+            Some("zc-config-status-invalid-float")
+        );
+        assert_eq!(scalar_validation_status_key(PropKind::Float, "0.7"), None);
+    }
+
+    #[tokio::test]
+    async fn scalar_field_edit_supports_cursor_insertion_and_word_navigation() {
+        let mut manager = test_manager();
+        let mut editable = field("example.name");
+        editable.value = Some(serde_json::Value::String("alpha beta".into()));
+        editable.populated = true;
+        manager.fields = vec![editable];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT))
+            .await
+            .unwrap();
+        assert_eq!(manager.edit_cursor, "alpha ".len());
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(manager.edit_buf, "alpha Xbeta");
+        assert_eq!(manager.edit_cursor, "alpha X".len());
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(manager.edit_buf, "alpha beta");
+        assert_eq!(manager.edit_cursor, "alpha ".len());
+    }
+
+    #[tokio::test]
+    async fn pane_navigation_claims_only_scalar_field_edits() {
+        let mut manager = test_manager();
+        manager.fields = vec![field("example.name")];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+            field_idx: 0,
+        };
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::ALT);
+
+        assert!(manager.claims_pane_navigation(&word_left));
+
+        manager.section = ConfigSection::Zerocode;
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.section = ConfigSection::Zeroclaw;
+        manager.zeroclaw_pane = ZeroclawPane::Sections;
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.zeroclaw_pane = ZeroclawPane::Detail;
+        manager.select_items = vec!["first".into(), "second".into()];
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.select_items.clear();
+        manager.fields[0].kind = PropKind::StringArray;
+        assert!(!manager.claims_pane_navigation(&word_left));
+
+        manager.screen = Screen::FieldList {
+            section_idx: 0,
+            prefix: "example".into(),
+            breadcrumb: vec!["example".into()],
+        };
+        assert!(!manager.claims_pane_navigation(&word_left));
+    }
+
+    #[test]
+    fn scalar_field_cursor_display_masks_by_grapheme_without_losing_position() {
+        let text = "e\u{301}x";
+        let cursor = "e\u{301}".len();
+        assert_eq!(scalar_edit_display(text, cursor, false), "e\u{301}█x");
+        assert_eq!(scalar_edit_display(text, cursor, true), "•█•");
+    }
+
+    #[tokio::test]
+    async fn scalar_field_insertion_normalizes_zwj_cursor_and_backspace() {
+        let mut manager = test_manager();
+        manager.edit_buf = "👩👩".into();
+        manager.edit_cursor = "👩".len();
+
+        manager.insert_scalar_edit_text("\u{200d}");
+        assert_eq!(manager.edit_buf, "👩\u{200d}👩");
+        assert_eq!(manager.edit_cursor, manager.edit_buf.len());
+        assert_eq!(
+            scalar_edit_display(&manager.edit_buf, manager.edit_cursor, true),
+            "•█"
+        );
+
+        manager.backspace_scalar_edit();
+        assert_eq!(manager.edit_buf, "");
+        assert_eq!(manager.edit_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn scalar_field_backspace_normalizes_a_joined_grapheme() {
+        let mut manager = test_manager();
+        manager.edit_buf = "🇺x🇸".into();
+        manager.edit_cursor = "🇺x".len();
+
+        manager.backspace_scalar_edit();
+
+        assert_eq!(manager.edit_buf, "🇺🇸");
+        assert_eq!(manager.edit_cursor, manager.edit_buf.len());
+    }
+
+    #[test]
     fn keyboard_enhancement_flags_disambiguate_modified_enter() {
         assert!(
             keyboard_enhancement_flags()
                 .contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             "Shift+Enter reaches crossterm as plain Enter on common terminals unless keyboard enhancement asks for modified-key disambiguation"
+        );
+    }
+
+    fn test_manager() -> App {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::new(RpcOutbound::new(tx))));
+        App::new(rpc, std::path::Path::new("/tmp"))
+    }
+
+    fn entry_with_cost(key: &str, cost_category: &str) -> ConfigSectionEntry {
+        ConfigSectionEntry {
+            key: key.to_string(),
+            label: key.to_string(),
+            help: String::new(),
+            completed: false,
+            group: String::new(),
+            group_key: String::new(),
+            shape: None,
+            cost_category: cost_category.to_string(),
+        }
+    }
+
+    #[test]
+    fn config_metadata_keys_use_locale_independent_identifiers() {
+        assert_eq!(
+            config_i18n_key("group", "multi_agent", None),
+            "zc-config-group-multi-agent"
+        );
+        assert_eq!(
+            config_i18n_key("section", "providers.models", Some("label")),
+            "zc-config-section-providers-models-label"
+        );
+        assert_eq!(
+            config_i18n_key("section", "query_classification", Some("help")),
+            "zc-config-section-query-classification-help"
+        );
+    }
+
+    #[test]
+    fn group_order_uses_new_keys_and_legacy_labels() {
+        let mut stable = entry_with_cost("providers.models", "");
+        stable.group = "Localized display text".to_string();
+        stable.group_key = "foundation".to_string();
+        assert_eq!(App::group_rank(&stable), 0);
+
+        let mut legacy = entry_with_cost("cron", "");
+        legacy.group = "Agent".to_string();
+        assert_eq!(App::group_rank(&legacy), 1);
+    }
+
+    #[test]
+    fn config_metadata_localization_preserves_wire_fallbacks_and_legacy_groups() {
+        let translate = |key: &str| match key {
+            "zc-config-group-foundation" => Some("基盤".to_string()),
+            "zc-config-section-providers-models-label" => Some("モデルプロバイダー".to_string()),
+            _ => None,
+        };
+
+        let mut current = entry_with_cost("providers.models", "");
+        current.label = "Model providers".to_string();
+        current.help = "Server-owned help".to_string();
+        current.group = "Foundation".to_string();
+        current.group_key = "foundation".to_string();
+        localize_section_metadata_with(&mut current, &translate);
+        assert_eq!(current.group, "基盤");
+        assert_eq!(current.label, "モデルプロバイダー");
+        assert_eq!(current.help, "Server-owned help");
+
+        let mut legacy = entry_with_cost("cron", "");
+        legacy.group = "Agent".to_string();
+        localize_section_metadata_with(&mut legacy, &|_| None);
+        assert_eq!(legacy.group_key, "agent");
+        assert_eq!(legacy.group, "Agent");
+
+        let mut unknown = entry_with_cost("extension", "");
+        unknown.group = "Extension group".to_string();
+        localize_section_metadata_with(&mut unknown, &|_| None);
+        assert!(unknown.group_key.is_empty());
+        assert_eq!(unknown.group, "Extension group");
+        assert_eq!(App::group_rank(&unknown), 8);
+
+        let mut ungrouped = entry_with_cost("legacy-flat", "");
+        localize_section_metadata_with(&mut ungrouped, &|_| None);
+        assert!(ungrouped.group.is_empty());
+        assert!(ungrouped.group_key.is_empty());
+    }
+
+    fn typed_section(key: &str) -> ConfigSectionEntry {
+        ConfigSectionEntry {
+            key: key.to_string(),
+            label: key.to_string(),
+            help: String::new(),
+            completed: false,
+            group: String::new(),
+            group_key: String::new(),
+            shape: Some(SectionShape::TypedFamilyMap),
+            cost_category: String::new(),
+        }
+    }
+
+    fn field(path: &str) -> ConfigFieldEntry {
+        ConfigFieldEntry {
+            path: path.to_string(),
+            category: String::new(),
+            kind: PropKind::String,
+            type_hint: String::new(),
+            value: None,
+            populated: false,
+            is_secret: false,
+            is_env_overridden: false,
+            enum_variants: Vec::new(),
+            description: String::new(),
+            section: None,
+            tab: ConfigTab::None,
+            alias_source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn channels_type_list_reserves_a_global_settings_row() {
+        let mut mgr = test_manager();
+        mgr.sections = vec![typed_section("channels")];
+        mgr.screen = Screen::TypeList { section_idx: 0 };
+        mgr.types = vec![
+            ConfigTemplateEntry {
+                path: "channels.telegram".to_string(),
+            },
+            ConfigTemplateEntry {
+                path: "channels.whatsapp".to_string(),
+            },
+        ];
+
+        assert_eq!(mgr.visible_count(), 3);
+        assert_eq!(
+            mgr.type_list_labels(0),
+            vec!["[channels]", "telegram", "whatsapp"]
+        );
+        assert_eq!(mgr.template_idx_for_type_row(0, 0), None);
+        assert_eq!(mgr.template_idx_for_type_row(0, 1), Some(0));
+        assert_eq!(mgr.template_idx_for_type_row(0, 2), Some(1));
+    }
+
+    #[tokio::test]
+    async fn non_channel_type_list_does_not_reserve_global_settings_row() {
+        let mut mgr = test_manager();
+        mgr.sections = vec![typed_section("providers.models")];
+        mgr.screen = Screen::TypeList { section_idx: 0 };
+        mgr.types = vec![ConfigTemplateEntry {
+            path: "providers.models.anthropic".to_string(),
+        }];
+
+        assert_eq!(mgr.type_list_labels(0), vec!["anthropic"]);
+        assert_eq!(mgr.template_idx_for_type_row(0, 0), Some(0));
+    }
+
+    #[test]
+    fn channels_root_settings_keep_only_direct_children() {
+        let mut fields = vec![
+            field("channels.show_tool_calls"),
+            field("channels.ack_reactions"),
+            field("channels.matrix.default.enabled"),
+            field("channels.whatsapp.personal.session_path"),
+            field("agents.default.model"),
+        ];
+
+        retain_direct_children(&mut fields, "channels");
+
+        let paths: Vec<&str> = fields.iter().map(|field| field.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["channels.show_tool_calls", "channels.ack_reactions"]
+        );
+    }
+
+    #[tokio::test]
+    async fn filtered_type_list_selected_row_tracks_filter_cursor() {
+        let mut mgr = test_manager();
+        mgr.sections = vec![typed_section("channels")];
+        mgr.screen = Screen::TypeList { section_idx: 0 };
+        mgr.types = vec![
+            ConfigTemplateEntry {
+                path: "channels.telegram".to_string(),
+            },
+            ConfigTemplateEntry {
+                path: "channels.whatsapp".to_string(),
+            },
+        ];
+        mgr.type_cursor = 2;
+        mgr.filter = Some("chan".to_string());
+        mgr.filter_cursor = 0;
+
+        assert_eq!(mgr.selected_type_row(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn left_on_leftmost_alias_tab_walks_back_to_type_list() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut mgr = test_manager();
+        mgr.sections = vec![entry_with_cost("providers.models", "models")];
+        mgr.screen = Screen::AliasList {
+            section_idx: 0,
+            map_path: "providers.models.anthropic".to_string(),
+            breadcrumb: vec!["providers.models".to_string(), "anthropic".to_string()],
+        };
+        mgr.alias_tab = 0;
+
+        assert!(
+            mgr.alias_list_has_tabs(),
+            "Aliases/Costs tabs must be present for this scenario"
+        );
+
+        mgr.handle_alias_list(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(mgr.screen, Screen::TypeList { section_idx: 0 }),
+            "Left on the leftmost alias tab walks out to the type list like Back"
+        );
+    }
+
+    fn field_with_value(kind: PropKind, value: &str, populated: bool) -> ConfigFieldEntry {
+        ConfigFieldEntry {
+            path: "test.field".into(),
+            category: String::new(),
+            kind,
+            type_hint: String::new(),
+            value: Some(serde_json::Value::String(value.into())),
+            populated,
+            is_secret: false,
+            is_env_overridden: false,
+            enum_variants: Vec::new(),
+            description: String::new(),
+            section: None,
+            tab: ConfigTab::None,
+            alias_source: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_edit_respects_populated_field() {
+        let mut mgr = test_manager();
+
+        mgr.fields = vec![field_with_value(PropKind::String, "<unset>", false)];
+        mgr.prepare_edit_at(0);
+        assert_eq!(
+            mgr.edit_buf, "",
+            "scalar unset field must start with an empty edit buffer"
+        );
+
+        mgr.fields = vec![field_with_value(
+            PropKind::StringArray,
+            r#"["ignored"]"#,
+            false,
+        )];
+        mgr.prepare_edit_at(0);
+        assert_eq!(
+            mgr.edit_buf, "",
+            "StringArray unset field must start with an empty edit buffer"
+        );
+
+        mgr.fields = vec![field_with_value(PropKind::String, "<unset>", true)];
+        mgr.prepare_edit_at(0);
+        assert_eq!(
+            mgr.edit_buf, "<unset>",
+            "populated scalar values must be preserved verbatim"
+        );
+    }
+
+    /// Manager wired to a responder task that records every request method
+    /// and answers config/set and config/list. List responses echo the
+    /// two-field tabbed fixture, applying the saved value to a.second.
+    fn responding_manager() -> (App, Arc<std::sync::Mutex<Vec<String>>>) {
+        use crate::jsonrpc::RpcOutbound;
+        use tokio::sync::mpsc;
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(16);
+        let outbound = Arc::new(RpcOutbound::new(writer_tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let manager = App::new(rpc, std::path::Path::new("/tmp"));
+        let calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_for_task = Arc::clone(&calls);
+        let outbound_for_task = Arc::clone(&outbound);
+        tokio::spawn(async move {
+            let mut saved: Option<(String, serde_json::Value)> = None;
+            while let Some(raw) = writer_rx.recv().await {
+                let Ok(req) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                let method = req["method"].as_str().unwrap_or_default().to_string();
+                calls_for_task
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(method.clone());
+                let id = req["id"].as_str().unwrap_or_default().to_string();
+                let result = if method == crate::client::method::CONFIG_SET {
+                    saved = Some((
+                        req["params"]["prop"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        req["params"]["value"].clone(),
+                    ));
+                    serde_json::json!({})
+                } else if method == crate::client::method::CONFIG_LIST {
+                    let mut first = field("a.first");
+                    first.tab = ConfigTab::Connection;
+                    let mut second = field("a.second");
+                    second.tab = ConfigTab::Advanced;
+                    if let Some((prop, value)) = &saved
+                        && prop == "a.second"
+                    {
+                        second.value = Some(value.clone());
+                        second.populated = true;
+                    }
+                    serde_json::json!({ "entries": [
+                        serde_json::to_value(&first).unwrap(),
+                        serde_json::to_value(&second).unwrap(),
+                    ] })
+                } else {
+                    serde_json::json!({})
+                };
+                outbound_for_task.dispatch_response(&id, Some(result), None);
+            }
+        });
+        (manager, calls)
+    }
+
+    #[tokio::test]
+    async fn scalar_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a scalar save must issue exactly one set and one list request"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 1, "the active tab must survive a save");
+        assert_eq!(manager.field_cursor, 1, "the cursor must survive a save");
+        assert!(
+            manager.tab_field_indices().contains(&manager.field_cursor),
+            "the restored cursor must be visible on the active tab"
+        );
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!("new")));
+    }
+
+    #[tokio::test]
+    async fn multiline_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.kind = PropKind::StringArray;
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "x\ny".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a multiline save must issue exactly one set and one list request"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 1, "the active tab must survive a save");
+        assert_eq!(manager.field_cursor, 1, "the cursor must survive a save");
+        assert!(
+            manager.tab_field_indices().contains(&manager.field_cursor),
+            "the restored cursor must be visible on the active tab"
+        );
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!(["x", "y"])));
+    }
+
+    #[tokio::test]
+    async fn choice_save_refreshes_once_and_keeps_tab_and_cursor() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.kind = PropKind::Enum;
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.select_items = vec!["one".into(), "two".into()];
+
+        manager.commit_select(1).await.unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a choice save must issue exactly one set and one list request"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 1, "the active tab must survive a save");
+        assert_eq!(manager.field_cursor, 1, "the cursor must survive a save");
+        assert!(
+            manager.tab_field_indices().contains(&manager.field_cursor),
+            "the restored cursor must be visible on the active tab"
+        );
+        assert_eq!(manager.fields[1].value, Some(serde_json::json!("two")));
+    }
+
+    #[tokio::test]
+    async fn skill_bundle_save_invalidates_the_skills_list_without_an_eager_fetch() {
+        let (mut manager, calls) = responding_manager();
+        let mut description = field("skill-bundles.demo.description");
+        description.tab = ConfigTab::Settings;
+        let mut include = field("skill-bundles.demo.include");
+        include.tab = ConfigTab::Settings;
+        manager.fields = vec![description, include];
+        manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Skills];
+        manager.active_tab = 0;
+        manager.skills_bundle = "demo".into();
+        manager.skills_list = vec![crate::client::SkillListEntry {
+            name: "from-dir-a".into(),
+        }];
+        manager.skills_active = Some("from-dir-a".into());
+        manager.skills_body = "stale".into();
+        manager.skills_body_loaded = "stale".into();
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "skill-bundles.demo".into(),
+            breadcrumb: vec!["skill-bundles.demo".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "a skill-bundle save must refresh once and never eagerly fetch skills"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 0, "the active tab must survive a save");
+        assert!(
+            manager.skills_list.is_empty(),
+            "a save in the section must drop the cached skills list"
+        );
+        assert!(
+            manager.skills_active.is_none(),
+            "a save in the section must drop the cached skills selection"
+        );
+        assert!(
+            manager.skills_body.is_empty(),
+            "a save in the section must drop the cached skill body"
+        );
+        assert_eq!(
+            manager.skills_bundle, "demo",
+            "the bundle identity is derived from the prefix and must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_save_invalidates_the_personality_files_without_an_eager_fetch() {
+        let (mut manager, calls) = responding_manager();
+        let mut model = field("agents.demo.model");
+        model.tab = ConfigTab::Settings;
+        let mut workspace = field("agents.demo.workspace.path");
+        workspace.tab = ConfigTab::Settings;
+        manager.fields = vec![model, workspace];
+        manager.tab_names = vec![ConfigTab::Settings, ConfigTab::Personality];
+        manager.active_tab = 0;
+        manager.personality_agent = "demo".into();
+        manager.personality_files = vec![crate::client::PersonalityFileEntry {
+            filename: "SOUL.md".into(),
+            exists: true,
+            size: 3,
+        }];
+        manager.personality_active_file = Some("SOUL.md".into());
+        manager.personality_content = "stale".into();
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "agents.demo".into(),
+            breadcrumb: vec!["agents.demo".into()],
+            field_idx: 0,
+        };
+        manager.prepare_edit_at(0);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "an agent save must refresh once and never eagerly fetch personality files"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(manager.active_tab, 0, "the active tab must survive a save");
+        assert!(
+            manager.personality_files.is_empty(),
+            "a save in the section must drop the cached personality file list"
+        );
+        assert!(
+            manager.personality_active_file.is_none(),
+            "a save in the section must drop the cached personality selection"
+        );
+        assert!(
+            manager.personality_content.is_empty(),
+            "a save in the section must drop the cached personality content"
+        );
+        assert_eq!(
+            manager.personality_agent, "demo",
+            "the agent identity is derived from the prefix and must survive"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_section_save_leaves_composite_state_alone() {
+        let (mut manager, calls) = responding_manager();
+        let mut first = field("a.first");
+        first.tab = ConfigTab::Connection;
+        let mut second = field("a.second");
+        second.tab = ConfigTab::Advanced;
+        manager.fields = vec![first, second];
+        manager.tab_names = vec![ConfigTab::Connection, ConfigTab::Advanced];
+        manager.active_tab = 1;
+        manager.field_cursor = 1;
+        manager.skills_list = vec![crate::client::SkillListEntry {
+            name: "unrelated".into(),
+        }];
+        manager.personality_files = vec![crate::client::PersonalityFileEntry {
+            filename: "SOUL.md".into(),
+            exists: true,
+            size: 3,
+        }];
+        manager.screen = Screen::FieldEdit {
+            section_idx: 0,
+            prefix: "a".into(),
+            breadcrumb: vec!["a".into()],
+            field_idx: 1,
+        };
+        manager.prepare_edit_at(1);
+        manager.edit_buf = "new".into();
+
+        manager
+            .handle_field_edit(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec!["config/set", "config/list"],
+            "the save must go through the ordinary single-refresh path"
+        );
+        assert!(matches!(manager.screen, Screen::FieldList { .. }));
+        assert_eq!(
+            manager.skills_list.len(),
+            1,
+            "a save outside composite sections must not drop the skills list"
+        );
+        assert_eq!(
+            manager.personality_files.len(),
+            1,
+            "a save outside composite sections must not drop the personality files"
         );
     }
 }

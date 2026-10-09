@@ -1,19 +1,7 @@
 //! End-to-end tests for the multi-agent runtime.
-//!
-//! Covers install-level upgrade and per-agent lifecycle paths that
-//! cross multiple subsystems (config schema, filesystem migration,
-//! per-agent memory, agents-table machinery). Tests run against a
-//! TempDir-rooted install so they're hermetic and can be run in
-//! parallel.
 
 use tempfile::TempDir;
 
-/// Filesystem migration: a legacy `<install>/workspace/` is split on
-/// first boot — shared databases (`memory/`, `sessions/`, `state/`)
-/// move to `<install>/data/`, per-agent plaintext (MEMORY.md,
-/// IDENTITY.md, SOUL.md, anything else) moves to
-/// `<install>/agents/default/workspace/`. Timestamped backup retains
-/// the legacy tree; re-run on a fresh-cleaned install is a no-op.
 #[test]
 fn legacy_install_upgrades_cleanly_with_backup() {
     let tmp = TempDir::new().unwrap();
@@ -104,11 +92,6 @@ fn legacy_install_upgrades_cleanly_with_backup() {
     );
 }
 
-/// Multi-agent install: two agents on different memory backends
-/// don't interfere. The schema validator rejects cross-backend
-/// `read_memory_from` entries at config load; the runtime only ever
-/// sees same-backend allowlists by the time the per-agent memory
-/// factory builds its wrappers.
 #[tokio::test]
 async fn two_sqlite_agents_on_one_install_have_isolated_memory() {
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
@@ -138,9 +121,6 @@ async fn two_sqlite_agents_on_one_install_have_isolated_memory() {
         );
     }
 
-    // Build per-agent wrappers and store an attributable row from
-    // each. Without an allowlist between them, neither sibling sees
-    // the other's row.
     let alpha_mem = zeroclaw_memory::create_memory_for_agent(&cfg, "alpha", None)
         .await
         .expect("per-agent memory for alpha");
@@ -199,21 +179,6 @@ async fn two_sqlite_agents_on_one_install_have_isolated_memory() {
     );
 }
 
-/// Peer-group routing: a peer group can bind to an exact channel alias
-/// (`telegram.prod`) or to a bare channel type (`telegram`) for legacy
-/// type-wide compatibility. Asserts:
-///   1. Resolver: alpha (in the group) recognizes beta + the external
-///      operator on type `"telegram"` and refuses gamma (on the channel
-///      but not on the group).
-///   2. Resolver: gamma's resolved set is empty (no peer-group
-///      membership).
-///   3. Tool: alpha cannot dispatch to gamma — the rejection names the
-///      peer-set check, not a delivery failure, so the operator can
-///      tell why it bounced.
-///   4. Tool: alpha → beta routes in-process (the channel's bot
-///      identity is shared, so an outbound through the channel would
-///      loop back to inbound; agent-to-agent is process-internal by
-///      design) and the success output names that path.
 #[tokio::test]
 async fn peer_group_routes_messages_only_within_resolved_peer_set() {
     use serde_json::json;
@@ -222,6 +187,7 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
     use zeroclaw_config::providers::ChannelRef;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+    use zeroclaw_runtime::control_plane::ControlPlaneHandle;
     use zeroclaw_runtime::peers::resolve_peer_set;
     use zeroclaw_runtime::tools::SendMessageToPeerTool;
 
@@ -270,7 +236,9 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
     );
 
     let cfg = Arc::new(cfg);
-    let tool = SendMessageToPeerTool::new(cfg.clone(), "alpha");
+    let control_plane_dir = TempDir::new().unwrap();
+    let control_plane = ControlPlaneHandle::open(control_plane_dir.path()).unwrap();
+    let tool = SendMessageToPeerTool::new(cfg.clone(), "alpha").with_control_plane(control_plane);
 
     let to_gamma = tool
         .execute(json!({
@@ -308,6 +276,88 @@ async fn peer_group_routes_messages_only_within_resolved_peer_set() {
         "in-process delivery output must name its routing path so the agent can reason about delivery semantics, got: {:?}",
         to_beta.output
     );
+    assert!(
+        to_beta.output.contains("task_id="),
+        "accepted in-process delivery must expose its durable task id, got: {:?}",
+        to_beta.output
+    );
+}
+
+#[tokio::test]
+async fn standalone_peer_send_registers_before_acceptance_and_rejects_an_unopenable_store() {
+    use serde_json::json;
+    use std::sync::Arc;
+    use zeroclaw_api::tool::Tool;
+    use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
+    use zeroclaw_config::providers::ChannelRef;
+    use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+    use zeroclaw_runtime::control_plane::{ControlPlaneHandle, TaskKind};
+    use zeroclaw_runtime::tools::SendMessageToPeerTool;
+
+    let data_dir = TempDir::new().unwrap();
+    let mut cfg = Config {
+        data_dir: data_dir.path().join("tasks"),
+        ..Config::default()
+    };
+    cfg.risk_profiles
+        .insert("research-floor".into(), RiskProfileConfig::default());
+    for alias in ["alpha", "beta"] {
+        cfg.agents.insert(
+            alias.to_string(),
+            AliasedAgentConfig {
+                risk_profile: "research-floor".into(),
+                channels: vec![ChannelRef::from("telegram.prod")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+    }
+    cfg.peer_groups.insert(
+        "research".into(),
+        PeerGroupConfig {
+            channel: "telegram.prod".into(),
+            agents: vec![AgentAlias::from("alpha"), AgentAlias::from("beta")],
+            ..Default::default()
+        },
+    );
+
+    let args = json!({"channel": "telegram.prod", "target": "beta", "message": "hi"});
+    let accepted = SendMessageToPeerTool::new(Arc::new(cfg.clone()), "alpha")
+        .execute(args.clone())
+        .await
+        .expect("standalone tool result");
+    assert!(accepted.success, "standalone send rejected: {accepted:?}");
+    let task_id = accepted
+        .output
+        .split_once("task_id=")
+        .expect("accepted result exposes the task id")
+        .1
+        .trim_end_matches(')');
+    let store = ControlPlaneHandle::open(&cfg.data_dir).expect("configured durable store");
+    let task = store
+        .store
+        .get(task_id)
+        .await
+        .expect("task lookup")
+        .expect("registration precedes acceptance");
+    assert_eq!(task.kind, TaskKind::PeerInbox);
+    assert_eq!(task.agent, "beta");
+    assert_eq!(task.principal_id.as_deref(), Some("alpha"));
+
+    let blocked_path = data_dir.path().join("not-a-directory");
+    std::fs::write(&blocked_path, b"occupied").expect("block the store directory");
+    cfg.data_dir = blocked_path;
+    let rejected = SendMessageToPeerTool::new(Arc::new(cfg), "alpha")
+        .execute(args)
+        .await
+        .expect("store-open failure is a tool result");
+    assert!(!rejected.success, "unopenable store accepted: {rejected:?}");
+    assert!(
+        rejected
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("durable task store")),
+        "store-open rejection must name the durable dependency: {rejected:?}"
+    );
 }
 
 #[tokio::test]
@@ -318,6 +368,7 @@ async fn peer_group_dotted_channel_refs_remain_alias_scoped_for_dispatch() {
     use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig};
     use zeroclaw_config::providers::ChannelRef;
     use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+    use zeroclaw_runtime::control_plane::ControlPlaneHandle;
     use zeroclaw_runtime::peers::resolve_peer_set;
     use zeroclaw_runtime::tools::SendMessageToPeerTool;
 
@@ -352,7 +403,9 @@ async fn peer_group_dotted_channel_refs_remain_alias_scoped_for_dispatch() {
     );
 
     let cfg = Arc::new(cfg);
-    let tool = SendMessageToPeerTool::new(cfg, "alpha");
+    let control_plane_dir = TempDir::new().unwrap();
+    let control_plane = ControlPlaneHandle::open(control_plane_dir.path()).unwrap();
+    let tool = SendMessageToPeerTool::new(cfg, "alpha").with_control_plane(control_plane);
     let prod = tool
         .execute(json!({
             "channel": "telegram.prod",
@@ -364,6 +417,10 @@ async fn peer_group_dotted_channel_refs_remain_alias_scoped_for_dispatch() {
     assert!(
         prod.success,
         "exact alias dispatch should succeed: {prod:?}"
+    );
+    assert!(
+        prod.output.contains("task_id="),
+        "accepted in-process delivery must expose its durable task id: {prod:?}"
     );
 
     let dev = tool

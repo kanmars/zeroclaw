@@ -24,13 +24,16 @@ die() {
 }
 bold() { printf "${BOLD}%s${RESET}" "$*"; }
 
+  # >>> generated:route-contract by `cargo generate installers` - do not edit <<<
 TUI_BIN_NAME="zerocode"
-
-# Apps installed by default (the rest are discovered and listed but off
-# until selected via --apps or the interactive picker). Intentionally a
-# fixed list: zeroclaw-desktop needs the Tauri toolchain + webview deps,
-# so it ships off-by-default.
 DEFAULT_APPS="zerocode"
+PIPED_INSTALL_MODE="prebuilt"
+QUICKSTART_COMMAND="zeroclaw quickstart"
+QUICKSTART_SUBCOMMAND="quickstart"
+GUIDED_INSTALL_MODE="choice"
+GUIDED_QUICKSTART_MODE="offer"
+UNIX_PATH_RELOAD="true"
+  # >>> end generated:route-contract <<<
 
 # ── Parse Cargo.toml (source of truth) ────────────────────────────
 
@@ -146,6 +149,13 @@ validate_feature() {
   die "Unknown feature '$1'. Run: $0 --list-features"
 }
 
+selected_feature_enabled() {
+  case ",$USER_FEATURES," in
+  *",$1,"*) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
 # ── List features ─────────────────────────────────────────────────
 
 list_features() {
@@ -164,7 +174,7 @@ list_features() {
     default | ci-all | fantoccini | landlock | metrics) continue ;;
     channel-*) channels="${channels:+$channels, }$feat" ;;
     observability-*) observability="${observability:+$observability, }$feat" ;;
-    hardware | peripheral-* | sandbox-* | browser-* | probe | rag-pdf | webauthn)
+    hardware | peripheral-* | sandbox-* | browser-* | probe | webauthn)
       platform="${platform:+$platform, }$feat"
       ;;
     *) other="${other:+$other, }$feat" ;;
@@ -254,14 +264,24 @@ detect_target_triple() {
     fi
     ;;
   Linux)
-    libc=$(detect_libc)
-    case "$arch" in
-    x86_64) echo "x86_64-unknown-linux-${libc}" ;;
-    aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
-    armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
-    armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
-    *) echo "" ;;
-    esac
+    if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux ]; then
+      case "$arch" in
+      aarch64 | arm64) echo "aarch64-linux-android" ;;
+      *)
+        printf "Unsupported Android architecture: %s (only aarch64/arm64 is supported)\n" "$arch" >&2
+        echo ""
+        ;;
+      esac
+    else
+      libc=$(detect_libc)
+      case "$arch" in
+      x86_64) echo "x86_64-unknown-linux-${libc}" ;;
+      aarch64 | arm64) echo "aarch64-unknown-linux-${libc}" ;;
+      armv7l) echo "armv7-unknown-linux-gnueabihf" ;;
+      armv6l | arm*) echo "arm-unknown-linux-gnueabihf" ;;
+      *) echo "" ;;
+      esac
+    fi
     ;;
   *) echo "" ;;
   esac
@@ -295,8 +315,8 @@ install_prebuilt() {
   printf "%s\n" "$(bold "Installing ZeroClaw ${version} (pre-built)")"
   info "Platform: $triple"
   info "Source:   $asset_url"
-  info "Channels: pre-built binaries use the lean default bundle."
-  info "For Slack/Discord or all bundled channels, build from source with --preset full."
+  info "Channels: pre-built binaries ship the lean standard distribution set; availability is target-specific."
+  info "Run 'zeroclaw channel list' to inspect this binary. For other channels such as Slack, build from source with --preset full."
   echo
 
   # Resolve platform-correct web data directory to match gateway auto-detect
@@ -384,7 +404,10 @@ Options:
   --prebuilt           Download and install a pre-built binary (default when asked)
   --source             Build from source (skips the pre-built prompt)
   --preset NAME        Named feature preset: 'minimal' (kernel only, ~6.6MB) or
-                       'full' (historical broad channel bundle). Source builds only.
+                       'full' (every channel plus heavyweight extras such as
+                       whatsapp-web and channel-matrix). Source builds only.
+  --full               Install everything: the 'full' feature preset plus every
+                       installable app (implies --source)
   --minimal            Alias for --preset minimal
   --features X,Y       Select specific features — source only (comma-separated)
   --apps X,Y           Select apps to install (e.g. zerocode); "none" to skip all
@@ -408,7 +431,8 @@ Examples:
   $0 --source                                  # always build from source
   $0 --source --minimal                        # smallest possible binary
   $0 --source --features agent-runtime,channel-discord  # custom feature set
-  $0 --source --preset full                   # broad channel bundle
+  $0 --source --preset full                   # every channel plus heavyweight extras
+  $0 --full                                    # everything: full preset + every app
   $0 --skip-quickstart                            # install only, configure later
   $0 --prefix /tmp/zc-test --skip-quickstart      # isolated test install
   $0 --dry-run --prebuilt                      # preview without installing
@@ -511,15 +535,11 @@ quickstart_needed() {
 }
 
 # ── Interactive feature picker ───────────────────────────────────
-#
-# POSIX-sh number-toggle picker over the OPTIONAL feature set (channel-*,
-# observability-*, hardware/peripheral/sandbox/browser flavours). Default
-# features are always on; this only surfaces the opt-in extras. The output
-# is a comma-separated list of selected features written to stdout.
-#
-# Invoked from the interactive flow when the operator runs install.sh in a
-# TTY without `--minimal`, `--preset`, or `--features`. Skipped in
-# non-interactive runs (curl | bash) and in CI.
+  # >>> generated:feature-picker-helper by `cargo generate installers` - do not edit <<<
+# Offers every non-aggregate feature and installable app. Defaults start
+# checked and can be toggled off. Prompts are written to stderr; the selected
+# values are returned through PICKED_FEATURES and PICKED_APPS. The caller only
+# invokes this helper for an interactive TTY, never for a piped `curl | sh` run.
 interactive_feature_picker() {
   toml="$1"
   parse_cargo_toml "$toml"
@@ -622,6 +642,7 @@ interactive_feature_picker() {
   PICKED_FEATURES=$(printf '%s' "$selected_features" | tr ' ' ',')
   PICKED_APPS=$(printf '%s' "$selected_apps" | tr ' ' ',')
 }
+  # >>> end generated:feature-picker-helper <<<
 
 # Resolve the platform data directory the gateway auto-detects for the
 # dashboard bundle. Single source of truth so the prebuilt and source
@@ -654,6 +675,16 @@ install_web_dist() {
   fi
   mkdir -p "$web_data_dir"
   cp -r "$src_dist/." "$web_data_dir/"
+  # Prune files the fresh build no longer ships. Copy-then-prune keeps
+  # index.html present throughout, so a running gateway never 503s
+  # mid-install, while stale hashed chunks still get removed.
+  (
+    cd "$web_data_dir" || exit 0
+    find . -type f | while IFS= read -r f; do
+      [ -f "$src_dist/$f" ] || rm -f "$f"
+    done
+    find . -depth -type d -empty -exec rmdir {} \; 2>/dev/null
+  )
   info "Web dashboard installed to $web_data_dir"
 }
 
@@ -668,11 +699,18 @@ install_web_dist() {
 # present — never to run cargo by hand.
 build_web_dashboard() {
   src_dir="$1"
+  required="${2:-false}"
   if [ ! -d "$src_dir/web" ]; then
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires a web/ directory in the source checkout."
+    fi
     warn "Source has no web/ directory; skipping dashboard build."
     return 0
   fi
   if ! command -v npm >/dev/null 2>&1; then
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires Node.js/npm to build web/dist before cargo install. Install the Node version from .nvmrc and re-run, or remove embedded-web."
+    fi
     warn "npm not found — skipping dashboard build. The gateway will run"
     warn "  in API-only mode. Install Node.js (npm) and re-run ./install.sh"
     warn "  --source to build and install the dashboard."
@@ -683,6 +721,9 @@ build_web_dashboard() {
   # re-runs cheap.
   info "Building web dashboard (cargo web build)..."
   (cd "$src_dir" && cargo web build) || {
+    if [ "$required" = true ]; then
+      die "feature embedded-web requires a successful dashboard build before cargo install."
+    fi
     warn "Dashboard build failed — gateway will run in API-only mode."
     return 0
   }
@@ -731,6 +772,7 @@ PRESET=""       # ""=unset, "minimal"=alias for --minimal, "full"=default-featur
 WITH_GATEWAY="" # ""=unset (preset/feature default applies), "true"/"false"=explicit toggle
 WITHOUT_TUI=""  # ""=unset (default: install TUI), "true"=skip TUI
 USER_APPS=""    # ""=unset (default apps), "none"=skip all, or comma list (e.g. "zerocode")
+FULL_APPS=false # true when --full: install every discovered app, not just the defaults
 
 # Support legacy env var
 if [ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]; then
@@ -753,6 +795,11 @@ while [ $# -gt 0 ]; do
     full) PRESET="full" ;;
     *) die "Unknown preset '$1'. Expected: minimal or full" ;;
     esac
+    ;;
+  --full)
+    # Everything: the 'full' feature preset plus every installable app.
+    PRESET="full"
+    FULL_APPS=true
     ;;
   --features)
     if [ $# -lt 2 ]; then
@@ -782,8 +829,10 @@ while [ $# -gt 0 ]; do
   --dry-run) DRY_RUN=true ;;
   --no-modify-path) MODIFY_PATH=false ;;
   --skip-quickstart) SKIP_QUICKSTART=true ;;
+  # >>> generated:route-flags by `cargo generate installers` - do not edit <<<
   --prebuilt) INSTALL_MODE="prebuilt" ;;
   --source) INSTALL_MODE="source" ;;
+  # >>> end generated:route-flags <<<
   --uninstall) UNINSTALL=true ;;
   -h | --help)
     usage
@@ -829,10 +878,10 @@ fi
 
 # ── Decide: pre-built or source ───────────────────────────────────
 
+  # >>> generated:route-decision by `cargo generate installers` - do not edit <<<
 # --minimal, --features, --apps, --without-gateway, or --preset full imply
-# source. Prebuilt binaries always ship with default features and no apps,
-# so any flag that changes the feature set or selects apps must force a
-# source build.
+# source. Prebuilt archives have fixed feature and app contents, so any flag
+# that changes the feature set or selects apps must force a source build.
 if [ "$MINIMAL" = true ] || [ -n "$USER_FEATURES" ] || [ -n "$USER_APPS" ] ||
   [ "$WITH_GATEWAY" = "false" ] || [ "$PRESET" = "full" ]; then
   INSTALL_MODE="source"
@@ -841,7 +890,7 @@ fi
 if [ "$INSTALL_MODE" = "" ]; then
   triple=$(detect_target_triple)
   if [ -n "$triple" ]; then
-    if [ -t 0 ]; then
+    if [ "$GUIDED_INSTALL_MODE" = "choice" ] && [ -t 0 ]; then
       echo
       printf "  %s\n" "$(bold "How would you like to install ZeroClaw?")"
       printf "  [P] Pre-built binary  — fast, no Rust required  %s\n" "$(bold "(default)")"
@@ -854,7 +903,7 @@ if [ "$INSTALL_MODE" = "" ]; then
       esac
     else
       # Non-interactive (curl | bash): default to pre-built silently
-      INSTALL_MODE="prebuilt"
+      INSTALL_MODE="$PIPED_INSTALL_MODE"
     fi
   else
     INSTALL_MODE="source"
@@ -870,6 +919,7 @@ if [ "$INSTALL_MODE" = "prebuilt" ]; then
     PREBUILT_OK=false
   fi
 fi
+  # >>> end generated:route-decision <<<
 
 [ "${PREBUILT_OK:-false}" = true ] && [ "$DRY_RUN" != true ] && {
   BIN="$CARGO_HOME/bin/zeroclaw"
@@ -888,12 +938,9 @@ fi
 
 # ── Locate source ─────────────────────────────────────────────────
 
-[ "${PREBUILT_OK:-false}" = true ] && {
-  # Jump past the source build to PATH + quickstart
-  SOURCE_SKIPPED=true
-}
-
-if [ "${SOURCE_SKIPPED:-false}" != true ]; then
+  # >>> generated:source-dispatch-open by `cargo generate installers` - do not edit <<<
+if [ "${PREBUILT_OK:-false}" != true ]; then
+  # >>> end generated:source-dispatch-open <<<
 
   echo
   printf "%s\n" "$(bold "ZeroClaw — source install")"
@@ -928,6 +975,7 @@ if [ "${SOURCE_SKIPPED:-false}" != true ]; then
 
   # ── Preflight: Rust ───────────────────────────────────────────────
 
+  # >>> generated:rust-bootstrap by `cargo generate installers` - do not edit <<<
   NEED_RUST=false
   if ! command -v rustc >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; then
     NEED_RUST=true
@@ -953,6 +1001,7 @@ if [ "${SOURCE_SKIPPED:-false}" != true ]; then
     fi
     info "Rust $RUST_VERSION (>= $MSRV)"
   fi
+  # >>> end generated:rust-bootstrap <<<
 
   # ── Preflight: 32-bit ARM ────────────────────────────────────────
 
@@ -998,10 +1047,27 @@ See all available features:
     esac
   fi
 
+  # `--preset full` must actually deliver the broad bundle the installer
+  # advertises (whatsapp-web, channel-matrix, the heavyweight extras), not
+  # Cargo's lean `default`. Resolve the explicit feature list from the
+  # canonical registry (`cargo generate features --selection all`), the same
+  # source of truth the release workflow consumes, and build with
+  # --no-default-features against it so the advertised set is exact.
+  if [ "$PRESET" = "full" ]; then
+    preset_features=$(cargo run --quiet -p xtask --bin generate -- features --selection all 2>/dev/null || true)
+    if [ -n "$preset_features" ]; then
+      CARGO_FLAGS="--no-default-features"
+      USER_FEATURES="${USER_FEATURES:+$USER_FEATURES,}$preset_features"
+    else
+      warn "Could not resolve --preset full from the feature registry; falling back to default features."
+    fi
+  fi
+
   # Interactive picker — only when the operator did not pin features or
   # apps via the CLI and is running under a TTY. Skipped on `--minimal`,
   # `--preset`, `--features`, `--apps`, `--with-gateway` /
-  # `--without-gateway`, and any non-interactive run (curl | bash).
+  # `--without-gateway`, and any non-interactive run (curl | sh).
+  # >>> generated:feature-picker by `cargo generate installers` - do not edit <<<
   if [ -t 0 ] &&
     [ "$MINIMAL" != true ] &&
     [ -z "$USER_FEATURES" ] &&
@@ -1038,6 +1104,7 @@ See all available features:
       CARGO_FLAGS="$CARGO_FLAGS --features $USER_FEATURES"
     fi
   fi
+  # >>> end generated:feature-picker <<<
 
   # ── Detect existing installs ──────────────────────────────────────
 
@@ -1065,7 +1132,7 @@ See all available features:
       fi
     fi
     if [ "$PRESET" = "full" ] && [ "$DRY_RUN" != true ] && [ -t 1 ]; then
-      info "--preset full: building from source with the historical broad channel bundle."
+      info "--preset full: building from source with the complete feature set (every channel plus heavyweight extras) resolved from the registry."
     fi
   fi
 
@@ -1075,6 +1142,11 @@ See all available features:
 
   # ── Build and install ─────────────────────────────────────────────
 
+  WANT_EMBEDDED_WEB=false
+  if selected_feature_enabled embedded-web; then
+    WANT_EMBEDDED_WEB=true
+  fi
+
   echo
   printf "%s\n" "$(bold "Building ZeroClaw v$VERSION")"
   if [ -n "$CARGO_FLAGS" ]; then
@@ -1083,6 +1155,16 @@ See all available features:
     info "Feature flags: (defaults)"
   fi
   echo
+
+  # embedded-web includes web/dist at Rust compile time, so the dashboard must
+  # exist before cargo install reaches zeroclaw-gateway's build script.
+  if [ "$WANT_EMBEDDED_WEB" = true ]; then
+    if [ "$DRY_RUN" = true ]; then
+      info "[dry-run] Would build web dashboard before cargo install for embedded-web"
+    else
+      build_web_dashboard "$INSTALL_DIR" true
+    fi
+  fi
 
   # >>> generated:source-cargo-install by `cargo generate installers` - do not edit <<<
   if [ "$DRY_RUN" = true ]; then
@@ -1110,7 +1192,13 @@ See all available features:
   esac
   if [ "$WANT_GATEWAY" = true ]; then
     if [ "$DRY_RUN" = true ]; then
-      info "[dry-run] Would build web dashboard"
+      if [ "$WANT_EMBEDDED_WEB" = true ]; then
+        info "[dry-run] Web dashboard would already be built for embedded-web"
+      else
+        info "[dry-run] Would build web dashboard"
+      fi
+    elif [ "$WANT_EMBEDDED_WEB" = true ]; then
+      info "Web dashboard already built for embedded-web"
     else
       build_web_dashboard "$INSTALL_DIR"
     fi
@@ -1124,16 +1212,34 @@ See all available features:
   # Resolve the app set: explicit --apps list, "none" to skip, or the
   # full installable set by default. --without-tui is back-compat for
   # dropping the TUI app from the default set.
-  if [ "$USER_APPS" = "none" ]; then
+  # >>> generated:app-selection by `cargo generate installers` - do not edit <<<
+  if [ "$FULL_APPS" = true ] && [ -z "$USER_APPS" ]; then
+    # --full installs every discovered app (an explicit --apps still wins) —
+    # except Tauri-based apps (tauri.conf.json present): they need the Tauri
+    # toolchain + system webview deps (webkit2gtk/GTK on Linux), which most
+    # machines don't have. Request them explicitly via --apps to opt in.
+    WANT_APPS=""
+    for app in $APPS; do
+      app_path=$(app_dir_for "$app") || continue
+      if [ -f "$app_path/tauri.conf.json" ]; then
+        info "Skipping $app: Tauri app needs system webview deps — install explicitly with --apps $app"
+        continue
+      fi
+      WANT_APPS="${WANT_APPS:+$WANT_APPS }$app"
+    done
+  elif [ "$USER_APPS" = "none" ]; then
     WANT_APPS=""
   elif [ -n "$USER_APPS" ]; then
     WANT_APPS=$(printf '%s' "$USER_APPS" | tr ',[:space:]' '\n' | grep -v '^$' | sort -u | paste -sd' ' -)
     for app in $WANT_APPS; do validate_app "$app"; done
   else
     WANT_APPS="$DEFAULT_APPS"
-    if [ "$WITHOUT_TUI" = true ]; then
-      WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
-    fi
+  fi
+
+  # --without-tui drops the TUI app from the resolved default or --full
+  # set (an explicit --apps list is honored as-is).
+  if [ "$WITHOUT_TUI" = true ] && [ -z "$USER_APPS" ]; then
+    WANT_APPS=$(printf '%s' "$WANT_APPS" | tr ' ' '\n' | grep -vx "$TUI_BIN_NAME" | paste -sd' ' -)
   fi
 
   # agent-runtime is a default feature; if defaults are stripped and it
@@ -1158,6 +1264,7 @@ See all available features:
       cargo install --path "$app_path" --locked --force
     fi
   done
+  # >>> end generated:app-selection <<<
 
   # ── Summary ───────────────────────────────────────────────────────
 
@@ -1187,12 +1294,15 @@ See all available features:
     fi
   fi
 
+  # >>> generated:source-dispatch-close by `cargo generate installers` - do not edit <<<
 fi # end source build block
+  # >>> end generated:source-dispatch-close <<<
 
 BIN="$CARGO_HOME/bin/zeroclaw"
 
 # ── PATH setup ────────────────────────────────────────────────────
 
+  # >>> generated:path-handoff by `cargo generate installers` - do not edit <<<
 PROFILE=$(detect_shell_profile)
 EXPORT_LINE=$(shell_export_syntax)
 
@@ -1228,7 +1338,9 @@ elif [ "$MODIFY_PATH" = true ] && [ "$PREFIX" = "$HOME" ]; then
     printf '# <<< zeroclaw <<<\n'
   } >>"$PROFILE" 2>/dev/null; then
     info "Added $CARGO_HOME/bin to PATH in $PROFILE"
-    printf "    Reload your shell or run: source %s\n" "$PROFILE"
+    if [ "$UNIX_PATH_RELOAD" = true ]; then
+      printf "    Reload your shell or run: source %s\n" "$PROFILE"
+    fi
   else
     warn "Could not write to $PROFILE — add this line manually:"
     print_path_help
@@ -1237,23 +1349,25 @@ else
   # --no-modify-path, or a custom --prefix install we won't auto-edit for.
   print_path_help
 fi
+  # >>> end generated:path-handoff <<<
 
 # ── Quickstart prompt ─────────────────────────────────────────────
 
+  # >>> generated:quickstart-handoff by `cargo generate installers` - do not edit <<<
 if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; then
   # Skip the prompt entirely when the operator already has a configured
   # ZeroClaw — re-installs should not re-prompt.
   if ! quickstart_needed; then
     info "Existing ZeroClaw config detected at $PREFIX/.zeroclaw/config.toml — skipping setup prompt."
-    info "Run 'zeroclaw quickstart' to reconfigure."
-  elif [ -t 0 ]; then
+    info "Run '$QUICKSTART_COMMAND' to reconfigure."
+  elif [ "$GUIDED_QUICKSTART_MODE" = "offer" ] && [ -t 0 ]; then
     # 3-way setup choice. Bare Enter accepts the [1] CLI quickstart default;
     # option [2] foregrounds the daemon so the operator can finish in the
     # browser and Ctrl+C to return; [3] skips and prints a follow-up hint.
     # Non-TTY runs fall through to the silent skip in the else branch.
     echo
     printf "%s\n" "$(bold "ZeroClaw installed. How would you like to complete setup?")"
-    printf "  [1] CLI quickstart  (zeroclaw quickstart)\n"
+    printf "  [1] CLI quickstart  ($QUICKSTART_COMMAND)\n"
     printf "  [2] Open gateway in browser (zeroclaw daemon + dashboard)\n"
     printf "  [3] Skip for now\n"
     printf "  Choice [1-3, default 1]: "
@@ -1261,7 +1375,7 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
     case "${quickstart_choice:-1}" in
     1 | "")
       echo
-      "$BIN" quickstart || warn "Quickstart exited with an error — run 'zeroclaw quickstart' manually"
+      "$BIN" "$QUICKSTART_SUBCOMMAND" || warn "Quickstart exited with an error — run '$QUICKSTART_COMMAND' manually"
       ;;
     2)
       echo
@@ -1271,16 +1385,17 @@ if [ "$SKIP_QUICKSTART" = false ] && [ "$DRY_RUN" != true ] && [ -f "$BIN" ]; th
       "$BIN" daemon || warn "Daemon exited with an error — run 'zeroclaw daemon' manually"
       ;;
     3)
-      info "Skipped setup. Run 'zeroclaw quickstart' (CLI) or 'zeroclaw daemon' (browser) when ready."
+      info "Skipped setup. Run '$QUICKSTART_COMMAND' (CLI) or 'zeroclaw daemon' (browser) when ready."
       ;;
     *)
-      warn "Unknown choice '$quickstart_choice' — skipping. Run 'zeroclaw quickstart' to configure."
+      warn "Unknown choice '$quickstart_choice' — skipping. Run '$QUICKSTART_COMMAND' to configure."
       ;;
     esac
   else
-    info "Non-interactive — skipping setup prompt. Run 'zeroclaw quickstart' to configure."
+    info "Non-interactive — skipping setup prompt. Run '$QUICKSTART_COMMAND' to configure."
   fi
 fi
+  # >>> end generated:quickstart-handoff <<<
 
 echo
 # Next-step hint, smartest-first: if zerocode (the TUI) was installed, that's

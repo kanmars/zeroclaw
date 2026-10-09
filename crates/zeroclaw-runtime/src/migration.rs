@@ -27,6 +27,7 @@ pub async fn migrate_openclaw_memory(
     config: &Config,
     source_workspace: Option<PathBuf>,
     dry_run: bool,
+    reindex: bool,
 ) -> Result<()> {
     let source_workspace = resolve_openclaw_workspace(source_workspace)?;
     if !source_workspace.exists() {
@@ -60,6 +61,9 @@ pub async fn migrate_openclaw_memory(
         println!("    - from sqlite:   {}", stats.from_sqlite);
         println!("    - from markdown: {}", stats.from_markdown);
         println!();
+        if reindex {
+            println!("Reindex requested: indexes would be rebuilt after import.");
+        }
         println!("Run without --dry-run to import these entries.");
         return Ok(());
     }
@@ -101,12 +105,47 @@ pub async fn migrate_openclaw_memory(
     println!("  Renamed conflicts:{}", stats.renamed_conflicts);
     println!("  Source sqlite rows:{}", stats.from_sqlite);
     println!("  Source markdown:   {}", stats.from_markdown);
+    if reindex {
+        // The import above deliberately goes through a NoopEmbedding-backed
+        // handle for speed, so reindex through a second handle with the
+        // configured embedder wired in - the same construction `zeroclaw
+        // memory reindex` uses - otherwise the backfill could never compute
+        // an embedding regardless of the operator's embedding config.
+        drop(memory);
+        let reindex_memory = reindex_memory_backend(config)?;
+        let reembedded = reindex_memory.reindex().await?;
+        println!("  Reindexed:         yes ({reembedded} embeddings backfilled; FTS rebuilt)");
+    }
 
     Ok(())
 }
 
 fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
-    zeroclaw_memory::create_memory_for_migration(&config.memory.backend, &config.data_dir)
+    let backend = zeroclaw_memory::backend_kind_from_dotted(&config.memory.backend);
+    if zeroclaw_memory::classify_memory_backend(&backend)
+        == zeroclaw_memory::MemoryBackendKind::Qdrant
+    {
+        bail!(crate::i18n::get_required_cli_string(
+            "cli-migrate-openclaw-qdrant-unsupported"
+        ));
+    }
+    zeroclaw_memory::create_memory_for_migration(config)
+}
+
+/// Memory handle for the post-import `--reindex` pass, with the configured
+/// embedder resolved and wired in. Mirrors `zeroclaw memory reindex`
+/// (`create_memory_with_embedder` in the CLI): same storage resolution, same
+/// embedding-route handling, so `migrate openclaw --reindex` is equivalent to
+/// running the standalone reindex command right after the import.
+fn reindex_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
+    zeroclaw_memory::create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        config.resolve_active_storage(),
+        &config.data_dir,
+        None,
+        Some(&config.providers.models),
+    )
 }
 
 fn collect_source_entries(
@@ -500,7 +539,7 @@ mod tests {
         .unwrap();
 
         let config = test_config(target.path());
-        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false)
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, false)
             .await
             .unwrap();
 
@@ -530,12 +569,109 @@ mod tests {
         .unwrap();
 
         let config = test_config(target.path());
-        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), true)
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), true, false)
             .await
             .unwrap();
 
         let target_mem = SqliteMemory::new("test", target.path()).unwrap();
         assert_eq!(target_mem.count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn migration_reindex_uses_same_dotted_sqlite_backend_as_import() {
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let source_db_dir = source.path().join("memory");
+        fs::create_dir_all(&source_db_dir).unwrap();
+
+        let source_db = source_db_dir.join("brain.db");
+        let conn = Connection::open(&source_db).unwrap();
+        conn.execute_batch("CREATE TABLE memories (key TEXT, content TEXT, category TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO memories (key, content, category) VALUES (?1, ?2, ?3)",
+            params!["reindex_key", "reindex searchable content", "core"],
+        )
+        .unwrap();
+
+        let mut config = test_config(target.path());
+        config.memory.backend = "sqlite.default".to_string();
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, true)
+            .await
+            .unwrap();
+
+        let target_mem = SqliteMemory::new("test", target.path()).unwrap();
+        let results = target_mem
+            .recall("searchable", 10, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "reindex_key");
+    }
+
+    #[tokio::test]
+    async fn migration_without_reindex_never_calls_configured_embedding_endpoint() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let source = TempDir::new().unwrap();
+        let target = TempDir::new().unwrap();
+        let source_db_dir = source.path().join("memory");
+        fs::create_dir_all(&source_db_dir).unwrap();
+        let source_db = source_db_dir.join("brain.db");
+        let conn = Connection::open(&source_db).unwrap();
+        conn.execute_batch("CREATE TABLE memories (key TEXT, content TEXT, category TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO memories (key, content, category) VALUES (?1, ?2, ?3)",
+            params!["imported", "historical private content", "core"],
+        )
+        .unwrap();
+        drop(conn);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&requests);
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = zeroclaw_spawn::spawn!(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.unwrap();
+                        observed.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0u8; 4096];
+                        let _ = stream.read(&mut request).await;
+                        let body = r#"{"data":[{"embedding":[0.1,0.2],"index":0}]}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    }
+                }
+            }
+        });
+
+        let mut config = test_config(target.path());
+        config.memory.embedding_provider = format!("custom:http://{endpoint}");
+        config.memory.embedding_model = "test-embedding-model".into();
+        config.memory.embedding_dimensions = 2;
+        migrate_openclaw_memory(&config, Some(source.path().to_path_buf()), false, false)
+            .await
+            .unwrap();
+
+        stop_tx.send(()).unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "ordinary import must not call the configured embedding endpoint"
+        );
+        let imported = SqliteMemory::new("test", target.path()).unwrap();
+        assert!(imported.get("imported").await.unwrap().is_some());
     }
 
     #[test]
@@ -548,6 +684,21 @@ mod tests {
             .err()
             .expect("backend=none should be rejected for migration target");
         assert!(err.to_string().contains("disables persistence"));
+    }
+
+    #[test]
+    fn migration_target_rejects_qdrant_with_localized_operator_guidance() {
+        let target = TempDir::new().unwrap();
+        let mut config = test_config(target.path());
+        config.memory.backend = "qdrant.default".to_string();
+
+        let err = target_memory_backend(&config)
+            .err()
+            .expect("Qdrant is not a supported OpenClaw migration target");
+        let expected =
+            crate::i18n::get_required_cli_string("cli-migrate-openclaw-qdrant-unsupported");
+        assert_eq!(err.to_string(), expected);
+        assert!(!err.to_string().contains("create_memory_"));
     }
 
     // ── §7.1 / §7.2 Config backward compatibility & migration tests ──

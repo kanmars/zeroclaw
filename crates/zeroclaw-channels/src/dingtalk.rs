@@ -124,11 +124,7 @@ impl DingTalkChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("gateway registration failed ({status}): {err}");
-        }
+        let resp = crate::util::ensure_success(resp, "gateway registration").await?;
 
         let gw: GatewayResponse = resp.json().await?;
         Ok(gw)
@@ -188,11 +184,7 @@ impl Channel for DingTalkChannel {
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("webhook reply failed ({status}): {err}");
-        }
+        crate::util::ensure_success(resp, "webhook reply").await?;
 
         Ok(())
     }
@@ -376,6 +368,8 @@ impl Channel for DingTalkChannel {
                         interruption_scope_id: None,
                         attachments: vec![],
                         subject: None,
+
+                        ..Default::default()
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -400,6 +394,15 @@ impl Channel for DingTalkChannel {
 
     async fn health_check(&self) -> bool {
         self.register_connection().await.is_ok()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator API in the DingTalk Open Platform.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

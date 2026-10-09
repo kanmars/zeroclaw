@@ -1,5 +1,5 @@
 //! Stream/draft event types and pacing constants for the turn loop, plus the
-//! loop's `TurnEvent` emission helpers (#7415 consolidation).
+//! loop's `TurnEvent` emission helpersconsolidation).
 
 use super::outcome::ToolLoopCancelled;
 use super::redact::scrub_credentials;
@@ -7,14 +7,70 @@ use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
-use zeroclaw_api::agent::TurnEvent;
+use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
+use zeroclaw_api::attribution::ToolProvenance;
+pub use zeroclaw_api::channel::ProgressEvent;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
-/// Minimum characters per chunk when relaying LLM text to a streaming draft.
+/// Minimum characters per chunk when relaying live model text to draft surfaces.
 pub(crate) const STREAM_CHUNK_MIN_CHARS: usize = 80;
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
+
+/// Shared one-shot acknowledgement slot for [`StreamDelta::FlushBarrier`].
+/// Wrapped in `Arc<Mutex<Option<..>>>` so the enum stays `Clone`; dropping
+/// every clone of the event releases the ack, so a consumer that ignores the
+/// variant can never deadlock the sender.
+pub type FlushBarrierAck =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+
+/// Placeholder text used for newly opened draft messages.
+pub const DRAFT_PLACEHOLDER: &str = "...";
+/// Prefix for liveness-only thinking/reasoning progress.
+pub const THINKING_STATUS_PREFIX: &str = "\u{1f914} ";
+/// Prefix for opt-in raw reasoning progress.
+pub const REASONING_FULL_PREFIX: &str = THINKING_STATUS_PREFIX;
+const THINKING_STATUS_LABEL: &str = "Thinking...";
+const THINKING_STATUS_ROUND_PREFIX: &str = "Thinking (round ";
+const THINKING_STATUS_ROUND_SUFFIX: &str = ")...";
+
+/// Status-mode reasoning tick that does not expose raw reasoning text.
+pub fn thinking_status_text(iteration: usize) -> String {
+    let round = iteration + 1;
+    if round == 1 {
+        format!("{THINKING_STATUS_PREFIX}{THINKING_STATUS_LABEL}\n")
+    } else {
+        format!(
+            "{THINKING_STATUS_PREFIX}{THINKING_STATUS_ROUND_PREFIX}{round}{THINKING_STATUS_ROUND_SUFFIX}\n"
+        )
+    }
+}
+
+/// Parse the label portion of a generated status-mode reasoning line.
+pub fn thinking_status_label_round(label: &str) -> Option<usize> {
+    if label == THINKING_STATUS_LABEL {
+        return Some(1);
+    }
+    label
+        .strip_prefix(THINKING_STATUS_ROUND_PREFIX)
+        .and_then(|rest| rest.strip_suffix(THINKING_STATUS_ROUND_SUFFIX))
+        .and_then(|round| round.parse::<usize>().ok())
+        .filter(|round| *round > 1)
+}
+
+/// Comparable round number for a generated status-mode reasoning line.
+pub fn thinking_status_round(text: &str) -> Option<usize> {
+    let label = text
+        .strip_prefix(THINKING_STATUS_PREFIX)?
+        .strip_suffix('\n')?;
+    thinking_status_label_round(label)
+}
+
+/// Whether a progress line is one of the liveness-only thinking status lines.
+pub fn is_thinking_status_text(text: &str) -> bool {
+    thinking_status_round(text).is_some()
+}
 
 /// Delta sent from the agent loop to the channel's draft updater.
 /// Append-only — no clear/reset variant exists by design.
@@ -24,16 +80,103 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// A pending tool call. Channel draft consumers decide how to render its
+    /// arguments; the runtime keeps this event structured to avoid coupling a
+    /// transport-specific disclosure policy into the agent loop.
+    ToolStart {
+        tool: String,
+        arguments: std::sync::Arc<serde_json::Value>,
+        /// Canonical trust origin carried from the resolved static or activated
+        /// tool. `None` means the name did not resolve in either registry.
+        tool_provenance: Option<ToolProvenance>,
+    },
+    /// A completed tool call paired with its original arguments.
+    ToolComplete {
+        tool: String,
+        arguments: std::sync::Arc<serde_json::Value>,
+        /// The same trust origin observed when the matching start event was
+        /// emitted; consumers must treat `None` as untrusted.
+        tool_provenance: Option<ToolProvenance>,
+        secs: u64,
+        success: bool,
+        error: Option<String>,
+    },
+    /// Provider reasoning text. Channel surfaces must opt in before rendering.
+    Reasoning(String),
+    /// Typed, non-sensitive agent lifecycle progress.
+    Lifecycle(ProgressEvent),
+    /// Rendezvous barrier: flush any buffered draft narration for the
+    /// in-flight turn, then ack. Queue FIFO guarantees all prior `Text`
+    /// deltas were consumed first, letting the agent loop ensure narration
+    /// reaches the channel before a direct call (e.g. an approval prompt)
+    /// overtakes it.
+    FlushBarrier(FlushBarrierAck),
+}
+
+impl StreamDelta {
+    /// Render structured tool events with the historical conservative policy.
+    /// Non-Matrix consumers must use this instead of serializing arguments.
+    #[must_use]
+    pub fn legacy_status(&self) -> Option<String> {
+        match self {
+            Self::ToolStart {
+                tool, arguments, ..
+            } => Some(super::progress::render_tool_start_progress(tool, arguments)),
+            Self::ToolComplete {
+                tool,
+                arguments,
+                secs,
+                success,
+                error,
+                ..
+            } => Some(super::progress::render_tool_completion_progress(
+                tool,
+                arguments,
+                *secs,
+                *success,
+                error.as_deref(),
+            )),
+            Self::Text(_)
+            | Self::Status(_)
+            | Self::Reasoning(_)
+            | Self::Lifecycle(_)
+            | Self::FlushBarrier(_) => None,
+        }
+    }
+}
+
+/// Send a typed lifecycle state through the draft stream without exposing tool
+/// names, arguments, prompts, provider output, or error details.
+pub(crate) async fn send_progress(on_delta: Option<&Sender<DraftEvent>>, event: ProgressEvent) {
+    if let Some(tx) = on_delta {
+        let _ = tx.send(StreamDelta::Lifecycle(event)).await;
+    }
+}
+
+impl StreamDelta {
+    /// Build a flush barrier event plus the receiver that resolves once the
+    /// consumer acks it (or drops the event).
+    pub fn flush_barrier() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        (
+            Self::FlushBarrier(std::sync::Arc::new(std::sync::Mutex::new(Some(ack_tx)))),
+            ack_rx,
+        )
+    }
+
+    /// Fire a barrier ack exactly once across all clones of the event.
+    pub fn ack_flush_barrier(ack: &FlushBarrierAck) {
+        if let Ok(mut slot) = ack.lock()
+            && let Some(tx) = slot.take()
+        {
+            let _ = tx.send(());
+        }
+    }
 }
 
 /// Backwards-compatible alias while callers are migrated.
 pub type DraftEvent = StreamDelta;
 
-/// Send `text` to the draft channel in word-aligned chunks of at least
-/// [`STREAM_CHUNK_MIN_CHARS`] (upstream loop body, no-tool-calls final exit).
-/// Used when the final response wasn't already streamed live. Honors the
-/// cancellation token between chunks; a closed receiver stops chunking
-/// silently.
 pub(crate) async fn stream_text_posthoc_chunks(
     on_delta: &Sender<DraftEvent>,
     text: &str,
@@ -60,24 +203,12 @@ pub(crate) async fn stream_text_posthoc_chunks(
     Ok(())
 }
 
-/// Resolve the stable correlation id for a parsed call. Native calls carry
-/// their own `tool_call_id`; text-protocol calls are id-less, so a fresh UUID
-/// is synthesized. Callers that emit the pending `ToolCall` and the later
-/// `ToolResult` separately must resolve the id once and reuse it so both
-/// halves correlate (ACP/WS clients key on it).
 pub(crate) fn resolve_tool_call_id(call: &ParsedToolCall) -> String {
     call.tool_call_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
 }
 
-/// Emit the pending `TurnEvent::ToolCall` for a call that is about to execute.
-///
-/// This is the event ACP/WS clients render as the live "tool running" card.
-/// It must be sent BEFORE the tool blocks so a long-running tool surfaces in
-/// the window immediately instead of leaving the turn visibly idle until the
-/// result lands. `id` must equal the value passed to the matching
-/// [`emit_tool_result`] so the result updates the same card.
 pub(crate) async fn emit_tool_call_pending(
     event_tx: &Sender<TurnEvent>,
     id: &str,
@@ -105,6 +236,12 @@ pub(crate) async fn emit_tool_result(
             id: id.to_string(),
             name: name.to_string(),
             output: scrub_credentials(&outcome.output),
+            // Project the tool's structured output into typed artifact metadata
+            // when it declared a delivered file, so channels never parse `output`.
+            artifact: outcome
+                .output_data
+                .as_ref()
+                .and_then(ToolArtifact::from_delivered_data),
         })
         .await;
 }
@@ -140,6 +277,26 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[tokio::test]
+    async fn flush_barrier_ack_resolves_receiver() {
+        let (event, rx) = StreamDelta::flush_barrier();
+        if let StreamDelta::FlushBarrier(ack) = &event {
+            StreamDelta::ack_flush_barrier(ack);
+        }
+        assert!(rx.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn flush_barrier_dropped_event_releases_receiver() {
+        // A consumer that ignores the variant must not deadlock the sender:
+        // dropping the last clone of the event closes the ack channel.
+        let (event, rx) = StreamDelta::flush_barrier();
+        let clone = event.clone();
+        drop(event);
+        drop(clone);
+        assert!(rx.await.is_err());
+    }
+
     fn parsed_call(id: Option<&str>) -> ParsedToolCall {
         ParsedToolCall {
             name: "echo".into(),
@@ -151,15 +308,29 @@ mod tests {
     fn ok_outcome() -> ToolExecutionOutcome {
         ToolExecutionOutcome {
             output: "out".into(),
+            attachments: Vec::new(),
             success: true,
             error_reason: None,
             duration: Duration::ZERO,
             receipt: None,
+            output_data: None,
         }
     }
 
-    /// Text-protocol calls have no id; the pair must still correlate via a
-    /// fresh non-empty id, and two id-less calls must never share one.
+    #[test]
+    fn thinking_status_parser_requires_exact_generated_status_text() {
+        assert!(is_thinking_status_text(&thinking_status_text(0)));
+        assert_eq!(thinking_status_round(&thinking_status_text(0)), Some(1));
+        assert!(is_thinking_status_text(&thinking_status_text(1)));
+        assert_eq!(thinking_status_round(&thinking_status_text(1)), Some(2));
+        assert!(!is_thinking_status_text(&format!(
+            "{REASONING_FULL_PREFIX}Thinking (round 2) through the next option"
+        )));
+        assert!(!is_thinking_status_text(&format!(
+            "{THINKING_STATUS_PREFIX}Thinking (round 1)...\n"
+        )));
+    }
+
     #[tokio::test]
     async fn idless_calls_get_distinct_synthesized_pair_ids() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -187,7 +358,6 @@ mod tests {
         assert_ne!(ids[0], ids[2], "distinct calls must get distinct ids");
     }
 
-    /// Parser-assigned ids pass through untouched.
     #[tokio::test]
     async fn existing_ids_pass_through() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -203,9 +373,6 @@ mod tests {
         }
     }
 
-    /// Split emit: a pending ToolCall sent before execution and a ToolResult
-    /// sent after must correlate via the resolved id so the client updates the
-    /// same card. This is the load-bearing contract for the live tool card.
     #[tokio::test]
     async fn split_pending_then_result_share_resolved_id() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -232,16 +399,16 @@ mod tests {
         );
     }
 
-    /// The UI-facing `ToolResult` event is scrubbed at the rendering boundary,
-    /// even though the source outcome carries raw bytes on the data path.
     #[tokio::test]
     async fn tool_result_event_is_scrubbed_for_rendering() {
         let outcome = ToolExecutionOutcome {
             output: "api_key = \"sk-live-abcd1234efgh5678\"".into(),
+            attachments: Vec::new(),
             success: true,
             error_reason: None,
             duration: Duration::ZERO,
             receipt: None,
+            output_data: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         emit_tool_call_pair(&tx, &parsed_call(Some("c1")), &outcome).await;

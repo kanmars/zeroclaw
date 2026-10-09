@@ -1,31 +1,11 @@
-export interface StatusResponse {
-  version?: string;
-  /** Dotted `<type>.<alias>` of the first configured model provider, or null
-   *  when none is configured. "provider" alone is reserved — always qualify. */
-  model_provider: string | null;
-  model: string;
-  temperature: number;
-  uptime_seconds: number;
-  /** RFC 3339 wall-clock of daemon start. Stable across the daemon's
-   *  lifetime so the Logs page can default `since_ts` to "since daemon
-   *  start" without a separate `/api/logs` round-trip. */
-  daemon_started_at?: string;
-  gateway_port: number;
-  locale: string;
-  memory_backend: string;
-  paired: boolean;
-  channels: Record<string, boolean>;
-  health: HealthSnapshot;
-  /** Self-process resource snapshot. Present on Linux; on unsupported
-   * platforms `rss_bytes = 0` and `cpu_percent = null`. */
-  process?: ProcessStats;
-}
+import type { components } from "../lib/api-generated";
+
+export type StatusResponse = components["schemas"]["StatusResponse"];
 
 export interface ProcessStats {
   rss_bytes: number;
-  /** Total system RAM in bytes (`/proc/meminfo`'s `MemTotal`). `0` on
-   * unsupported platforms; render the RAM tile as `rss / total * 100%`
-   * when this is non-zero. */
+  /** Total system RAM in bytes. `0` on unsupported platforms; render the
+   * RAM tile as `rss / total * 100%` when this is non-zero. */
   system_ram_total_bytes: number;
   /** Average CPU% across logical cores (0..100 * num_cpus). `null` on the
    * first sample after boot (no baseline) or on unsupported platforms. */
@@ -48,10 +28,20 @@ export interface ComponentHealth {
   restart_count: number;
 }
 
+export type OptionDomain =
+  | "channel_refs"
+  | "peer_targets"
+  | "peer_groups"
+  | "agent_aliases"
+  | "tool_names"
+  | "memory_categories";
+
 export interface ToolSpec {
   name: string;
   description: string;
   parameters: any;
+  output?: any;
+  param_domains?: Record<string, OptionDomain>;
 }
 
 export interface CronDeliveryConfig {
@@ -77,6 +67,7 @@ export interface CronJob {
   enabled: boolean;
   delivery: CronDeliveryConfig;
   delete_after_run: boolean;
+  uses_memory: boolean;
   session_target: string | null;
   model: string | null;
   allowed_tools: string[] | null;
@@ -108,6 +99,12 @@ export interface Integration {
   /** Human-readable display label derived by the API from the category enum. */
   category_label: string;
   status: "Available" | "Active";
+  /** Canonical ChannelsConfig map key (or model-provider family key) for
+   *  entries backed by a schema config slot. It can differ from a runtime
+   *  channel kind when multiple backends share one config map. Route config
+   *  deep links on this, never on a slug of `name`; `null` when the entry has
+   *  no config section. */
+  key: string | null;
 }
 
 export interface DiagResult {
@@ -239,6 +236,8 @@ export interface WsMessage {
     | "connected"
     | "cron_result"
     | "approval_request"
+    | "history_trimmed"
+    | "safeguard_fallback"
     | "aborted";
   content?: string;
   full_response?: string;
@@ -254,11 +253,46 @@ export interface WsMessage {
   timestamp?: string;
   job_id?: string;
   success?: boolean;
+  // History-trim token accounting (server → client). Absent on message-limit
+  // trims and on older daemons; clients fall back to the count-only notice.
+  token_budget?: number;
+  tokens_before?: number;
+  tokens_after?: number;
+  tokens_before_source?: string;
+  tokens_after_source?: string;
+  // The retained request cannot fit the configured budget (protected newest
+  // turn plus schemas) even after trimming. History MAY have been trimmed on
+  // the way to that floor, so this flag — not `dropped_messages === 0` — is
+  // the authoritative "unsatisfiable" signal. Absent for ordinary trims and
+  // older daemons.
+  unsatisfiable_floor?: boolean;
   // Supervised-mode tool approval (server → client). See #6522.
   request_id?: string;
   tool?: string;
   arguments_summary?: string;
   timeout_secs?: number;
+  dropped_messages?: number;
+  dropped_turns?: number;
+  kept_turns?: number;
+  reason?: string;
+  // Safety-safeguard fallback notice (server → client), present only on
+  // "safeguard_fallback" frames. Display-only: the gateway sends just the
+  // model names and which layer switched (`server`/`client`) — never the
+  // classifier category or refusal explanation. See #9262-#9268 (provider
+  // plumbing) plus the gateway/web surfacing built on top of it.
+  requested_model?: string;
+  served_model?: string;
+  fallback_kind?: "server" | "client" | "client_server";
+  // Context window info (present on "done" frames). See #7311.
+  // `max_context_tokens` is the preemptive-trim budget the bar fills toward;
+  // `model_context_window` is the model's full capacity (bar denominator when present).
+  max_context_tokens?: number;
+  model_context_window?: number | null;
+  input_tokens?: number;
+  output_tokens?: number;
+  // Emitted as JSON null when the accepted call reports no usage (stale
+  // route protection); consumers must branch on null, not undefined.
+  last_input_tokens?: number | null;
 }
 
 export type ApprovalDecision = "approve" | "deny" | "always";

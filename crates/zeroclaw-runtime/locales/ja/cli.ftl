@@ -15,6 +15,27 @@ cli-models-about = プロバイダーモデルカタログを管理
 cli-providers-about = サポートされているAIプロバイダーをリスト表示
 cli-channel-about = 通信チャネルを管理
 cli-integrations-about = 50以上の統合を参照
+cli-integrations-unknown = 不明なインテグレーション: {$name}。対応しているインテグレーションは README を確認してください。モデルプロバイダーを設定するには {$quickstart} を実行し、チャネルには {$channel_config} を実行してください。
+cli-integrations-category-heading = カテゴリ
+cli-integrations-category-chat = チャットプロバイダー
+cli-integrations-category-ai-model = AIモデル
+cli-integrations-category-tools-automation = ツールと自動化
+cli-integrations-category-platform = プラットフォーム
+cli-integrations-status-heading = 状態
+cli-integrations-status-active = 有効
+cli-integrations-status-available = 利用可能
+cli-integrations-setup-heading = セットアップ
+cli-integrations-setup-macos-heading = セットアップ (macOS専用)
+cli-integrations-builtin-heading = 組み込み
+cli-integrations-chat-telegram-prepare = {$channel} で {$botfather} にメッセージを送り、ボットを作成してトークンを取得します。
+cli-integrations-chat-discord-prepare = {$url} でボットを作成し、トークンを取得して {$intent} インテントを有効にします。
+cli-integrations-chat-slack-prepare = {$url} でアプリを作成し、ボットの権限を設定して Socket Mode を有効にし、アプリレベルトークンを作成してから、アプリをインストールしてボットトークンを取得します。
+cli-integrations-chat-configure = {$command} を起動して設定を開き、{$channel} のインスタンスと認証情報を設定します。
+cli-integrations-chat-bind = チャンネルのエイリアスをエージェントに関連付け、ピアグループのアクセス権を確認します。
+cli-integrations-chat-enable = 設定とアクセス権を確認してから、チャンネルのインスタンスを有効にします。
+cli-integrations-chat-imessage-transport = AppleScript オートメーションでメッセージを送信し、ローカルの「メッセージ」データベースを読み取って受信します。
+cli-integrations-chat-imessage-permissions = 「メッセージ」を操作するための macOS の「オートメーション」と、メッセージデータベースを読み取るための「フルディスクアクセス」を許可します。
+cli-integrations-chat-generic-setup = {$command} を実行して「設定」を開き、{$channel} に必要なフィールド、ルーティング、アクセス権を設定します。設定を確認してから有効にしてください。
 cli-skills-about = スキル (ユーザー定義機能) を管理
 cli-sop-about = 標準操作手順 (SOP) を管理
 cli-migrate-about = 他のエージェントランタイムからデータを移行
@@ -26,7 +47,7 @@ cli-config-about = ZeroClaw設定を管理
 cli-update-about = ZeroClaw更新を確認・適用
 cli-self-test-about = 診断自己テストを実行
 cli-completions-about = シェル補完スクリプトを生成
-cli-desktop-about = ZeroClawコンパニオンデスクトップアプリを起動
+cli-desktop-about = コンパニオンデスクトップアプリを起動、またはダウンロードページを開く
 cli-config-schema-about = 完全な設定JSONスキーマをstdoutにダンプ
 cli-config-list-about = すべての設定プロパティを現在の値とともにリスト表示
 cli-config-get-about = 設定プロパティ値を取得
@@ -61,8 +82,11 @@ cli-wechat-login-confirmed-missing-field = ログインは確認されました�
 cli-wechat-connected = ✅ WeChat に接続しました！
 cli-wechat-bound-success = ✅ WeChatアカウントが正常にバインドされました。これで ZeroClaw と会話できます。
 cli-wechat-invalid-bind-code = ❌ 無効なバインドコードです。もう一度お試しください。
+cli-wechat-bind-denied = ❌ このアカウントは設定の `ignore` 項目によりブロックされています。運用者に削除を依頼してから同じコードで再試行してください。
+cli-wechat-bind-not-saved = ❌ 連携を保存できなかったため、変更はありません。コードは引き続き有効です。運用者に設定ファイルの確認を依頼してから再試行してください。
 cli-skills-list-about = すべてのインストール済みスキルをリスト表示
 cli-skills-audit-about = スキルソースディレクトリまたはインストール済みスキル名を監査
+cli-skills-audit-failed = スキル監査に失敗しました。
 cli-skills-install-about = URLまたはローカルパスから新しいスキルをインストール
 cli-skills-remove-about = インストール済みスキルを削除
 cli-skills-test-about = スキル (またはすべてのスキル) の TEST.sh 検証を実行
@@ -70,8 +94,26 @@ cli-skills-review-summary = { "  " }💾 スキルレビュー: {$summary}
 cli-skills-install-start = スキルをインストール中: {$source}
 cli-skills-install-resolving-registry = { "  " }スキルレジストリから '{$source}' を解決中...
 cli-skills-install-resolving-extra-registry = { "  " }レジストリ '{$registry}' から '{$source}' を解決中...
+cli-skills-install-skill-requires-git = --skill <name> には、ソースとして git リポジトリ URL が必要です（'{$source}' が指定されました）
+cli-skills-install-catalog-failed = カタログ {$source} からスキル '{$skill}' のインストールに失敗しました
+cli-skills-install-invalid-skill-name = 無効な --skill 名 '{$skill}': 単独のスキル名（英字、数字、'-'、'_'）を使用してください
+cli-skills-install-catalog-clone-failed = スキルカタログ {$url} のクローンに失敗しました
+cli-skills-install-skill-not-in-catalog-empty = スキル '{$skill}' は {$url} に見つかりません: skills/ ディレクトリが存在しないか、空です
+cli-skills-install-skill-not-in-catalog = スキル '{$skill}' は {$url} に見つかりません。\n利用可能なスキル: {$available}
+cli-skills-install-catalog-root-symlink = スキルカタログ {$url} にはシンボリックリンクされた skills/ ディレクトリがあるため、検査を拒否します
+cli-skills-install-catalog-root-escapes = スキルカタログ {$url} の skills/ ディレクトリはクローンしたカタログの外部に解決されるため、検査を拒否します
+cli-skills-install-catalog-skill-symlink = {$url} 内のスキル '{$skill}' はシンボリックリンクです。カタログのスキルはリポジトリ内の実体のあるディレクトリでなければなりません
+cli-skills-install-catalog-skill-escapes = {$url} 内のスキル '{$skill}' はクローンしたカタログの外部に解決されるため、インストールを拒否します
+cli-skills-install-git-failed = git スキルソースのインストールに失敗しました: {$source}
+cli-skills-install-registry-failed = レジストリからのスキルのインストールに失敗しました: {$source}
+cli-skills-install-extra-registry-failed = 追加レジストリからのスキルのインストールに失敗しました: {$source}
+cli-skills-install-local-failed = ローカルスキルソースのインストールに失敗しました: {$source}
 cli-skills-install-installed-audited = { "  " }{$status} スキルがインストールされ、監査されました: {$path}（{$files} ファイルをスキャン）
 cli-skills-install-security-audit-completed = { "  " }セキュリティ監査が正常に完了しました。
+cli-skills-install-into-bundle = { "  " }バンドル '{$alias}' にインストールしました。skill_bundles にこのバンドルを列挙しているエージェントが読み込みます。
+cli-skills-install-global-note = { "  " }注意: グローバルスキルディレクトリにインストールされましたが、どのエージェントも自動的には読み込みません。読み込み可能にするには --bundle <alias> を付けて再実行するか、バンドルをエージェントに割り当ててください。
+cli-skills-removed-archived = { "  " }{$status} スキル '{$name}' をバンドル '{$bundle}' から削除しました（shared/skills/_deleted/ 配下にアーカイブされました）。
+cli-skills-removed-global = { "  " }{$status} スキル '{$name}' をグローバルスキルディレクトリから削除しました。
 cli-skills-install-tier-official = {$name} v{$version} をインストール中 — 公式（zeroclaw-labs 管理）
 cli-skills-install-tier-community =
     {$name} v{$version} をインストール中 — コミュニティ提出
@@ -109,10 +151,19 @@ cli-cron-remove-about = スケジュールタスクを削除
 cli-cron-update-about = 既存のスケジュールタスクの 1 つ以上のフィールドを更新
 cli-cron-pause-about = スケジュールタスクを一時停止
 cli-cron-resume-about = 一時停止したタスクを再開
-cli-auth-login-about = OAuth でログイン (OpenAI Codex または Gemini)
-cli-auth-refresh-about = リフレッシュトークンを使用して OpenAI Codex アクセストークンをリフレッシュ
+cli-auth-login-about = OAuth でログイン (OpenAI Codex、Gemini、または xAI)
+cli-auth-refresh-about = リフレッシュトークンを使用して OAuth アクセストークンを更新
 cli-auth-logout-about = 認証プロファイルを削除
 cli-auth-use-about = プロバイダーのアクティブなプロファイルを設定
+cli-oidc-unknown-alias = 設定に [oidc.{ $alias }] エントリがありません。設定済みのエントリ: { $known }
+cli-oidc-device-visit = サインインするには { $uri } を開き、コード { $code } を入力してください
+cli-oidc-device-waiting = ID プロバイダーの承認を待っています(コードは { $seconds } 秒で失効します)...
+cli-oidc-device-expired = 承認前にデバイスコードが失効しました。コマンドを再実行してください。
+cli-oidc-enrolled = [oidc.{ $alias }] に登録しました。アクセストークンは標準出力にあります。RPC ハンドシェイクの auth_token として渡すか、ZEROCLAW_AUTH_TOKEN としてエクスポートしてください。
+cli-oidc-token-expiry = トークンは { $seconds } 秒で失効します。
+cli-oidc-browser-open = サインインのためにブラウザを開いています。開かない場合は次の URL にアクセスしてください:
+    { $uri }
+cli-oidc-browser-waiting = ブラウザでのサインイン完了を待っています...
 cli-auth-list-about = 認証プロファイルを一覧表示
 cli-auth-status-about = アクティブなプロファイルとトークン有効期限情報を表示
 cli-memory-list-about = オプションのフィルター付きでメモリエントリを一覧表示
@@ -128,6 +179,7 @@ cli-models-set-about = 設定でデフォルトモデルを設定
 cli-models-status-about = 現在のモデル設定とキャッシュステータスを表示
 cli-doctor-models-about = プロバイダー全体のモデルカタログをプローブして可用性を報告
 cli-doctor-traces-about = ランタイムトレースイベント (ツール診断とモデル応答) をクエリ
+cli-doctor-update-context-windows-about = プロバイダーの /models エンドポイントから config.toml の context_window を更新
 cli-hardware-discover-about = USB デバイスを列挙して既知のボードを表示
 cli-hardware-introspect-about = デバイスをそのシリアル番号またはデバイスパスで内省
 cli-hardware-info-about = ST-Link 経由 probe-rs を使用して USB でチップ情報を取得
@@ -138,6 +190,7 @@ cli-sop-list-about = ロードされた SOP を一覧表示
 cli-sop-validate-about = SOP 定義を検証
 cli-sop-show-about = SOP の詳細を表示
 cli-migrate-openclaw-about = OpenClaw ワークスペースからこの ZeroClaw ワークスペースにメモリをインポート
+cli-migrate-openclaw-qdrant-unsupported = Qdrant は現在、OpenClaw の移行先としてサポートされていません。memory.backend を sqlite、lucid、または markdown に設定して再試行してください。
 cli-agent-long-about =
     AI エージェントループを起動します。
 
@@ -166,6 +219,7 @@ cli-acp-long-about =
 
     例:
     zeroclaw acp                        # ACP サーバーを起動
+    zeroclaw acp --agent fable         # 新しいセッションの既定エージェントを fable に設定
     zeroclaw acp --max-sessions 5       # 同時セッション数を制限
 cli-daemon-long-about =
     長時間実行の自律型デーモンを起動します。
@@ -187,12 +241,12 @@ cli-cron-long-about =
 
     例:
     zeroclaw cron list
-    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-    zeroclaw cron add '*/5 * * * *' 'echo ok'
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-    zeroclaw cron add-every 60000 'Ping heartbeat'
-    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+    zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause TASK_ID
     zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =
@@ -287,6 +341,11 @@ cli-skills-install-suggestion =
 
     一致した機能: {$matched}
     次: `{$install_command}` を実行してインストールしてください。
+cli-plugin-install-suggestion =
+    このリクエストには `{$name}` プラグインが必要なようですが、インストールされていません。
+
+    一致した機能: {$matched}
+    次: `{$install_command}` を実行してインストールしてください。
 cli-completions-long-about =
     `zeroclaw` のシェル補完スクリプトを生成します。
 
@@ -301,11 +360,11 @@ cli-desktop-long-about =
 
     コンパニオンアプリは、CLI と同じゲートウェイに接続する軽量のメニューバー/システムトレイアプリケーションです。ダッシュボードへのクイックアクセス、ステータス監視、およびデバイスペアリングを提供します。
 
-    --install を使用して、プラットフォーム用の事前ビルドコンパニオンアプリをダウンロードしてください。
+    --install を使用すると、プラットフォーム用のダウンロードページが開きます。それ自体は何もインストールしません。
 
     例:
     zeroclaw desktop              # コンパニオンアプリを起動
-    zeroclaw desktop --install    # ダウンロードしてインストール
+    zeroclaw desktop --install    # ダウンロードページを開く
 channel-needs-quickstart-reply = このエージェントはまだ完全にセットアップされていません。返信する前に、オペレーターがQuickstartを実行する必要があります。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web は設定されていますが、'whatsapp-web' 機能がコンパイルされていません。
 channel-whatsapp-web-feature-missing-build = ビルド/実行: cargo build --features whatsapp-web
@@ -348,10 +407,23 @@ channel-wecom-ws-dm-access-denied =
 channel-discord-interaction-unauthorized = このコマンドをここで使用する権限がありません。
 channel-discord-interaction-malformed = 不明または不正なコマンドです。
 channel-discord-interaction-unavailable = このコマンドは利用できなくなったか、入力が空でした。
+channel-discord-component-expired = このボタンまたはメニューは期限切れになったか、すでに使用されています。
+channel-discord-approval-recorded = あなたの決定が記録されました。
 channel-discord-delivery-failure-note-one = （注意：{$count}個のファイルを配信できませんでした。）
 channel-discord-delivery-failure-note-many = （注意：{$count}個のファイルを配信できませんでした。）
 channel-whatsapp-web-delivery-failure-note-one = （注意：{$count}件のWhatsAppメディア添付ファイルを配信できませんでした。）
 channel-whatsapp-web-delivery-failure-note-many = （注意：{$count}件のWhatsAppメディア添付ファイルを配信できませんでした。）
+channel-line-bind-success = ✅ ペアリングしました！チャットできるようになりました。
+channel-line-bind-invalid-code = ❌ 無効なコードです。もう一度お試しください。
+channel-line-bind-rate-limited = ⏳ 試行回数が多すぎます。{ $secs }秒後に再試行してください。
+channel-line-bind-denied = ❌ このアカウントは `ignore` 設定によりブロックされています。運用者に削除を依頼してから再試行してください。
+channel-line-bind-not-saved = ❌ 連携を保存できなかったため、変更はありません。コードは引き続き有効です。運用者に設定ファイルの確認を依頼してから再試行してください。
+channel-telegram-cmd-new-desc = 新しい会話セッションを開始
+channel-telegram-cmd-clear-desc = この会話セッションをクリア
+channel-telegram-cmd-stop-desc = 実行中のタスクをキャンセル
+channel-telegram-cmd-model-desc = 現在のモデルを表示または切り替え
+channel-telegram-cmd-models-desc = 利用可能なモデルプロバイダーを一覧表示、またはプロバイダーを切り替え
+channel-telegram-cmd-config-desc = 現在の設定を表示
 onboard-openai-auth-note =
     OpenAI認証:
     • APIキー — platform.openai.com 経由の標準APIアクセス (sk-...)
@@ -365,10 +437,20 @@ onboard-openai-codex-followup =
 cli-web-dist-dir-reason-tilde = 展開されない `~` で始まっています
 cli-web-dist-dir-reason-dollar = 展開されない `$` が含まれています
 cli-doctor-web-dist-dir-expansion-warning = gateway.web_dist_dir = "{$path}" — {$reason}。gateway.web_dist_dir はそのまま読み込まれるため、値を自分で展開してください（例: 絶対パス）
+cli-doctor-codex-auth-profile-no-slot = OpenAI Codex 認証情報にサインインしていますが、それを使用するモデルプロバイダースロットがありません。OpenAI プロバイダースロットで `requires_openai_auth = true` を設定し、エージェントの `model_provider` をそこへ向けるか、`zeroclaw quickstart` を実行してください。
+cli-doctor-codex-auth-slot-no-profile = OpenAI スロット {$slots} は `requires_openai_auth = true` を設定していますが、OpenAI Codex 認証情報にサインインしていません。`zeroclaw auth login --provider openai-codex` を実行してください。
+cli-doctor-codex-auth-ok = OpenAI Codex 認証情報にサインインしており、モデルプロバイダースロットから参照されています。
+cli-doctor-bootstrap-file-truncated-compact = [{$alias}] {$file}：このファイルを注入するエージェントループおよびチャンネルのターンでは、ファイルごとの上限により {$total} 文字中 {$retained} 文字が保持されます（{$discarded} 文字を破棄、プロンプト全体の予算より前の段階）。このエージェントでは compact_context が有効です。各ブートストラップファイルは {$limit} 文字に制限されます。`[runtime_profiles.{$profile}]` で `compact_context = false` を設定するか、ファイルを短くしてください。
+cli-doctor-bootstrap-file-truncated-compact-no-profile = [{$alias}] {$file}：このファイルを注入するエージェントループおよびチャンネルのターンでは、ファイルごとの上限により {$total} 文字中 {$retained} 文字が保持されます（{$discarded} 文字を破棄、プロンプト全体の予算より前の段階）。このエージェントでは compact_context が有効です（既定値、ランタイムプロファイルは未割り当て）。各ブートストラップファイルは {$limit} 文字に制限されます。`compact_context = false` を指定した `[runtime_profiles.<name>]` を追加し、エージェントに `runtime_profile = "<name>"` を設定してください。またはファイルを短くしてください。
+cli-doctor-bootstrap-file-truncated = [{$alias}] {$file}：このファイルを注入するエージェントループおよびチャンネルのターンでは、ファイルごとの上限により {$total} 文字中 {$retained} 文字が保持されます（{$discarded} 文字を破棄、プロンプト全体の予算より前の段階）。各ブートストラップファイルは {$limit} 文字に制限されます。ファイルを短くしてください。
+cli-doctor-systemd-linger-enabled = systemd ユーザー linger は有効です
+cli-doctor-systemd-linger-disabled = systemd ユーザー linger は無効です。ログアウト後にユーザーサービスが停止する可能性があります。有効化: loginctl enable-linger {$user}
+cli-doctor-systemd-linger-unknown = loginctl で systemd ユーザー linger を確認できませんでした
 cli-self-test-web-dist-dir-name = web_dist_dir
 cli-self-test-web-dist-dir-pass-unset = 未設定（自動検出を使用）
 cli-self-test-web-dist-dir-pass-literal = {$path}（リテラルパス）
 cli-self-test-web-dist-dir-fail-expansion = 警告: {$path} — {$reason}。gateway.web_dist_dir はそのまま読み込まれるため、値を自分で展開してください（例: 絶対パス）
+cli-service-systemd-linger-disabled-warning = systemd ユーザー linger は無効です。ZeroClaw のユーザーサービスはログアウト後に停止する可能性があります。有効化: loginctl enable-linger {$user}
 cli-peripherals-none = 周辺機器が設定されていません。
 cli-peripherals-add-hint = 次のコマンドで追加します: zeroclaw peripheral add <board> <path>
 cli-peripherals-add-example = {"  "}例: zeroclaw peripheral add nucleo-f401re <serial-path>
@@ -383,13 +465,32 @@ cli-skills-none-installed = スキルがインストールされていません�
 cli-skills-create-hint = {"  "}作成: mkdir -p ~/.zeroclaw/workspace/skills/my-skill
 cli-skills-install-hint = {"  "}またはインストール: zeroclaw skills install <source>
 cli-skills-installed-header = インストール済みのスキル ({$count}):
+cli-skills-list-group-bundle = バンドル: {$alias}
+cli-skills-list-group-agent = エージェント '{$alias}' によって読み込み
+cli-skills-list-group-global = グローバル / open-skills / プラグイン（バンドル外）
+cli-skills-agent-not-configured = エージェント '{$alias}' は設定されていません
+cli-skills-agent-multiple-bundles = エージェント '{$alias}' には複数のスキルバンドル ({$bundles}) があります。--bundle で1つを選択してください
+cli-skills-multiple-locations-bundle = スキル '{$name}' は複数の場所 ({$locations}) に存在します。--bundle で1つを選択してください
+cli-skills-multiple-locations-path = スキル '{$name}' は複数の場所 ({$locations}) に存在します。明示的なパスを渡して区別してください
 cli-skills-tags = タグ:  {$tags}
+cli-skills-skipped-header = スキップ済み ({$count}):
+cli-skills-skipped-reason = {"    "}理由: {$reason}
+cli-skills-skipped-scripts-hint = {"    "}有効にするには、zeroclaw の設定で `skills.allow_scripts = true` を設定してください。
 cli-sop-none = SOP が見つかりません。
-cli-sop-create-hint = {"  "}作成: mkdir -p <workspace>/sops/my-sop
+cli-sop-pending-none = 承認待ちの SOP 実行はありません。
+cli-sop-pending-header = 承認待ちの SOP 実行:
+cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] ステップ {$step}/{$total}
+cli-sop-status-failure-reason = 失敗の理由: {$reason}
+cli-sop-ws-invalid-approval = sop approval_response には run_id と approve または deny の決定が必要です
+cli-sop-ws-resolve-failed = SOP の解決に失敗しました: {$error}
+cli-sop-ws-engine-lock-poisoned = SOP エンジンロックがポイズンされました
+cli-sop-ws-subsystem-disabled = SOP サブシステムは有効ではありません
+cli-sop-create-hint = {"  "}作成: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します
 cli-sop-loaded-header = 読み込み済みの SOP ({$count}):
 cli-sop-none-to-validate = 検証する SOP が見つかりません。
 cli-sop-valid = ✅ {$name} — 有効
+cli-sop-deleted = SOP を削除しました: {$name}
 cli-sop-warnings = ⚠️  {$name} — {$count} 件の警告:
 cli-sop-all-passed = すべての SOP が検証に合格しました。
 cli-sop-priority = {"  "}優先度:       {$value}
@@ -397,6 +498,8 @@ cli-sop-execution-mode = {"  "}実行モード: {$value}
 cli-sop-deterministic = {"  "}決定論的:  {$value}
 cli-sop-cooldown = {"  "}クールダウン:       {$value}秒
 cli-sop-max-concurrent = {"  "}最大同時実行数: {$value}
+cli-sop-admission-policy = {"  "}許可ポリシー:   {$value}
+cli-sop-max-pending-approvals = {"  "}最大保留承認数: {$value}
 cli-sop-location = {"  "}場所:       {$value}
 cli-sop-triggers = {"  "}トリガー:
 cli-sop-steps = {"  "}ステップ:
@@ -432,6 +535,7 @@ cli-cron-added-oneshot = ✅ ワンショットcronジョブ {$id} を追加し�
 cli-cron-added-interval-agent = ✅ インターバルエージェントcronジョブ {$id} を追加しました
 cli-cron-added-interval = ✅ インターバルcronジョブ {$id} を追加しました
 cli-cron-updated = ✅ cronジョブ {$id} を更新しました
+cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory、または配信オプション（--channel、--to、--thread、--best-effort、--no-best-effort）のうち少なくとも1つを指定する必要があります
 cli-cron-removed = ✅ cronジョブ {$id} を削除しました
 cli-cron-paused = ⏸️  cronジョブ {$id} を一時停止しました
 cli-cron-resumed = ▶️  cronジョブ {$id} を再開しました
@@ -447,10 +551,17 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}At    : {$v}
 cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
+cli-cron-delivery = {"  "}配信: {$v}
+cli-cron-delivery-disabled = 無効（出力はどこにも送信されません）
 cli-no-command = コマンドが指定されていません。
 cli-press-enter = 終了するにはEnterキーを押してください...
 cli-quickstart-title = クイックスタート — 1つの動作するエージェントをエンドツーエンドで作成します。
 cli-quickstart-needs-tty = クイックスタートは対話式で、stdin と stderr にターミナルが必要です。対話式シェルから実行するか、ヘッドレス設定には `zeroclaw config set <path> <value>` を使用してください。
+cli-quickstart-terminal-size-unknown = クイックスタートはターミナルのサイズを判定できなかったため、チェックリストが収まるか確認できません。サイズを報告するターミナルから実行するか、ヘッドレス設定には `zeroclaw config set <path> <value>` を使用してください。
+cli-quickstart-terminal-too-narrow = クイックスタートには幅が {$min_width} 列以上のターミナルが必要です。現在の幅は {$width} 列です。ターミナルを広げて再試行してください。
+cli-quickstart-terminal-too-short = クイックスタートには高さが {$min_height} 行以上のターミナルが必要です。現在の高さは {$height} 行です。ターミナルを高くして再試行してください。
+cli-quickstart-terminal-resized = クイックスタートのチェックリストを開いている間に、ターミナルが {$initial_width}x{$initial_height} から {$current_width}x{$current_height} に変更されました。続行するにはチェックリストを開き直してください。
+cli-quickstart-empty-checklist = クイックスタートは空のチェックリストを開けません。
 cli-quickstart-cancelled = クイックスタートをキャンセルしました。設定は書き込まれていません。
 cli-quickstart-incomplete = {"  "}すべてのセレクターがまだ入力されていません。
 cli-quickstart-create-agent = ── エージェントを作成
@@ -480,6 +591,19 @@ cli-quickstart-peer-group-row = {$channel} → {$name} (ピア {$count} 件)
 cli-quickstart-provider-local-label = {$name} (ローカル)
 cli-quickstart-provider-type-prompt = プロバイダータイプ
 cli-quickstart-alias-for = {$name} のエイリアス
+cli-quickstart-openai-auth-mode-label = 認証
+cli-quickstart-openai-auth-mode-help = ChatGPT/Codex サブスクリプションの認証プロファイルを使用する場合は `codex` を選択してください。Codex CLI で既にサインイン済みの場合は `zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json` を実行し、そうでない場合は `zeroclaw auth login --model-provider openai-codex` を実行してください。
+cli-quickstart-anthropic-auth-mode-label = 認証
+cli-quickstart-anthropic-auth-mode-help = Anthropic Console のキーには `api_key` を選択し、Claude Max 向けに `claude setup-token` を実行して生成したトークンを貼り付ける場合は `setup_token` を選択してください。
+cli-quickstart-anthropic-api-key-help = Anthropic Console の API キー、または `claude setup-token` で生成したトークンを貼り付けてください。
+cli-quickstart-auth-codex-prompt = 今すぐ ChatGPT アカウントで OpenAI Codex にサインインしますか？
+cli-quickstart-auth-codex-import-prompt = 既存の Codex ログイン (~/.codex/auth.json) が見つかりました — 今すぐインポートしますか？
+cli-quickstart-auth-codex-skip-hint = {"  "}後で完了させるには: zeroclaw auth login --model-provider openai-codex
+cli-quickstart-auth-anthropic-prompt = Anthropic プロバイダー `{$alias}` 用に今すぐ `claude setup-token` を実行しますか？
+cli-quickstart-auth-anthropic-token-prompt = `claude setup-token` のトークンを貼り付けてください
+cli-quickstart-auth-anthropic-saved = {"  "}anthropic.{$alias} の Claude setup token を保存しました
+cli-quickstart-auth-anthropic-skip-hint = {"  "}後で完了させるには: claude setup-token を実行し、次に zeroclaw config set providers.models.anthropic.{$alias}.api_key <token>
+cli-quickstart-auth-failed = {"  "}認証の設定が完了しませんでした: {$error}
 cli-quickstart-model-field-missing-warning = 警告: スキーマが `{$provider}` の `model` フィールドを生成しませんでした — 手動入力にフォールバックします。報告してください。
 cli-quickstart-model-id-for = {$name} のモデルID
 cli-quickstart-risk-profile-prompt = リスクプロファイル
@@ -525,12 +649,18 @@ cli-quickstart-error-not-type-alias-ref = `{$reference}` は `<type>.<alias>` �
 cli-quickstart-error-no-configured-path = `{$path}` は設定されていません
 cli-quickstart-error-provider-required = プロバイダータイプ、エイリアス、モデルが必要です
 cli-quickstart-error-unknown-provider-type = 不明なモデルプロバイダータイプ `{$provider}` — プロバイダー一覧から選択してください
+cli-quickstart-error-unknown-openai-auth-mode = 不明な OpenAI 認証モード `{$mode}` — `api_key` または `codex` を選択してください
+cli-quickstart-error-unknown-anthropic-auth-mode = 不明な Anthropic 認証モード `{$mode}` — `api_key` または `setup_token` を選択してください
 cli-quickstart-error-alias-exists = エイリアス `{$alias}` は既に存在します
 cli-quickstart-error-no-profile = プロファイル `{$alias}` は設定されていません
 cli-quickstart-error-unknown-risk-preset = 不明なリスクプリセット `{$preset}`
 cli-quickstart-error-unknown-runtime-preset = 不明なランタイムプリセット `{$preset}`
 cli-quickstart-error-channel-bound = チャンネル `{$reference}` は既にエージェント `{$owner}` に割り当てられています
 cli-quickstart-error-channel-required = チャンネルタイプとエイリアスが必要です
+cli-quickstart-error-channel-field-not-advertised = チャンネルフィールド `{$field}` は Quickstart では使用できません
+cli-quickstart-error-channel-token-required = Telegram Bot トークンが必要です
+cli-quickstart-error-webhook-secret-required = Webhook 共有シークレットが必要です
+cli-quickstart-error-webhook-port-conflict = Webhook ポート {$port} は有効な Webhook `{$alias}` が既に使用しています — 有効な Webhook にはそれぞれ固有のポートが必要です
 cli-quickstart-error-peer-group-name-required = ピアグループ名が必要です
 cli-quickstart-error-peer-group-channel-required = ピアグループのチャンネル参照が必要です
 cli-quickstart-error-peer-group-unknown-channel = ピアグループ `{$name}` が不明なチャンネル `{$channel}` を参照しています
@@ -550,11 +680,28 @@ cli-agent-not-created = エージェントは作成されませんでした — 
 cli-onboard-deprecated = `zeroclaw onboard` は非推奨です — `zeroclaw quickstart` を使用してください。
 cli-otp-initialized = ZeroClaw用のOTPシークレットを初期化しました。
 cli-otp-enrollment-uri = 登録URI: {$uri}
+cli-otp-received = {"  "}✓ OTP受信済
+cli-secret-captured = {"  "}● 値を取得しました — Enterで保存
+cli-secret-received = {"  "}✓ 秘密情報受信済
+cli-secret-needs-tty = シークレットの入力には、stdin と stderr にターミナルが必要です。
+cli-secret-empty = 値は空にできません。
 cli-pairing-enabled = 🔐 ゲートウェイのペアリングが有効です。
 cli-pairing-use-code = {"  "}このワンタイムコードを使って新しいデバイスをペアリングしてください:
 cli-pairing-post = {"    "}POST /pair にヘッダー X-Pairing-Code: {$code} を付けて送信
 cli-pairing-restart = {"   "}新しいペアリングコードを生成するにはゲートウェイを再起動してください。
 cli-pairing-disabled = ⚠️  ゲートウェイのペアリングは設定で無効になっています。
+cli-pairing-fetch-failed = ❌ ゲートウェイからペアリングコードを取得できませんでした: {$endpoint}
+cli-pairing-no-code = 🔐 ゲートウェイのペアリングは有効ですが、利用可能なアクティブなペアリングコードがありません。
+cli-pairing-requests-accepted = すべてのリクエストが認証なしで受け付けられます。
+cli-pairing-enable-config = ペアリングを有効にするには、[gateway] require_pairing = true を設定してください。
+cli-pairing-show-only = `zeroclaw gateway get-paircode` は既存のアクティブなコードを表示するだけで、新しいコードは発行しません。
+cli-pairing-pair-another = 別のデバイスをペアリングするには、次を実行してください:
+cli-pairing-revoke-replace = 既存のペアリングを取り消して置き換えコードを発行するには、次を実行してください:
+cli-pairing-new-code-unavailable = ゲートウェイは新しいペアリングコードを発行しませんでした。コードがすでに保留中か、ペアリングのリセットが必要な可能性があります。
+cli-pairing-retry-or-rotate = しばらくしてから再試行するか、既存のペアリングを取り消して置き換えコードを発行してください:
+cli-pairing-rotate-no-code = ローテーション要求は置き換えコードを返さずに完了しました。
+cli-pairing-check-enabled = ペアリングが有効か確認してから、新しいデバイスコードを要求してください:
+cli-pairing-inspect = 実行中のゲートウェイを確認するには:
 cli-gateway-running-q = {"   "}ゲートウェイは実行中ですか？次のコマンドで起動してください:
 cli-status-title = 🦀 ZeroClaw ステータス
 cli-security-status-title = ZeroClaw セキュリティステータス
@@ -565,6 +712,7 @@ cli-security-status-risk-profile = リスクプロファイル: {$v}
 cli-security-status-autonomy = 自律性:   {$v}
 cli-security-status-approvals = 承認:  中リスクの承認が必要: {$medium}、高リスクのコマンドはブロック済み: {$high}
 cli-security-status-sandbox = サンドボックス:    要求済み {$requested}、アクティブ {$active} ({$description})
+cli-security-status-sandbox-description-docker-runtime = Docker ランタイムのコンテナ分離（runtime.kind = "docker"; 追加のサンドボックスラッパーなし）
 cli-security-status-workspace = ワークスペース:  {$dir}; ワークスペース限定: {$workspace_only}; 読み書きルート: {$read_write_roots}; 読み取り専用ルート: {$read_only_roots}; 書き込み専用ルート: {$write_only_roots}; 環境変数パススルー: {$env_passthrough}
 cli-security-status-credentials = 認証情報: 暗号化: {$encryption}; シークレット設定数: {$secrets_set}/{$secrets_total}; 分類されたフィールド数: {$classified_total}; クラス: {$classification_summary}
 cli-security-status-credentials-classes-none = なし
@@ -573,6 +721,7 @@ cli-security-status-warnings = 警告:   {$v}
 cli-security-status-warnings-none = 警告:   なし
 cli-security-status-warning-agent-disabled = エージェントが無効です
 cli-security-status-warning-sandbox-disabled = このエージェントのリスクプロファイルではサンドボックス化が無効です
+cli-security-status-warning-optional-sandbox-disabled-docker-runtime = 追加の OS サンドボックスは無効です; Docker ランタイムの封じ込めは引き続き有効です
 cli-security-status-warning-sandbox-none = アクティブなサンドボックスはアプリケーション層のみです
 cli-security-status-warning-sandbox-fallback = 要求されたサンドボックスバックエンド `{$requested}` は `{$active}` にフォールバックしました
 cli-security-status-warning-workspace-not-restricted = ワークスペース限定のファイルシステムポリシーが無効です
@@ -588,9 +737,9 @@ cli-status-service-stopped = 🔴 サービス:       停止
 cli-status-channels = チャンネル:
 cli-status-cli-always = {"  "}CLI:      ✅ 常時
 cli-status-peripherals = 周辺機器:
-cli-desktop-download = ZeroClaw コンパニオンアプリをダウンロード:
+cli-desktop-download = ZeroClaw コンパニオンアプリのダウンロードページを開きます:
 cli-desktop-homebrew = または Homebrew でインストール(近日対応予定):
-cli-desktop-linux-pkg = {"  "}お使いのアーキテクチャ用の .deb または .AppImage をダウンロードしてください。
+cli-desktop-linux-pkg = {"  "}このページには、アーキテクチャ別の .deb と .AppImage があります。
 cli-desktop-launching = ZeroClaw コンパニオンアプリを起動中...
 cli-status-version = バージョン:     {$v}
 cli-status-workspace = ワークスペース:   {$v}
@@ -601,7 +750,11 @@ cli-status-model = {"   "}モデル:         {$model}
 cli-status-observability = 📊 可観測性:  {$v}
 cli-status-trace-storage = 🧾 トレースストレージ:  {$mode} ({$path})
 cli-status-agents = 🛡️  エージェント:        {$v}
+cli-status-agent-risk-profile = {$alias}={$level}
+cli-status-agent-no-risk-profile-summary = {$alias}=<risk_profile なし>
 cli-status-runtime = ⚙️  ランタイム:       {$v}
+cli-status-web-ui-found = 🌐 Web UI:        検出 ({$path})
+cli-status-web-ui-missing = 🌐 Web UI:        未検出
 cli-status-heartbeat = 💓 ハートビート:      {$v}
 cli-status-heartbeat-every-minutes = {$minutes}分ごと
 cli-status-memory = 🧠 メモリ:         {$backend} (自動保存: {$auto_save})
@@ -620,7 +773,6 @@ cli-status-otp = {"  "}OTP 有効:       {$v}
 cli-status-estop = {"  "}E-stop 有効:    {$v}
 cli-status-peripherals-enabled = {"  "}有効:   {$v}
 cli-status-boards = {"  "}ボード:    {$v}
-cli-status-channel-not-compiled = 🚫 設定済み、未コンパイル
 cli-status-word-enabled = 有効
 cli-status-word-disabled = 無効
 cli-status-word-yes = はい
@@ -630,16 +782,57 @@ cli-status-word-off = オフ
 cli-status-word-none = (なし)
 cli-status-word-configured = 設定済み
 cli-status-word-not-configured = 未設定
+cli-status-channel-configured = ✅ {$status}
+cli-status-channel-not-configured = ❌ {$status}
+cli-status-channel-not-compiled = 🚫 設定済み、未コンパイル
 cli-desktop-not-installed = ZeroClaw コンパニオンアプリがインストールされていません。
 cli-desktop-blurb1 = コンパニオンアプリは軽量なメニューバーアプリで、
 cli-desktop-blurb2 = CLI と同じゲートウェイに接続します。
 cli-config-all-configured = すべてのセクションは既に設定済みです。
+cli-config-initialized-sections = {$count} 個のセクションをデフォルト値で初期化しました:
 cli-config-schema-current = 設定は既に現在のスキーマバージョンです。
 cli-config-applied-ops = {$count} 件の操作を適用しました:
 cli-plugins-none = インストールされているプラグインはありません。
 cli-plugins-installed = インストール済みプラグイン:
+cli-plugin-search-none = '{$query}' に一致するプラグインはありません。
+cli-plugin-search-results = '{$query}' に一致するプラグイン ({$count}):
+cli-plugin-search-result = {$name} v{$version} — {$description}
+cli-plugin-no-description = (説明なし)
+cli-plugin-install-resolving = プラグインレジストリから '{$source}' を解決しています...
 cli-plugin-installed-from = プラグインを {$source} からインストールしました
+cli-plugin-installed-name-version = プラグイン {$name} v{$version} をインストールしました
+cli-plugin-config-entry-seeded = '{$name}' の [[plugins.entries]] を作成しました。プラグイン設定値は `zeroclaw config set plugins.entries.{$name}.config.<key>` で設定してください。
+cli-plugin-config-entry-key = 設定エントリキー ({$capability}): {$key}
+cli-plugin-config-entry-seed-skipped = 警告: '{$name}' の設定エントリ作成をスキップしました: ディスク上の [plugins] セクションが不正です。修復し、`name = "{$name}"` を含む [[plugins.entries]] ブロックを追加してから、`zeroclaw config set plugins.entries.{$name}.config.<key>` で値を設定してください。
+cli-plugin-egress-seeded = マニフェストの宣言に基づき '{$name}' に送信先を許可しました ({$count} 件):
+cli-plugin-egress-destination = → {$host}
+cli-plugin-egress-edit-command = この許可を後で編集するには: {$command}
+cli-plugin-egress-declared-not-granted = プラグイン '{$name}' は既存の設定エントリが許可していない送信先を {$count} 件宣言しています:
+cli-plugin-egress-added = + {$host}
+cli-plugin-egress-apply-command = 意図して許可する場合は: {$command}
+cli-plugin-egress-granted-not-declared = プラグイン '{$name}' の設定エントリは、マニフェストがもう宣言していない送信先を {$count} 件許可しています (そのまま維持されます):
+cli-plugin-egress-removed = - {$host}
+cli-plugin-egress-never-extended = '{$name}' の既存の送信許可は変更されていません: パッケージのインストールがエントリの許可リストを拡張することはありません。
+cli-plugin-egress-inherited = プラグイン '{$name}' は送信先を宣言していませんが、既存の設定エントリは引き続き {$grants} を許可しています。インストールしたパッケージはこの許可を引き継ぎます。plugins.entries.{$key} で編集または削除してください。
+cli-plugin-egress-gap = {$name}: {$hosts} を宣言していますが設定エントリが許可していません — これらの送信先へのリクエストは拒否されます。許可するには: {$command}
+cli-plugin-egress-gap-legacy = {$name}: {$hosts} を宣言していますが設定エントリが許可していません — これらの送信先へのリクエストは拒否されます。設定行が 1.0 より前のキー形式のままなので、許可する前に行を移行してください:
+cli-plugin-egress-migrate-step = 1) 行を移行する: 設定ファイル内の '{$legacy}' という名前の [[plugins.entries]] 行を '{$key}' に変更して保存します。そのキーは `zeroclaw plugin info {$name}` で確認できます。
+cli-plugin-egress-grant-step = 2) 許可する: {$command}
+cli-plugin-egress-legacy-inert = {$name}: 設定行が 1.0 より前のキー形式のままで、ランタイムはその行を読み取りません — 送信許可は有効になっておらず、リクエストは拒否されます。設定ファイル内の '{$legacy}' という名前の [[plugins.entries]] 行を '{$key}' に変更して保存してください。そのキーは `zeroclaw plugin info {$name}` で確認できます。
+cli-plugin-egress-invalid-grant = {$name}: ランタイムが送信許可を拒否しています（{$reason}）— 修正するまですべてのリクエストが拒否されます。次のコマンドで許可を置き換えてください: {$command}
+cli-plugin-egress-invalid-grant-legacy = {$name}: ランタイムが送信許可を拒否しています（{$reason}）— 修正するまですべてのリクエストが拒否されます。設定行が 1.0 より前のキー形式のままなので、行を移行してから許可を置き換えてください:
+cli-plugin-egress-repair-incomplete = {$name}: 表示されたコマンドを実行してもランタイムは許可を拒否したままです（{$reason}）。`plugins.entries.{$key}.egress_allow_private` を許可済みホストに合わせて修正するか、その例外を削除してください。
+cli-plugin-egress-deployment-rejected = ランタイムはこのデプロイのすべてのプラグイン送信ポリシーを拒否しています（{$reason}）。修正するまでどのプラグインの許可も有効になりません。`security.nat64_prefixes` と `plugins.limits.max_connections_per_instance` を確認してください。
+cli-plugin-install-verify-failed = インストールに失敗しました: '{$name}' はこのホストで読み込めません: {$error} — このホストの WIT（wit/v0 を参照）でプラグインを再ビルドするか、--no-verify を指定して強制的にインストールしてください。
+cli-plugin-install-verify-bypassed = 注記: '{$name}' のインストール時の読み込み確認をスキップします (--no-verify)。このホストで読み込めない場合は起動時にスキップされます
+cli-plugin-list-entry-loads = {$name} v{$version} — {$description}（読み込み可）
+cli-plugin-list-entry-failed = {$name} v{$version} — {$description}（読み込み不可: {$error}）
+cli-plugin-list-entry-no-component = {$name} v{$version} — {$description}（読み込むコンポーネントなし）
+cli-config-section-degraded = 警告: {$path} の設定セクション `{$section}` は不正なため、この実行ではデフォルト値にリセットされました。そのセクションの値は有効ではありません。`zeroclaw config migrate` を実行して解析エラーを確認し、ファイルを修復してください。
+cli-config-section-retired-wati = 警告: 廃止された WATI チャネル設定セクション `{$section}` は、WATI のサポートが削除されたため無視されます。Cloud API または WhatsApp Web を使用して `[channels.whatsapp.<alias>]` に移行し、未使用の WATI API トークンを失効させてください。
+cli-config-section-retired-node-transport = 警告: 廃止された `[node_transport]` 設定は、レガシー HMAC ノードトランスポートが削除されたため無視されます。config.toml からこのセクションを削除してください。
 cli-plugin-removed = プラグイン '{$name}' を削除しました。
+cli-plugin-removed-grant-kept = 設定エントリ '{$key}' は送信許可 ({$grants}) とともに残ります。後で '{$name}' としてインストールされるパッケージはこれを引き継ぎます。許可を取り消すには '{$key}' という名前の [[plugins.entries]] 行を削除してください。
 cli-plugin-not-found = プラグイン '{$name}' が見つかりません。
 cli-plugin-legacy-detected = 注意: レガシーな場所 ({$path}) にあるプラグインはエージェントに読み込まれません。`zeroclaw plugin migrate` を実行して {$target} に移動してください。
 cli-plugin-migrated = {$count} 個のプラグインを {$path} から {$target} に移動しました。
@@ -659,6 +852,8 @@ cli-config-secret-set = {$path} は設定されています(暗号化された�
 cli-config-secret-unset = {$path} は設定されていません(暗号化されたシークレット)
 cli-config-updated = {$path} を更新しました。
 cli-config-review-hint = `zeroclaw config list` を実行して確認し、必須フィールドを設定してください。
+cli-config-catalog-unavailable-manual = {"  "}⚠ {$provider} のカタログを利用できません（{$error}）。モデル ID を手動で入力してください。
+model-switch-catalog-failed = 設定済みプロバイダープロファイル {$provider} のカタログを読み込めませんでした: {$error}
 cli-config-backed-up = {$path} にバックアップしました
 cli-plugin-name-version = プラグイン: {$name} v{$version}
 cli-plugin-description = 説明: {$desc}
@@ -666,6 +861,12 @@ cli-plugin-capabilities = 機能: {$v}
 cli-plugin-permissions = 権限: {$v}
 cli-plugin-wasm = WASM: {$path}
 cli-plugin-wasm-none = WASM: (スキルのみのプラグイン)
+cli-plugin-info-load-ok = 読み込み: 可。このコンポーネントはこのホストの WIT ワールドでインスタンス化できます。
+cli-plugin-info-load-failed =
+    読み込み: 不可。{$error}
+    このホストに同梱された WIT（wit/v0 を参照）でプラグインを再ビルドし、再インストールしてください。
+cli-plugin-info-load-not-applicable = 読み込み: 対象外。スキルのみのプラグインのため、インスタンス化するコンポーネントはありません。
+cli-plugin-info-load-failed-exit = プラグイン '{$name}' はこのホストで読み込めません
 cli-estop-domains-none = {"  "}domain_blocks:  (なし)
 cli-estop-domains = {"  "}domain_blocks:  {$v}
 cli-estop-tools-none = {"  "}tool_freeze:    (なし)
@@ -676,6 +877,16 @@ cli-auth-active-for = {$provider} のアクティブなプロファイル: {$pro
 cli-auth-refresh-ok = ✓ トークンの更新に成功しました (プロファイル {$profile})
 cli-auth-removed = 認証プロファイル {$provider}:{$profile} を削除しました
 cli-auth-not-found = 認証プロファイルが見つかりません: {$provider}:{$profile}
+cli-auth-xai-imported = xAI 認証プロファイルを {$path} からインポートしました
+cli-auth-xai-device-code-started = xAI デバイスコードログインを開始しました。
+cli-auth-oauth-visit = アクセス先: {$uri}
+cli-auth-oauth-code = コード:  {$code}
+cli-auth-oauth-fast-link = 高速リンク: {$uri}
+cli-auth-xai-open-oauth-url = ブラウザでこの xAI OAuth URL を開き、アクセスを承認してください:
+cli-auth-callback-capture-failed = コールバックの取得に失敗しました: {$error}
+cli-auth-run-paste-redirect = `zeroclaw auth paste-redirect --model-provider {$provider} --profile {$profile}` を実行してください
+cli-auth-xai-no-pending-login = 保留中の xAI ログインが見つかりません。先に `zeroclaw auth login --model-provider xai` を実行してください。
+cli-auth-paste-redirect-requires-input = paste-redirect にはリダイレクト URL または OAuth コードが必要です
 cli-locales-fetched = {"  "}{$name} を取得しました -> {$path}
 cli-locales-skipped = {"  "}{$name} をスキップしました: アップストリームに存在しません（{$path}; 試行: {$refs}）
 cli-locales-installed = {$dir} 配下に '{$locale}' 用のカタログを {$count} 件インストールしました
@@ -688,7 +899,7 @@ cli-hardware-unsupported-platform = このプラットフォームではハー�
 cli-hardware-supported-platforms = 対応プラットフォーム: Linux、macOS、Windows。
 cli-update-already-current = すでに最新です (v{$version})。
 cli-update-success = v{$version} に正常に更新しました！
-cli-update-prebuilt-channel-note = ビルド済み更新は軽量なデフォルトチャンネルバンドルを使います。Slack やその他の非デフォルトチャンネルを使うには、`./install.sh --source --preset full`、`--features channels-full`、または特定の `channel-*` 機能でソースからビルドしてください。
+cli-update-prebuilt-channel-note = ビルド済み更新は軽量な標準配布セットを使います。Slack やその他の配布対象外チャンネルを使うには、`./install.sh --source --preset full`、`--features channels-full`、または特定の `channel-*` 機能でソースからビルドしてください。
 cli-update-available = 更新が利用可能です: v{$current} -> v{$latest}
 cli-update-forcing-reinstall = 再インストールを強制します: v{$current} -> v{$latest}
 cli-update-not-writable = インストールディレクトリ {$dir} は書き込みできません（{$error}）。権限を昇格して `zeroclaw update` を再実行してください（macOS/Linux では sudo、Windows では管理者コンソール）
@@ -704,13 +915,101 @@ cli-channels-build-hint = {"  "}ソースから `./install.sh --source --preset 
 cli-channels-start-hint = チャンネルを開始するには: zeroclaw channel start
 cli-channels-doctor-hint = 状態を確認するには:    zeroclaw channel doctor
 cli-channels-configure-hint = 設定するには:      zeroclaw config set channels.<name>.<field>=<value>
+cli-models-set-ok = デフォルトモデルが { $provider } の "{ $model }" に設定されました。
+cli-models-status-current = デフォルトモデル: { $model } (プロバイダー: { $provider })
+cli-models-status-none = デフォルトモデルが設定されていません。
 turn-interrupted-by-user = [ユーザーによって中断されました]
 turn-cancelled-client-rpc = [クライアント経由でターンがキャンセルされました]
 turn-stream-interrupted = [ストリームが中断されました]
+turn-failed = [ターンが失敗しました]
+turn-failed-attachment-omitted = [添付は省略されました: 失敗したターンでプロバイダーが拒否しました]
+turn-model-fallback-notice = ⚡ { $requested_model }（{ $requested_provider }）が利用できなかったため、この応答は { $actual_model }（{ $actual_provider }）によって生成されました。
+turn-max-iterations-reached = *ターン停止: ツールの最大反復回数 ({ $max_iterations }) に達しました。*
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]
 history-trim-reason-budget = context token budget exceeded
+history-trim-reason-message-cap = 履歴ターン数の上限を超えました
+history-trim-reason-recovery = コンテキストウィンドウのオーバーフロー復旧
+history-trim-floor-exceeds-budget = system prompt and tool definitions ({$floor} tokens) alone meet or exceed the context budget ({$budget} tokens); raise [runtime_profiles.<name>] max_context_tokens or reduce the tool surface by disabling unused integrations
+turn-ingress-dropped = このリクエストは処理されませんでした: { $reason }
 turn-tool-interrupted-before-result = [このツールが結果を生成する前にユーザーによって中断されました]
 channel-runtime-malformed-tool-output = 内部ツール呼び出し形式のエラーが発生し、このリクエストを完了できませんでした。もう一度お試しください。
+channel-runtime-progress-received = 受信しました
+channel-runtime-progress-planning = 計画中
+channel-runtime-progress-waiting-on-model = モデルの応答を待っています
+channel-runtime-progress-running-tool = ツールを実行中
+channel-runtime-progress-compacting-context = コンテキストを圧縮中
+channel-runtime-progress-finalizing-response = 応答を最終処理中
+channel-runtime-matrix-progress-item-too-large = ⚠️ この行は 1 件の Matrix メッセージに収まらないほど大きすぎます。⚠️
+channel-runtime-new-session = 会話履歴を消去しました。新しく開始します。
+channel-runtime-stop-sent = 停止シグナルを送信しました。
+channel-runtime-stop-no-task = この送信者スコープに実行中のタスクはありません。
+channel-runtime-stop-folded-followup = ここで停止できるものはありません。この返信は、返信先のまだ処理中のメッセージに統合されました。その会話で /stop を送ってください。
+channel-runtime-conversation-busy = この会話には保留中のメッセージが多すぎるため、このメッセージは破棄されました。返信を待つか、/stop を送信して待機中のリクエストを消去してください。
+channel-runtime-model-empty = モデル ID は空にできません。`/model <model-id>` を使用してください。
+channel-runtime-model-switched = モデルを `{ $model }`（model_provider: `{ $provider }`）に切り替えました。コンテキストは保持されています。
+channel-runtime-agent-scope-rejected = 送信者 `{ $sender }` はエージェント `{ $agent }` で `/model --agent` を実行する権限がありません。セッション限定の上書きには `/model --user { $model }` を使用するか、管理者にあなたをメンバーとして `admin_for_agent_scope = true` のピアグループへ登録するよう依頼してください。
+channel-runtime-request-timeout = ⚠️ モデルの応答待ちがタイムアウトしました。もう一度お試しください。
+channel-runtime-no-reply-refused = 🚫 そのリクエストにはお応えできません。
+channel-runtime-no-reply-failed = ⚠️ そのリクエストを完了できませんでした。
+channel-runtime-current-model-status =
+    現在の model_provider: `{ $provider }`
+    現在のモデル: `{ $model }`
+channel-runtime-model-switch-hint = `/model <model-id>` または `/model <hint>` でモデルを切り替えます。
+channel-runtime-provider-switch-hint = `/models <model_provider>` で model_provider を切り替えます。
+channel-runtime-available-providers-header = 利用可能な model_provider:
+channel-runtime-configured-routes-header = 設定済みモデルルート:
+channel-runtime-no-cached-models = `{ $provider }` のキャッシュ済みモデル一覧が見つかりません。オペレーターに `zeroclaw models refresh --model-provider { $provider }` の実行を依頼してください。
+channel-runtime-cached-model-ids-header = キャッシュ済みモデル ID（上位 { $count } 件）:
+channel-runtime-config-switch-hints =
+    `/models <model_provider>` で model_provider を切り替えます。
+    `/model <model-id>` でモデルを切り替えます。
+channel-runtime-config-block-title =
+    { "*" }モデル設定{ "*" }
+    現在: `{ $provider }` / `{ $model }`
+channel-runtime-config-select-provider-placeholder = model_provider を選択
+channel-runtime-config-select-model-placeholder = モデルを選択
+channel-runtime-config-provider-label = *ModelProvider*
+channel-runtime-config-model-label = *モデル*
+channel-runtime-scope-user = ユーザー
+channel-runtime-scope-agent = エージェント
+channel-runtime-scope-overrides-summary =
+    { "**" }モデル上書き{ "**" }（セッション内のみ。優先順位 user > agent > session > default）:
+    • user: { $user }
+    • agent: { $agent }
+    • session（このチャット）: { $session }
+    • default（設定）: { $default }
+    `/model --user|--agent <model-id>` でスコープを設定します。デフォルトに戻すとクリアされます。
+channel-runtime-set-provider-switched =
+    この送信者セッションの ModelProvider を `{ $provider }` に切り替えました。現在のモデルは `{ $model }` です。
+    provider 互換のモデルを設定するには `/model <model-id>` を使用してください。
+channel-runtime-set-provider-init-failed =
+    model_provider `{ $provider }` の初期化に失敗しました。ルートは変更されていません。
+    詳細: { $error }
+channel-runtime-provider-ambiguous = ModelProvider `{ $family }` には設定済みエイリアスが複数あります。`/models { $family }.<alias>` で指定してください: { $list }
+channel-runtime-provider-no-alias = `{ $provider }` に対応する設定済み provider エントリがありません。`[providers.models.{ $provider }]`（api_key/uri を含む）を追加するか、設定済み provider を選択してください。`/models` で有効な項目を確認できます。
+channel-runtime-provider-unknown = 不明な model_provider `{ $provider }` です。`/models` で有効な model_provider を一覧表示してください。
+channel-runtime-scoped-model-empty = モデル ID は空にできません。`/model --user|--agent <model-id>` を使用してください。
+channel-runtime-scoped-model-switched = **{ $scope }** スコープのモデルを `{ $model }`（model_provider: `{ $provider }`）に設定しました。セッション内のみ有効で、再起動するとリセットされます。
+channel-runtime-shadow-note = ⚠️ より高い優先順位の上書きが有効なため、メッセージでは代わりに `{ $model }`（`{ $provider }`）が使われます。`/model` を確認してください。
+channel-runtime-thinking-set =
+    この送信者セッションの thinking を `{ $level }` に設定しました。
+    agent のデフォルトに戻すには `/thinking reset` を使用してください。
+channel-runtime-thinking-cleared = thinking の上書きをクリアしました。この送信者セッションでは agent デフォルト `{ $default }` を使用します。
+channel-runtime-thinking-default =
+    thinking はすでにこの送信者セッションで agent デフォルト `{ $default }` を使用しています。
+    上書きするには `/thinking high`、`/thinking max`、または `/thinking off` を使用してください。
+channel-runtime-thinking-invalid = 不明な thinking レベル `{ $raw }` です。`/thinking off|minimal|low|medium|high|max`、`/thinking on`、または `/thinking reset` を使用してください。
+channel-runtime-provider-turn-init-failed =
+    ⚠️ model_provider `{ $provider }` の初期化に失敗しました。`/models` を実行して別の model_provider を選択してください。
+    詳細: { $error }
+channel-runtime-fallback-footer =
+    ⚡ `{ $requested }` は利用できません — **{ $actual }**（`{ $model }`）からの応答
+    モデル切り替え: /models
+channel-runtime-model-fallback-redacted = ⚡ 要求されたモデルが利用できなかったため、代替モデルがこの応答を生成しました。
+delegate-provider-fallback-warning = 警告: 委譲されたエージェントは、プロバイダーのフォールバックによって復旧しました。プロバイダーの障害の詳細はログに記録され、この結果からは省略されています。
+turn-tool-protocol-strict-mixed-error = 厳格なツール解析では、native-tool と text-only の候補が混在するフォールバックチェーンを実行できません。到達可能なすべての候補が同じツールプロトコルを使用するよう設定するか、strict_tool_parsing を false に設定してください。
+delegate-provider-fallback-header = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model })]
+delegate-provider-fallback-header-agentic = [エージェント '{ $agent }' (要求: { $requested_provider }/{ $requested_model }; 提供: { $actual_provider }/{ $actual_model }, agentic)]
 cli-alias-list-empty = ({$section} の下にエントリがありません)
 cli-alias-created = {$section}.{$alias} を作成しました
 cli-alias-exists = {$section}.{$alias} は既に存在します（変更なし）
@@ -751,4 +1050,121 @@ cli-bundle-warn-archive = 警告: バンドルディレクトリのアーカイ�
 cli-bundle-deleted = skill_bundles.{$alias} を削除しました（{$count} 件のエージェントから除去しました）
 cli-bundle-warn-move = 警告: バンドルディレクトリの移動に失敗しました: {$error}
 cli-bundle-renamed = skill_bundles.{$from} → skill_bundles.{$to} にリネームしました
-cli-onboard-about = ワークスペースと設定を初期化
+cli-gateway-restart-hint-kubernetes = kubectl rollout restart deployment/zeroclaw
+cli-gateway-restart-hint-container = docker compose restart
+cli-gateway-restart-hint-systemd = systemctl restart zeroclaw
+cli-gateway-restart-hint-launchd = launchctl kickstart -k <your-zeroclaw-label>
+cli-gateway-restart-hint-process = `zeroclaw daemon` プロセスを再起動してください
+cli-daemon-gateway-already-running = ZeroClaw ゲートウェイは既に {$host}:{$port} で実行中です。デーモンは自身のゲートウェイを監視しており、同じアドレスで2つ目を開始しません。そのゲートウェイを停止するか、`zeroclaw config set gateway.port <port>` でデーモンを空きポートに向けてから、もう一度デーモンを実行してください。
+cli-daemon-gateway-port-occupied = ゲートウェイアドレス {$host}:{$port} は別のプロセスで既に使用されています。ポートを解放するか、デーモンを空きポートに向けて (`zeroclaw config set gateway.port <port>`)、もう一度デーモンを実行してください。
+cli-daemon-starting-title = 🧠 ZeroClaw デーモンを起動しています…
+cli-daemon-starting-detail = 設定済みのデーモンエンドポイントを準備しています
+cli-daemon-started-title = 🧠 ZeroClaw デーモンの準備ができました
+cli-daemon-started-gateway = ゲートウェイ: {$url}
+cli-daemon-started-socket = ソケット:     {$path}
+cli-daemon-started-pairing = ペアリング: 有効（現在の状態は上のゲートウェイ出力を確認してください）
+cli-daemon-started-stop = Ctrl+C または SIGTERM で停止
+cli-relay-rotation-requested = リレー node-id のローテーションを要求しました。実行中のデーモンは~{$secs}s以内にローテーションします。新しい ID は、次回の証明書更新時にインバンドでクライアントへ届きます。
+cli-mtls-issued-client-cert = クライアント証明書を '{$name}' 用に発行しました:
+cli-mtls-issued-cert-path = {"  "}cert: {$path}
+cli-mtls-issued-key-path = {"  "}key:  {$path}
+cli-mtls-issued-ca-path = {"  "}CA:   {$path}
+cli-mtls-dropin-line-1 = ドロップイン: このディレクトリはすぐに使えるクライアント用 TLS ディレクトリです (ca.crt / client.crt /
+cli-mtls-dropin-line-2 = {"  "}client.key). クライアント側の <config-dir>/tls にコピーすると、zerocode が
+cli-mtls-dropin-line-3 = {"  "}必要なファイルを自動的に検出します - --tls-* フラグは不要です。
+cli-mtls-relay-connect-header = 設定済みのリレー経由でこのデーモンに接続:
+cli-mtls-relay-ca-note-1 = {"  "}(--relay-ca は RELAY の CA です - リレーからクライアントにコピーしてください;
+cli-mtls-relay-ca-note-2 = {"   "}--tls-ca-cert は DAEMON の CA で、すでにバンドルに含まれています。)
+cli-mtls-direct-connect-header = zerocode に直接接続:
+cli-mtls-revoked-certificate = 証明書 {$fingerprint} を失効させました。
+cli-mtls-revoke-no-active-fingerprint = フィンガープリント {$fingerprint} の有効な証明書はありません（すでに失効しているか、発行されていません）。
+cli-mtls-revoked-device-certs = デバイス '{$device}' の有効な証明書を {$count} 件失効させました。
+cli-mtls-revoked-list-updated = {$path} を更新しました。デーモンは次回の接続時に失効した証明書を拒否します。
+cli-mtls-list-no-active-certs = このデーモンの CA によって発行された有効なクライアント証明書はありません。
+cli-mtls-list-active-header = 有効なクライアント証明書（{$count}）:
+cli-enroll-endpoint-ready = 登録エンドポイントは {$bind}:{$port} で準備完了です。クライアントを登録するには、次を渡してください
+cli-enroll-confirm-sas-line-1 = このワンタイムペアリングコードを使用し、短縮認証文字列（SAS）が
+cli-enroll-confirm-sas-line-2 = デーモンを信頼する前に双方で一致することを確認してください:
+cli-enroll-pairing-code = {"    "}ペアリングコード : {$code}
+cli-enroll-sas = {"    "}SAS          : {$sas}
+cli-delegate-error-invalid-semantic-completion = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-agent-error-invalid-semantic-completion = モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-delegate-error-incomplete-after-provider-tools = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
+cli-agent-error-incomplete-after-provider-tools = モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
+cli-agent-vision-unsupported-by-fallback = {$marker_count} 個の画像マーカーを受信しましたが、フォールバック model_provider={$fallback_name} は画像入力をサポートしていません
+cli-agent-vision-unsupported-by-provider = {$marker_count} 個の画像マーカーを受信しましたが、この model_provider は画像入力をサポートしていません
+cli-agent-error-provider-context-window = リクエストが選択したモデルのコンテキストウィンドウを超えています。会話を短くするか、より大きなコンテキストウィンドウを持つモデルを選択してください。
+cli-agent-error-provider-credentials-missing = 選択したモデルプロバイダーの認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-credentials-missing-named = モデルプロバイダー {$provider} の認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-authentication = 選択したモデルプロバイダーが認証情報を拒否しました。設定した認証情報を確認してください。
+cli-agent-error-provider-authentication-named = モデルプロバイダー {$provider} が認証情報を拒否しました。設定した認証情報を確認してください。
+cli-agent-error-provider-rate-limited = 選択したモデルプロバイダーがリクエストをレート制限しました。待機するか、クォータを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-server = 選択したモデルプロバイダーがサーバーエラーを返しました。再試行するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-model-not-found = 選択したモデルを利用できません。設定したモデル名を確認してください。
+cli-agent-error-provider-client-request = 選択したモデルプロバイダーがリクエストを拒否しました。プロバイダー設定とリクエストを確認してください。
+cli-agent-error-provider-connection-local = {$endpoint} のローカルモデルサーバーを利用できません。起動するか、エンドポイントを更新してください。
+cli-agent-error-provider-connection-remote = {$endpoint} のモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-connection = 選択したモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-timeout = 選択したモデルプロバイダーがタイムアウトしました。再試行するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-generic = 選択したモデルプロバイダーで失敗しました。プロバイダー設定を確認するか、別のプロバイダーを選択してください。
+cli-doctor-context-window-ok = {$provider_ref}: コンテキストウィンドウ: {$context_window} トークン
+cli-doctor-context-window-zero = {$provider_ref}: context_window が 0 です（無効。モデルの実際のコンテキスト上限を設定してください）
+cli-doctor-context-window-unset = {$provider_ref}: context_window が未設定です — 選択時には {$fallback} トークンのフォールバックを使用します。モデルの実際の上限を大きく下回る可能性があるため、このプロファイルに context_window を設定してください
+cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
+cli-agent-context-bar-unknown = ctx: 不明 / {$max}
+cli-doctor-ctxwin-already-set = {$provider_ref}: 既に context_window = {$ctx} が設定されています
+cli-doctor-ctxwin-no-model = {$provider_ref}: モデルが未設定のためスキップ
+cli-doctor-ctxwin-would-set = {$provider_ref}: context_window = {$ctx} を設定します (ドライラン)
+cli-doctor-ctxwin-set = {$provider_ref}: context_window = {$ctx} を設定しました
+cli-doctor-ctxwin-not-found = {$provider_ref}: 更新対象のエントリが見つかりません
+cli-doctor-ctxwin-fetch-failed = {$provider_ref}: コンテキストウィンドウを公開していないか、取得に失敗しました
+cli-doctor-ctxwin-saved = config.toml に {$updated} 件の更新を保存しました
+cli-doctor-ctxwin-dry-run = ドライラン完了 — 変更は書き込まれません。--dry-run なしで実行して適用してください。
+cli-doctor-ctxwin-none = 更新は必要ありません。
+cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込みに失敗しました: {$error}
+cli-doctor-cache-write-failed = モデルキャッシュの保存に失敗しました: {$error}
+cli-doctor-probe-timeout-message = モデル調査がタイムアウトしました。一部のプロバイダーカタログに到達できない可能性があります。Doctor を再実行して更新できます。
+cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
+cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
+cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled が設定されていますが、認証情報チェーン検証器が存在するまで、vi_verify ツールはモデルに表示されるレジストリには登録されません。このセクションを有効にしても、コマースツール呼び出しでの認証情報検証が有効になるわけではありません。発行および検証ライブラリのパスには影響しません。
+sop-approval-deferred-at-capacity = 実行スロットが満杯のため、実行 {$run_id} を再開できませんでした。承認は待機状態のままです。スロットが空いてから再試行してください。
+sop-approval-policy-unavailable = 待機中の SOP ステップを利用できないため、承認に失敗しました: {$reason}。実行は待機状態のままです。
+sop-rpc-decision-invalid-state = 実行 {$run_id} は現在の状態では解決できません。
+sop-rpc-decision-unauthorized = RPC プリンシパルには、この SOP ステップを解決する権限がありません。
+sop-rpc-policy-missing = SOP 承認ポリシー '{$name}' が構成されていません。
+sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できません: {$reason}。
+tool-runtime-command-build-failed = ランタイムコマンドの構築に失敗しました: {$error}
+tool-runtime-command-docker-workspace-path = ランタイムコマンドの構築に失敗しました: Docker ワークスペースパス {$path} の正規化に失敗しました: {$cause}
+tool-runtime-command-docker-allowed-root = ランタイムコマンドの構築に失敗しました: Docker ワークスペースルート {$path} の正規化に失敗しました: {$cause}
+cli-approval-request = 🔧 エージェントが実行しようとしています: {$tool}
+cli-approval-prompt = { "   " }[Y] はい / [N] いいえ / [A] 常に許可（{$tool}）:{ " " }
+channel-approval-heading = ツールの承認が必要です
+channel-approval-heading-shout = 承認が必要です
+channel-approval-tool-label = ツール
+channel-approval-args-label = 引数
+channel-approval-btn-approve = 承認
+channel-approval-btn-deny = 拒否
+channel-approval-btn-always = 常に
+channel-approval-tap-instruction = 下のボタンをタップしてください：
+channel-approval-position = ツール呼び出し { $total } 件中 { $index } 件目
+channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
+channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
+channel-approval-group-visibility-warning = これはグループチャットのため、ここにいる全員がこのコードと上に表示されたツールの引数を見ることができます。このチャンネルの承認されたピアのみが応答できます。
+channel-telegram-approval-ack-approved = 承認しました
+channel-telegram-approval-ack-always-approved = 常に承認しました
+channel-telegram-approval-ack-denied = 拒否しました
+channel-telegram-approval-ack-not-accepted = 承認は受け付けられませんでした
+channel-telegram-approval-ack-unknown = 不明な操作です
+channel-telegram-approval-ack-already-resolved = 承認はすでに処理済みです
+channel-telegram-voice-drop-too-long = ⚠️ 音声メッセージをスキップしました: { $limit_secs }秒の上限を超えています。短い録音を送るか、分割して送ってください。
+channel-telegram-voice-drop-file-unavailable = ⚠️ 音声メッセージをスキップしました: Telegram からファイルを取得できませんでした。大きすぎるか、すでに利用できない可能性があります。より小さいか短いファイルでお試しください。
+channel-telegram-voice-drop-empty-transcript = ⚠️ 音声メッセージをスキップしました: 録音から何も認識できませんでした。より明瞭な録音でもう一度お試しください。
+channel-discord-approval-btn-allow-once = 今回のみ許可
+channel-discord-approval-btn-allow-session = このセッションのみ許可
+channel-discord-approval-btn-allow-always = 常に許可
+channel-approval-title = { $tool } を承認しますか？
+channel-approval-opt-allow-once = 今回のみ許可
+channel-approval-opt-allow-always = 常に許可
+channel-approval-opt-reject = 拒否
+channel-approval-opt-reject-with-edit = 編集して拒否
+tool-git-operations-error-docker-runtime-write-unsupported = Git の書き込みコマンドは Docker ランタイムでは利用できません。コンテナ内に閉じ込めることができないためです。

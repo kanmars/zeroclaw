@@ -52,12 +52,32 @@ export class ApiError extends Error {
 }
 
 /**
+ * A non-2xx response whose body is not a structured `ApiError` envelope, such
+ * as the session endpoints' `{"error": "..."}` bodies. Carries the HTTP status
+ * so a caller can branch on it (`404` = already gone) without regex-matching
+ * the message. The message keeps the historical `API <status>: <body>` text,
+ * so callers that only read `err.message` see no change.
+ */
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    body: string,
+  ) {
+    super(`API ${status}: ${body}`);
+    this.name = "HttpError";
+  }
+}
+
+/**
  * Stable config-API error codes, sourced from the generated OpenAPI schema
  * (`ConfigApiCode`). Branch on these constants, never a bare string literal, so
  * a backend rename or a typo fails `tsc` here instead of silently regressing
  * the behaviour that depends on the code.
  */
 export type ConfigApiCode = components["schemas"]["ConfigApiCode"];
+export type PluginCatalogEntry = components["schemas"]["PluginCatalogEntry"];
+export type PluginCatalogIssue = components["schemas"]["PluginCatalogIssue"];
+export type PluginsResponse = components["schemas"]["PluginsResponse"];
 export const ConfigApiCodes = {
   configChangedExternally: "config_changed_externally",
 } as const satisfies Record<string, ConfigApiCode>;
@@ -79,6 +99,21 @@ interface RawResult {
 // Keyed entries are removed as soon as the request settles, so this only merges
 // genuinely-overlapping requests, never caches stale data.
 const inFlightGets = new Map<string, Promise<RawResult>>();
+
+/**
+ * Drop any in-flight coalesced GET for `path` so the next caller performs a
+ * fresh request. Callers already awaiting the shared request still receive
+ * its payload; the point is that a read started after a mutation can never
+ * attach to a request that began before it and report pre-mutation state as
+ * the newest result. Mutating endpoints call this for the listings they
+ * affect.
+ */
+function invalidateInFlightGet(path: string): void {
+  const suffix = ` ${apiOrigin}${basePath}${path}`;
+  for (const key of [...inFlightGets.keys()]) {
+    if (key.endsWith(suffix)) inFlightGets.delete(key);
+  }
+}
 
 export async function apiFetch<T = unknown>(
   path: string,
@@ -126,7 +161,11 @@ export async function apiFetch<T = unknown>(
     if (existing) {
       result = await existing;
     } else {
-      const pending = doFetch().finally(() => inFlightGets.delete(coalesceKey));
+      // Remove only our own entry on settle: invalidateInFlightGet may have
+      // replaced it with a newer request that must keep coalescing.
+      const pending: Promise<RawResult> = doFetch().finally(() => {
+        if (inFlightGets.get(coalesceKey) === pending) inFlightGets.delete(coalesceKey);
+      });
       inFlightGets.set(coalesceKey, pending);
       result = await pending;
     }
@@ -141,8 +180,8 @@ export async function apiFetch<T = unknown>(
   }
 
   if (!result.ok) {
-    // Try to parse a structured ConfigApiError envelope. Falls back to a
-    // plain Error when the body is non-JSON or doesn't match the shape.
+    // Try to parse a structured ConfigApiError envelope. Falls back to an
+    // HttpError (status only) when the body is non-JSON or doesn't match.
     // Centralises the parsing so callers (including the Quickstart flow)
     // never have to regex-match `error.message` to recover the structured
     // code — they just `instanceof ApiError` and read `.envelope.code`.
@@ -162,7 +201,7 @@ export async function apiFetch<T = unknown>(
         // JSON.parse failure → fall through to the plain Error path.
       }
     }
-    throw new Error(`API ${result.status}: ${result.text || result.statusText}`);
+    throw new HttpError(result.status, result.text || result.statusText);
   }
 
   // Only 204 No Content is a genuinely empty success. A non-204 success with
@@ -254,8 +293,10 @@ export async function getAdminPairCode(): Promise<{
   pairing_code: string | null;
   pairing_required: boolean;
 }> {
-  // Use the public /pair/code endpoint which works in Docker and remote environments
-  // (no localhost restriction). Falls back to the admin endpoint for backward compat.
+  // /pair/code reports whether pairing is required but never returns the code:
+  // no HTTP caller can prove it is on the gateway host. The operator reads the
+  // code from the gateway log or `zeroclaw gateway get-paircode` and types it in.
+  // The admin fallback only answers callers holding the gateway admin token.
   const publicResp = await fetch(`${basePath}/pair/code`);
   if (publicResp.ok) {
     return publicResp.json() as Promise<{
@@ -356,6 +397,63 @@ export function getHealth(): Promise<HealthSnapshot> {
   ).then((data) => unwrapField(data, "health"));
 }
 
+// ── Version check / self-upgrade (version.rs) ────────────────────────
+// Types are derived from the generated OpenAPI client (`components`) so the
+// dashboard contract stays in lock-step with `openapi::build_spec()`. Editing
+// a request/response shape in Rust and running `cargo web check` will fail the
+// typecheck here on drift, instead of silently disagreeing at runtime.
+
+export type VersionCheckResponse = components["schemas"]["VersionCheckResponse"];
+
+/**
+ * GET /api/version/check — is a newer release available?
+ *
+ * Backed by `zeroclaw update --check --json`, cached server-side for 1h.
+ * Pass `force` to bypass the cache, or `version` to check a specific tag.
+ */
+export function checkVersion(opts?: {
+  force?: boolean;
+  version?: string;
+}): Promise<VersionCheckResponse> {
+  const params = new URLSearchParams();
+  if (opts?.force) params.set("force", "true");
+  if (opts?.version) params.set("version", opts.version);
+  const qs = params.toString();
+  return apiFetch<VersionCheckResponse>(
+    `/api/version/check${qs ? `?${qs}` : ""}`,
+  );
+}
+
+export type UpgradeState = components["schemas"]["UpgradeStatusState"];
+export type UpgradeStatusResponse =
+  components["schemas"]["UpgradeStatusResponse"];
+export type UpgradeRequest = components["schemas"]["UpgradeRequest"];
+export type UpgradeAcceptedResponse =
+  components["schemas"]["UpgradeAcceptedResponse"];
+
+/**
+ * POST /api/version/upgrade — apply an upgrade via `zeroclaw update`.
+ *
+ * Returns a `handoff_id`; poll {@link getUpgradeStatus} for progress. Requires
+ * `gateway.allow_self_upgrade`. `auto_restart` is only honoured under a
+ * supervisor (systemd/launchd).
+ */
+export function startUpgrade(
+  opts?: UpgradeRequest,
+): Promise<UpgradeAcceptedResponse> {
+  return apiFetch<UpgradeAcceptedResponse>("/api/version/upgrade", {
+    method: "POST",
+    body: JSON.stringify(opts ?? {}),
+  });
+}
+
+export function getUpgradeStatus(
+  handoffId?: string,
+): Promise<UpgradeStatusResponse> {
+  const qs = handoffId ? `?handoff_id=${encodeURIComponent(handoffId)}` : "";
+  return apiFetch<UpgradeStatusResponse>(`/api/version/upgrade/status${qs}`);
+}
+
 // ---------------------------------------------------------------------------
 // TUIs
 // ---------------------------------------------------------------------------
@@ -375,17 +473,16 @@ export function getTuis(): Promise<TuiEntry[]> {
 // ---------------------------------------------------------------------------
 
 /**
- * One non-fatal validation warning surfaced after a successful save —
- * config that loads and validates structurally but will fail at agent
- * runtime because of a logical inconsistency (e.g. `providers.fallback`
- * referencing a key not present in `providers.models`). Matches the
+ * One non-fatal validation warning surfaced after a successful save.
+ * Warnings may identify a runtime inconsistency, an inert setting, or a
+ * supported configuration that is being deprecated. Matches the
  * `tracing::warn!` signal the CLI shows on stderr; surfaced structured so
  * the dashboard can render it next to the offending field.
  */
 export interface ValidationWarning {
   /** Stable machine-readable identifier (e.g. `'dangling_provider_fallback'`). */
   code: string;
-  /** Human-readable description suitable for direct display. */
+  /** English fallback for unknown warning codes; localize known codes before display. */
   message: string;
   /** Dotted property path the warning concerns (e.g. `'providers.fallback'`). */
   path: string;
@@ -428,6 +525,12 @@ export interface ListResponseEntry {
   section?: string;
   /** Tab grouping from `ConfigTab` enum. Absent when `ConfigTab::None`. */
   tab?: string;
+  /**
+   * Surface hint from the schema's `#[multiline]` attribute: render a
+   * multi-line text area (e.g. a PEM key body) instead of a single-line
+   * input. Absent/false on single-line fields.
+   */
+  multiline?: boolean;
 }
 
 export interface DriftEntry {
@@ -690,6 +793,33 @@ export async function putPersonalityFile(
 
 // ── Skills (api_skills.rs) ───────────────────────────────────────────
 
+/** A predefined choice for a typed slash option. Only meaningful for
+ *  string/integer/number options; `value` is kept as text and coerced to the
+ *  option's type by the channel. Mirrors the runtime `SkillSlashChoice`. */
+export interface SkillSlashChoice {
+  name: string;
+  value: string;
+}
+
+/** A typed option a `slash`-tagged skill exposes on its slash command. Mirrors
+ *  the runtime `SkillSlashOption` (SKILL.md `slash_options:` /
+ *  SKILL.toml `[[skill.slash_options]]`), shaped after Discord's application
+ *  command option model. `type` is one of `string | integer | number |
+ *  boolean | user | channel | role | mentionable`; unknown values are dropped
+ *  by the channel. `choices` apply to string/integer/number; `min`/`max` to
+ *  integer/number; `min_length`/`max_length` to string. */
+export interface SkillSlashOption {
+  name: string;
+  description: string;
+  type: string;
+  required?: boolean;
+  choices?: SkillSlashChoice[];
+  min?: number | null;
+  max?: number | null;
+  min_length?: number | null;
+  max_length?: number | null;
+}
+
 export interface SkillFrontmatter {
   name: string;
   description: string;
@@ -700,6 +830,10 @@ export interface SkillFrontmatter {
   /** Free-form skill tags. The `slash` tag opts the skill into Discord slash
    *  commands (zeroclaw-labs/zeroclaw#7490); `open-skills` is loader-managed. */
   tags?: string[];
+  /** Typed slash-command options (zeroclaw-labs/zeroclaw#8021). Only meaningful
+   *  with the `slash` tag; edited by the bespoke editor in SkillsBundleEditor.
+   *  Omitted by the backend when empty. */
+  slash_options?: SkillSlashOption[];
 }
 
 export interface SkillBundleEntry {
@@ -727,6 +861,35 @@ export interface SkillDocument {
 export type AgentSkillOrigin = "workspace" | "open-skills" | "plugin" | "bundle";
 
 /**
+ * A lower-precedence same-name skill that a winning skill shadowed (it did
+ * not load). `origin` is the loser's origin tag (e.g. `"bundle"`).
+ */
+export interface ShadowedSkillEntry {
+  name: string;
+  origin: string;
+}
+
+/**
+ * A candidate skill the audited resolver dropped (failed its security audit,
+ * was unauditable, or its manifest failed to parse). Surfaced so operators
+ * can tell "no skills configured" apart from "all skills failed audit".
+ */
+export interface DroppedSkillEntry {
+  name: string;
+  origin: string;
+  /** Stable machine-readable reason tag. */
+  reason_kind:
+    | "audit_findings"
+    | "audit_error"
+    | "manifest_parse_error"
+    | string;
+  /** Human-readable detail (the audit summary / error text). */
+  reason: string;
+  /** On-disk directory of the dropped skill, when known. */
+  directory?: string | null;
+}
+
+/**
  * One skill in an agent's EFFECTIVE skill set, as resolved by the runtime
  * (not just the configured bundles). Returned by {@link listAgentSkills}.
  */
@@ -743,6 +906,8 @@ export interface AgentSkillEntry {
   /** True only when `origin === 'bundle'` — i.e. the skill is editable via
    *  the bundle endpoints and can be expanded for detail. */
   editable: boolean;
+  /** Lower-precedence same-name skills this one shadows. Empty normally. */
+  shadowed?: ShadowedSkillEntry[];
 }
 
 export interface SkillCreateRequest {
@@ -754,6 +919,21 @@ export interface SkillCreateRequest {
 
 export function listSkillBundles(): Promise<{ bundles: SkillBundleEntry[] }> {
   return apiFetch("/api/skills/bundles");
+}
+
+/** One kind's capability row from the backend slash-option kind registry. The
+ *  editor walks these rather than hardcoding the kind list or which constraints
+ *  each kind carries. Sourced from the generated OpenAPI schema, which is built
+ *  by walking the backend `SlashOptionKind` enum. */
+export type SlashOptionKindDescriptor =
+  components["schemas"]["SlashOptionKindDescriptor"];
+
+/** Fetch the canonical typed-slash-option kind registry (kind list + per-kind
+ *  choice/numeric-bound/length-bound capabilities). */
+export function listSlashOptionKinds(): Promise<{
+  kinds: SlashOptionKindDescriptor[];
+}> {
+  return apiFetch("/api/skills/slash-option-kinds");
 }
 
 export function listSkillsInBundle(
@@ -770,7 +950,11 @@ export function listSkillsInBundle(
  */
 export function listAgentSkills(
   alias: string,
-): Promise<{ agent: string; skills: AgentSkillEntry[] }> {
+): Promise<{
+  agent: string;
+  skills: AgentSkillEntry[];
+  dropped?: DroppedSkillEntry[];
+}> {
   return apiFetch(`/api/agents/${encodeURIComponent(alias)}/skills`);
 }
 
@@ -988,6 +1172,43 @@ export function objectArrayElementProps(
     });
   }
   return out;
+}
+
+/** Read the backend-stamped `x-required-by-transport` metadata off the
+ *  `McpServerConfig` schema (a `mcp.servers.<name>` map value). The backend
+ *  derives this map from `McpTransport::required_leaf`, the same relationship
+ *  `validate_mcp_config` enforces, so the form classifies a transport's
+ *  required leaf by reading the registry rather than re-encoding the enum.
+ *  Returns `null` when the path doesn't resolve or the backend predates the
+ *  extension, in which case callers leave required-ness unclassified. */
+export function mcpRequiredByTransport(
+  schema: JsonSchema,
+): Record<string, string> | null {
+  if (!schema) return null;
+  // Walk root -> mcp -> servers (a map whose value type is McpServerConfig).
+  let cur: unknown = schema;
+  for (const seg of ["mcp", "servers"]) {
+    cur = unwrapOptional(resolveRef(cur, schema));
+    if (!cur || typeof cur !== "object") return null;
+    const props = (cur as { properties?: Record<string, unknown> }).properties;
+    if (!props || !Object.prototype.hasOwnProperty.call(props, seg)) return null;
+    cur = props[seg];
+  }
+  // `cur` is the servers map; its value type (McpServerConfig) carries the
+  // extension, reachable through `additionalProperties`.
+  cur = unwrapOptional(resolveRef(cur, schema));
+  if (!cur || typeof cur !== "object") return null;
+  const additional = (cur as { additionalProperties?: unknown })
+    .additionalProperties;
+  const serverDef = unwrapOptional(resolveRef(additional, schema));
+  if (!serverDef || typeof serverDef !== "object") return null;
+  const raw = (serverDef as Record<string, unknown>)["x-required-by-transport"];
+  if (!raw || typeof raw !== "object") return null;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v === "string") out[k.toLowerCase()] = v;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 export function descriptionForPath(
@@ -1394,6 +1615,8 @@ export interface QuickstartTypeOption {
   display_name: string;
   /** True for local providers that need no credential; always false for channels. */
   local: boolean;
+  /** Daemon-derived runtime preset to auto-select for this provider. */
+  default_runtime_profile?: string | null;
 }
 
 export interface QuickstartState {
@@ -1401,6 +1624,8 @@ export interface QuickstartState {
   agents: string[];
   risk_profiles: string[];
   runtime_profiles: string[];
+  /** Canonical fallback when a provider has no runtime recommendation. */
+  default_runtime_profile?: string | null;
   model_providers: string[];
   channels: string[];
   /**
@@ -1660,8 +1885,9 @@ export function reloadDaemon(): Promise<AdminResponse> {
 // Tools
 // ---------------------------------------------------------------------------
 
-export function getTools(): Promise<ToolSpec[]> {
-  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>("/api/tools").then(
+export function getTools(agent?: string): Promise<ToolSpec[]> {
+  const qs = agent ? `?agent=${encodeURIComponent(agent)}` : "";
+  return apiFetch<ToolSpec[] | { tools: ToolSpec[] }>(`/api/tools${qs}`).then(
     (data) => {
       const result = unwrapField(data, "tools");
       return Array.isArray(result) ? result : [];
@@ -1700,6 +1926,7 @@ export function addCronJob(body: {
   allowed_tools?: string[];
   enabled?: boolean;
   delivery?: CronDelivery;
+  uses_memory?: boolean;
 }): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>("/api/cron", {
     method: "POST",
@@ -1754,6 +1981,7 @@ export function patchCronJob(
     command?: string;
     prompt?: string;
     enabled?: boolean;
+    uses_memory?: boolean;
   },
 ): Promise<CronJob> {
   return apiFetch<CronJob | { status: string; job: CronJob }>(
@@ -1812,6 +2040,11 @@ export function getIntegrations(): Promise<Integration[]> {
     const result = unwrapField(data, "integrations");
     return Array.isArray(result) ? result : [];
   });
+}
+
+/** Read-only plugin packages from installed and cached-registry sources. */
+export function getPlugins(): Promise<PluginsResponse> {
+  return apiFetch<PluginsResponse>("/api/plugins");
 }
 
 // ---------------------------------------------------------------------------
@@ -1919,14 +2152,40 @@ export function getSessionMessages(
   );
 }
 
-/** Delete a persisted session by its full DB key. */
+/**
+ * Give a persisted session a display name.
+ *
+ * Takes the bare session id (the `gw_`-stripped `session_id`, not
+ * `session_key`) because the handler prefixes `gw_` itself. Answers 404 when
+ * the gateway has no metadata row for the session — notably when session
+ * persistence is disabled.
+ */
+export function renameSession(
+  id: string,
+  name: string,
+): Promise<{ session_id: string; name: string }> {
+  return apiFetch<{ session_id: string; name: string }>(
+    `/api/sessions/${encodeURIComponent(id)}`,
+    { method: "PUT", body: JSON.stringify({ name }) },
+  ).finally(() => invalidateInFlightGet("/api/sessions"));
+}
+
+/**
+ * Delete a persisted session. Accepts either the full DB key or a bare gateway
+ * session id — the handler prefixes `gw_` only when the id carries no
+ * underscore. Unlike {@link renameSession}, which needs the bare id.
+ */
 export function deleteSession(
   sessionKey: string,
 ): Promise<{ deleted: boolean }> {
+  // A listing fetched before this delete settled must not be what a
+  // post-delete refresh reports: it would list the row just removed. Also on
+  // failure — a 404 means another client already deleted it, so an in-flight
+  // listing may be stale in exactly the same way.
   return apiFetch<{ deleted: boolean }>(
     `/api/sessions/${encodeURIComponent(sessionKey)}`,
     { method: "DELETE" },
-  );
+  ).finally(() => invalidateInFlightGet("/api/sessions"));
 }
 
 /**
@@ -1953,6 +2212,33 @@ export function getChannels(): Promise<ChannelDetail[]> {
   });
 }
 
+export interface BindChannelRequest {
+  channel_type: string;
+  alias: string;
+  identity: string;
+}
+
+export interface BindChannelResponse {
+  saved: boolean;
+  already_bound?: boolean;
+  group?: string;
+  channel?: string;
+}
+
+/**
+ * Authorize an inbound identity on a pairing channel (telegram/wechat/line)
+ * — the GUI equivalent of `zeroclaw channel bind-<type> <id> --alias <alias>`.
+ * The bound user can message the bot immediately, with no `/bind` round trip.
+ */
+export function bindChannelIdentity(
+  body: BindChannelRequest,
+): Promise<BindChannelResponse> {
+  return apiFetch<BindChannelResponse>("/api/channels/bind", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Logs (persisted JSONL via zeroclaw-log)
 // ---------------------------------------------------------------------------
@@ -1967,7 +2253,7 @@ export interface LogEvent {
   service?: { name: string; version: string };
   trace_id?: string | null;
   span_id?: string | null;
-  zeroclaw: Record<string, string> & { duration_ms?: number };
+  zeroclaw: Record<string, string | number | undefined> & { duration_ms?: number };
   message?: string;
   attributes?: Record<string, unknown>;
   schema_version?: number;
@@ -1975,9 +2261,38 @@ export interface LogEvent {
 
 export interface LogsResponse {
   events: LogEvent[];
-  /** `[timestamp, id]` to feed back as `until_ts` + `until_id` for older. */
+  /** Legacy cursor: `[timestamp, id]` to feed back as `until_ts` +
+   *  `until_id` for older. Tie-breaks same-timestamp events by
+   *  lexicographic id, which can drop earlier-written events when id
+   *  order diverges from file insertion order. Prefer
+   *  [`Self::next_cursor_line_offset`] when available — it is
+   *  independent of id ordering. */
   next_cursor: [string, string] | null;
+  /** Byte offset past the OLDEST event on the current page. Pass back
+   *  as [`LogsQueryParams::until_line_offset`] on the next request to
+   *  walk older pages deterministically regardless of id ordering.
+   *  `null` when the page is empty. */
+  next_cursor_line_offset: number | null;
+  /** Segment-aware cursor for the oldest event on the current page. Treat
+   *  it as an OPAQUE token: it identifies a segment and a byte offset within
+   *  it, and for the active file also carries an anchor event id so the
+   *  cursor survives a rotation. Its shape may change. Pass the returned
+   *  string back verbatim as [`LogsQueryParams::until_segment_cursor`] —
+   *  never construct or parse one, since a hand-built cursor loses whatever
+   *  the daemon encoded to keep it stable.
+   *  Supersedes `next_cursor_line_offset` for `rotating`-mode deployments:
+   *  when the oldest event on a page lives in an archive rather than the
+   *  active file, `next_cursor_line_offset` is `null` and only this cursor
+   *  can advance. `null` when the page is empty, or omitted entirely by
+   *  daemons predating multi-segment reads. */
+  next_segment_cursor?: string | null;
   at_end: boolean;
+  persistence_enabled: boolean;
+  /** True when a retained segment could not be read and was left out of this
+   *  page. `at_end` then only means "no older events among the segments that
+   *  could be read", so the UI must not present the buffer as the complete
+   *  history. Omitted (treat as `false`) by daemons predating the field. */
+  incomplete?: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
    *  from `ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES` in zeroclaw-log so
@@ -1991,6 +2306,16 @@ export interface LogsQueryParams {
   since_ts?: string;
   until_ts?: string;
   until_id?: string;
+  /** Byte offset cap passed back from the previous page's
+   *  `next_cursor_line_offset`. When set, the reader stops scanning at
+   *  this offset so the follow-up page only sees lines strictly older
+   *  than the previous one. Independent of id ordering. */
+  until_line_offset?: number;
+  /** Segment-aware cursor passed back from the previous page's
+   *  `next_segment_cursor`. Identifies both the segment file and the byte
+   *  offset within it, so pagination continues across rotated archives.
+   *  Takes precedence over `until_line_offset` when both are set. */
+  until_segment_cursor?: string;
   action?: string;
   category?: string;
   outcome?: string;
@@ -2029,5 +2354,32 @@ export function getCliTools(): Promise<CliTool[]> {
       const result = unwrapField(data, "cli_tools");
       return Array.isArray(result) ? result : [];
     },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Chat image upload
+// ---------------------------------------------------------------------------
+
+export interface UploadImageResult {
+  /** Absolute path of the saved file inside the agent workspace. */
+  path: string;
+  /** `[IMAGE:<path>]` marker ready to embed in a chat message. */
+  marker: string;
+}
+
+/**
+ * Upload an image for the given agent's chat. The body is the raw file — the
+ * gateway types it by magic bytes (client MIME and filename are never
+ * trusted), saves it under the agent workspace, and returns the
+ * `[IMAGE:<path>]` marker to embed in the next message.
+ */
+export function uploadChatImage(
+  agent: string,
+  file: Blob,
+): Promise<UploadImageResult> {
+  return apiFetch<UploadImageResult>(
+    `/api/upload?agent=${encodeURIComponent(agent)}`,
+    { method: "POST", body: file },
   );
 }

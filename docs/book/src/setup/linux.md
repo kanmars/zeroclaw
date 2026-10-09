@@ -14,13 +14,15 @@ That is the whole install. Run it from a clone, or pipe it from `curl`:
 
 #### sh
 
+<!-- >>> generated:unix-fast-command by `cargo generate installers` - do not edit <<< -->
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh
 ```
+<!-- >>> end generated:unix-fast-command <<< -->
 
 </div>
 
-The installer detects your distribution and architecture, picks a prebuilt binary or builds from source (interactive by default; non-interactive shells take the prebuilt when available), installs to `~/.cargo/bin/zeroclaw`, and offers to run [`zeroclaw quickstart`](../getting-started/quickstart.md) for first-time setup. Pass `--help` for the full flag reference, or `--skip-quickstart` to install only.
+The [canonical installation paths](../getting-started/quickstart.md#install) explain the fast and guided routes, source fallback, app selection, PATH handoff, and the next Quickstart step.
 
 ### Homebrew (Linuxbrew)
 
@@ -38,17 +40,15 @@ Homebrew-on-Linux installs follow Homebrew's service path convention, your works
 
 ### NixOS
 
-A multi-instance NixOS module is shipped in-tree. See [NixOS](./nixos.md).
+The upstream flake provides the ZeroClaw CLI. With Nix and flakes enabled:
 
-### A note on `cargo binstall` and `nix run`
+```sh
+nix run github:zeroclaw-labs/zeroclaw -- --version
+```
 
-Neither works yet. `cargo binstall zeroclaw` resolves crate metadata from
-crates.io, but ZeroClaw is not published there (`publish = false`), so there is
-nothing for it to fetch; `nix run github:zeroclaw-labs/zeroclaw` does not launch
-the agent because the flake exposes only a dev toolchain, not a runnable package
-([#5987](https://github.com/zeroclaw-labs/zeroclaw/issues/5987)). `install.sh`
-already does what `binstall` would (download a prebuilt release binary), so it
-remains the supported one-liner.
+See [NixOS](./nixos.md) for source builds, the Nixpkgs package, and the
+multi-instance NixOS service module. For prebuilt binaries, use the installer
+described above.
 
 ## System dependencies
 
@@ -131,7 +131,7 @@ Re-run the installer, it detects the existing install and upgrades in place:
 #### sh
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash -s -- --skip-quickstart
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | sh -s -- --skip-quickstart
 ```
 
 </div>

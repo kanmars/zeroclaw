@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(windows)]
+use zeroclaw_config::platform::native::windows_std_cmd_shell_command;
 
 const TEST_FILE_NAME: &str = "TEST.sh";
 
@@ -33,7 +35,6 @@ struct TestCase {
 }
 
 /// Parse a single TEST.sh line into a `TestCase`.
-///
 /// Expected format: `command | expected_exit_code | expected_output_pattern`
 fn parse_test_line(line: &str) -> Option<TestCase> {
     let trimmed = line.trim();
@@ -73,11 +74,6 @@ fn parse_test_line(line: &str) -> Option<TestCase> {
     })
 }
 
-/// Check whether `output` matches `pattern`.
-///
-/// If the pattern looks like a regex (contains regex metacharacters beyond a
-/// simple `/` path), we attempt a regex match. Otherwise we fall back to a
-/// simple substring check.
 fn pattern_matches(output: &str, pattern: &str) -> bool {
     if pattern.is_empty() {
         return true;
@@ -114,8 +110,8 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
     };
 
     let actual_exit = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = crate::tools::shell_output::decode_shell_output(&output.stdout);
+    let stderr = crate::tools::shell_output::decode_shell_output(&output.stderr);
     let combined = format!("{stdout}{stderr}");
 
     if verbose {
@@ -146,15 +142,8 @@ fn run_test_case(case: &TestCase, skill_dir: &Path, verbose: bool) -> Option<Tes
 
 #[cfg(windows)]
 fn build_test_command(command: &str, skill_dir: &Path) -> Command {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let mut cmd = Command::new("cmd.exe");
-    cmd.raw_arg("/C")
-        .raw_arg(format!("\"{command}\""))
-        .current_dir(skill_dir)
-        .creation_flags(CREATE_NO_WINDOW);
+    let mut cmd = windows_std_cmd_shell_command(command);
+    cmd.current_dir(skill_dir);
     cmd
 }
 
@@ -322,7 +311,7 @@ fn truncate_output(s: &str, max: usize) -> String {
         // inside a multi-byte UTF-8 char (non-ASCII skill output). Round down
         // to the nearest char boundary first (matches skills/review.rs).
         let end = trimmed.floor_char_boundary(max);
-        format!("{}...", &trimmed[..end].replace('\n', " "))
+        format!("{}...", trimmed[..end].replace('\n', " "))
     }
 }
 
@@ -333,7 +322,7 @@ mod tests {
 
     #[test]
     fn truncate_output_does_not_panic_on_multibyte_boundary() {
-        // Regression for #7828: `max` landing inside a multi-byte UTF-8 char
+        // `max` landing inside a multi-byte UTF-8 char
         // must not panic. "🦀" is 4 bytes; max=2 is mid-char.
         let out = truncate_output("🦀🦀🦀", 2);
         assert!(

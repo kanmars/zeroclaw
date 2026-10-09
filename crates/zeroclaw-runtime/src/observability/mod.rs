@@ -1,9 +1,13 @@
-pub mod dora;
+pub mod broadcast;
 pub mod log;
 pub mod multi;
 pub mod noop;
 #[cfg(feature = "observability-otel")]
 pub mod otel;
+#[cfg(feature = "observability-otel")]
+pub mod otel_config;
+#[cfg(feature = "observability-otel")]
+mod otel_logs;
 #[cfg(feature = "observability-prometheus")]
 pub mod prometheus;
 pub mod runtime_trace;
@@ -14,6 +18,9 @@ pub mod verbose;
 pub use self::log::LogObserver;
 #[allow(unused_imports)]
 pub use self::multi::MultiObserver;
+#[cfg(feature = "observability-otel")]
+use self::otel_config::OtelContentConfig;
+pub use broadcast::{BroadcastObserver, EventBuffer, EventBus};
 pub use noop::NoopObserver;
 #[cfg(feature = "observability-otel")]
 pub use otel::OtelObserver;
@@ -25,13 +32,109 @@ pub use verbose::VerboseObserver;
 
 use std::any::Any;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use traits::ObserverMetric;
 use zeroclaw_config::schema::{ObservabilityBackend, ObservabilityConfig};
 
-/// Process-wide broadcast hook installed by long-running subsystems (today: the
-/// gateway) so that events emitted by observers built in *other* subsystems —
+/// Drop-safe lifecycle bracket for one logical agent turn.
+///
+/// Construction emits exactly one [`ObserverEvent::AgentStart`]. Calling
+/// [`finish`](Self::finish), or dropping the guard during an error or panic,
+/// emits exactly one matching [`ObserverEvent::AgentEnd`]. Entry points that
+/// invoke the tool loop directly should use this guard instead of open-coding
+/// lifecycle events so in-flight observers cannot be left unbalanced.
+#[must_use = "hold the guard for the lifetime of the agent turn"]
+pub struct AgentTurnGuard<'a> {
+    observer: &'a dyn Observer,
+    model_provider: String,
+    model: String,
+    channel: Option<String>,
+    agent_alias: Option<String>,
+    turn_id: Option<String>,
+    turn_started_at: Instant,
+    tokens_used: Option<zeroclaw_api::observability_traits::TurnTokenUsage>,
+    cost_usd: Option<f64>,
+    done: bool,
+}
+
+impl<'a> AgentTurnGuard<'a> {
+    /// Open a lifecycle bracket and emit its start event.
+    pub fn start(
+        observer: &'a dyn Observer,
+        model_provider: impl Into<String>,
+        model: impl Into<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
+    ) -> Self {
+        let model_provider = model_provider.into();
+        let model = model.into();
+        observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: model_provider.clone(),
+            model: model.clone(),
+            channel: channel.clone(),
+            agent_alias: agent_alias.clone(),
+            turn_id: turn_id.clone(),
+        });
+        Self {
+            observer,
+            model_provider,
+            model,
+            channel,
+            agent_alias,
+            turn_id,
+            turn_started_at: Instant::now(),
+            tokens_used: None,
+            cost_usd: None,
+            done: false,
+        }
+    }
+
+    /// Attribute the closing event to the model route actually used.
+    pub fn set_model_route(&mut self, model_provider: impl Into<String>, model: impl Into<String>) {
+        self.model_provider = model_provider.into();
+        self.model = model.into();
+    }
+
+    /// Attach aggregate usage to the closing event.
+    pub fn set_usage(
+        &mut self,
+        tokens_used: Option<zeroclaw_api::observability_traits::TurnTokenUsage>,
+        cost_usd: Option<f64>,
+    ) {
+        self.tokens_used = tokens_used;
+        self.cost_usd = cost_usd;
+    }
+
+    /// Emit the matching end event once. Later calls and `Drop` are no-ops.
+    pub fn finish(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        self.observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: self.model_provider.clone(),
+            model: self.model.clone(),
+            duration: self.turn_started_at.elapsed(),
+            tokens_used: self.tokens_used.clone(),
+            cost_usd: self.cost_usd,
+            channel: self.channel.clone(),
+            agent_alias: self.agent_alias.clone(),
+            turn_id: self.turn_id.clone(),
+        });
+    }
+}
+
+impl Drop for AgentTurnGuard<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// Process-wide broadcast hook installed by long-running subsystems (the
+/// daemon's [`EventBus`], or a standalone gateway's) so that events emitted by observers built in *other* subsystems —
 /// notably the agent loop's `process_message` — also fan out to the SSE
 /// broadcast channel. Without this, observers created per call site stay
 /// isolated and `/api/events` only sees the gateway's own direct emissions.
@@ -74,11 +177,6 @@ pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
     });
 }
 
-/// Guard returned by [`set_scoped_broadcast_hook`].
-///
-/// Dropping the guard removes the hook it installed, but only if a later caller
-/// has not already replaced the process-wide hook. If multiple scoped hooks are
-/// live at once, dropping the newest hook restores the previous still-live hook.
 #[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
 pub struct BroadcastHookGuard {
     scoped_id: u64,
@@ -112,6 +210,54 @@ pub fn clear_broadcast_hook() {
 
 fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
     broadcast_hook_slot().read().current()
+}
+
+/// Guard that flushes its observer on drop — the telemetry analogue of
+/// [`AgentTurnGuard`]. Held for the lifetime of a short-lived agent
+/// invocation (today: the CLI one-shot, `zeroclaw agent -m ...`), whose
+/// process exits before the OTLP batch exporter / metric
+/// `PeriodicReader`'s background interval fires. Without this flush all
+/// buffered telemetry — including the never-ended `gen_ai.agent.invoke`
+/// span, which is only `.end()`'d inside [`Observer::flush`] — is lost
+/// when the runtime is torn down.
+///
+/// Long-lived callers (daemon heartbeat/cron, channel `process_message`,
+/// subagent spawns) pass `interactive = false` and skip this guard: they
+/// rely on the periodic export firing on its own cadence, and a flush
+/// per turn would add a synchronous OTLP HTTP POST to every invocation.
+///
+/// Backend-agnostic: calls `Observer::flush()`, which is a no-op for
+/// synchronous backends (`Log`/`Verbose`/`Noop`) and meaningless-but-
+/// harmless for pull backends (`Prometheus` — see startup warning).
+#[must_use = "hold the guard for the lifetime of the agent invocation; dropping it flushes"]
+pub struct FlushGuard {
+    observer: Arc<dyn Observer>,
+    done: bool,
+}
+
+impl FlushGuard {
+    /// Construct a guard that will flush `observer` when dropped.
+    pub fn new(observer: Arc<dyn Observer>) -> Self {
+        Self {
+            observer,
+            done: false,
+        }
+    }
+
+    /// Flush immediately and mark the guard spent so a later `Drop` is a no-op.
+    pub fn fire(&mut self) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        self.observer.flush();
+    }
+}
+
+impl Drop for FlushGuard {
+    fn drop(&mut self) {
+        self.fire();
+    }
 }
 
 /// Wrapper that forwards every event to a primary observer plus the
@@ -149,6 +295,49 @@ impl Observer for TeeObserver {
     }
 }
 
+/// Emit startup warnings for any non-`Off` OTel content policy. Behavior is
+/// unchanged from the pre-isolation inline block: a non-`Off` GenAI or tool
+/// I/O policy surfaces a privacy reminder at observer construction time.
+#[cfg(feature = "observability-otel")]
+fn warn_otel_content_policy(config: OtelContentConfig) {
+    use zeroclaw_config::schema::OtelContentPolicy;
+
+    let genai_warning = match config.genai_policy {
+        OtelContentPolicy::Redacted => Some(
+            "otel_genai_content=redacted: OTel GenAI input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary.",
+        ),
+        OtelContentPolicy::Full => Some(
+            "otel_genai_content=full: OTel GenAI input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments.",
+        ),
+        OtelContentPolicy::Off => None,
+    };
+    if let Some(msg) = genai_warning {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            msg
+        );
+    }
+    let tool_io_warning = match config.tool_io_policy {
+        OtelContentPolicy::Redacted => Some(
+            "otel_tool_io=redacted: OTel tool input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary.",
+        ),
+        OtelContentPolicy::Full => Some(
+            "otel_tool_io=full: OTel tool input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments.",
+        ),
+        OtelContentPolicy::Off => None,
+    };
+    if let Some(msg) = tool_io_warning {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            msg
+        );
+    }
+}
+
 /// Factory: create the right observer from config
 pub fn create_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
     Box::new(TeeObserver {
@@ -178,32 +367,47 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         }
         ObservabilityBackend::Otel => {
             #[cfg(feature = "observability-otel")]
-            match OtelObserver::new(
-                config.otel_endpoint.as_deref(),
-                config.otel_service_name.as_deref(),
-                config.otel_headers.clone(),
-            ) {
-                Ok(obs) => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({"endpoint": config
-                            .otel_endpoint
-                            .as_deref()
-                            .unwrap_or("http://localhost:4318")})),
-                        "OpenTelemetry observer initialized"
-                    );
-                    Box::new(obs)
-                }
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            {
+                let content_config = OtelContentConfig::from_observability_config(config);
+
+                match OtelObserver::new(
+                    config.otel_endpoint.as_deref(),
+                    config.otel_service_name.as_deref(),
+                    config.otel_headers.clone(),
+                    content_config,
+                ) {
+                    Ok(obs) => {
+                        warn_otel_content_policy(content_config);
+
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(
+                                ::serde_json::json!({"endpoint": config
+                                .otel_endpoint
+                                .as_deref()
+                                .unwrap_or("http://localhost:4318")})
+                            ),
+                            "OpenTelemetry observer initialized"
+                        );
+                        Box::new(obs)
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            ERROR,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Failed to create OTel observer. Falling back to noop."
-                    );
-                    Box::new(NoopObserver)
+                            "Failed to create OTel observer. Falling back to noop."
+                        );
+                        Box::new(NoopObserver)
+                    }
                 }
             }
             #[cfg(not(feature = "observability-otel"))]
@@ -220,6 +424,16 @@ fn create_primary_observer(config: &ObservabilityConfig) -> Box<dyn Observer> {
         ObservabilityBackend::None => Box::new(NoopObserver),
     }
 }
+
+/// Serializes tests (in this module and elsewhere in the crate, e.g. the
+/// `agent::loop_` lifecycle-bracket tests that drive `run()` end to end)
+/// that install the process-wide broadcast hook, so concurrent test runs
+/// don't observe each other's installations. A `tokio::sync::Mutex` (not
+/// `parking_lot`) so async tests can hold the guard across the `.await` on
+/// `run()` without tripping `clippy::await_holding_lock`; plain `#[test]`s
+/// use [`tokio::sync::Mutex::blocking_lock`].
+#[cfg(test)]
+pub(crate) static HOOK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -332,15 +546,16 @@ mod tests {
         assert_eq!(create_observer(&bad).name(), "noop");
     }
 
-    use parking_lot::Mutex as PlMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Test observer that counts events and metrics, used to verify the
-    /// broadcast hook fan-out and that downcasts pass through `TeeObserver`.
+    /// Test observer that counts events, metrics, and flushes, used to
+    /// verify the broadcast hook fan-out, that downcasts pass through
+    /// `TeeObserver`, and that `FlushGuard` drives `Observer::flush`.
     #[derive(Default)]
     struct CountingObserver {
         events: AtomicUsize,
         metrics: AtomicUsize,
+        flushes: AtomicUsize,
     }
 
     impl Observer for CountingObserver {
@@ -352,6 +567,10 @@ mod tests {
             self.metrics.fetch_add(1, Ordering::SeqCst);
         }
 
+        fn flush(&self) {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+        }
+
         fn name(&self) -> &str {
             "counting"
         }
@@ -361,13 +580,9 @@ mod tests {
         }
     }
 
-    /// Serialize tests that touch the process-wide broadcast hook so they
-    /// don't observe each other's installations.
-    static HOOK_TEST_LOCK: PlMutex<()> = PlMutex::new(());
-
     #[test]
     fn broadcast_hook_receives_events_from_factory_observer() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let hook = Arc::new(CountingObserver::default());
@@ -392,7 +607,7 @@ mod tests {
 
     #[test]
     fn broadcast_hook_does_not_receive_metrics() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let hook = Arc::new(CountingObserver::default());
@@ -415,7 +630,7 @@ mod tests {
 
     #[test]
     fn broadcast_hook_unset_means_only_primary_runs() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let cfg = ObservabilityConfig {
@@ -431,7 +646,7 @@ mod tests {
 
     #[test]
     fn scoped_broadcast_hook_guard_clears_installed_hook_on_drop() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let hook = Arc::new(CountingObserver::default());
@@ -454,7 +669,7 @@ mod tests {
 
     #[test]
     fn scoped_broadcast_hook_guard_preserves_replacement_hook() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let old_hook = Arc::new(CountingObserver::default());
@@ -479,7 +694,7 @@ mod tests {
 
     #[test]
     fn dropping_newer_scoped_broadcast_hook_restores_older_live_hook() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let old_hook = Arc::new(CountingObserver::default());
@@ -512,7 +727,7 @@ mod tests {
 
     #[test]
     fn factory_observer_downcasts_through_tee() {
-        let _guard = HOOK_TEST_LOCK.lock();
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
         let cfg = ObservabilityConfig {
@@ -524,5 +739,73 @@ mod tests {
         // `as_any` must surface the primary observer so existing downcasts
         // (e.g. PrometheusObserver in /metrics) keep working through the tee.
         assert!(observer.as_any().downcast_ref::<LogObserver>().is_some());
+    }
+
+    #[test]
+    fn flush_guard_flushes_on_drop() {
+        let observer = Arc::new(CountingObserver::default());
+        let guard = FlushGuard::new(observer.clone());
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 0);
+        drop(guard);
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn flush_guard_fire_is_idempotent() {
+        let observer = Arc::new(CountingObserver::default());
+        let mut guard = FlushGuard::new(observer.clone());
+        guard.fire();
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+        // Second explicit fire is a no-op.
+        guard.fire();
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+        // Dropping after fire must not flush again.
+        drop(guard);
+        assert_eq!(observer.flushes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn agent_turn_guard_closes_once_during_panic_unwind() {
+        let observer = CountingObserver::default();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = AgentTurnGuard::start(
+                &observer,
+                "provider",
+                "model",
+                Some("channel".into()),
+                Some("agent".into()),
+                Some("turn".into()),
+            );
+            panic!("test unwind");
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(
+            observer.events.load(Ordering::SeqCst),
+            2,
+            "panic unwind must emit one start and one end"
+        );
+    }
+
+    #[test]
+    fn agent_turn_guard_explicit_finish_is_idempotent() {
+        let observer = CountingObserver::default();
+        let mut guard = AgentTurnGuard::start(
+            &observer,
+            "provider",
+            "model",
+            Some("channel".into()),
+            Some("agent".into()),
+            Some("turn".into()),
+        );
+        guard.finish();
+        guard.finish();
+        drop(guard);
+
+        assert_eq!(
+            observer.events.load(Ordering::SeqCst),
+            2,
+            "explicit finish and drop must still emit one matched pair"
+        );
     }
 }

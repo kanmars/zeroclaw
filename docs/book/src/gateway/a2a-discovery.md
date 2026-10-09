@@ -8,6 +8,26 @@ exactly what to type and exactly what comes back.
 Every response on this page is real output from a running daemon. Nothing here
 is illustrative.
 
+## Authentication
+
+The two discovery GETs are unauthenticated: the catalog card and the per-alias
+agent card are readable without a token so a peer can discover your published
+surface before pairing. The `SendMessage` POST is different. It runs a full
+tool-enabled agent turn, so it is behind the gateway's pairing auth like every
+other write surface. When `[gateway] require_pairing` is on (the default), pass
+a pairing-derived bearer token on the task POST:
+
+```
+curl -X POST http://localhost:42617/a2a/agent_alpha \
+  -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
+  -H "A2A-Version: 1.0" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{...}}'
+```
+
+An unauthenticated task POST gets `401`, never an agent turn. The discovery GETs
+below need no header. See the gateway pairing docs for how to obtain a token.
+
 ## The whole thing in two requests
 
 You only ever need two GET requests to discover an agent.
@@ -57,7 +77,7 @@ Response:
             "protocolVersion": "1.0"
         }
     ],
-    "version": "0.8.0",
+    "version": "0.8.5",
     "capabilities": {
         "streaming": false,
         "pushNotifications": false,
@@ -128,7 +148,7 @@ Response:
             "protocolVersion": "1.0"
         }
     ],
-    "version": "0.8.0",
+    "version": "0.8.5",
     "capabilities": {
         "streaming": false,
         "pushNotifications": false,
@@ -189,7 +209,7 @@ curl http://localhost:42617/a2a/agent_beta/.well-known/agent-card.json
             "protocolVersion": "1.0"
         }
     ],
-    "version": "0.8.0",
+    "version": "0.8.5",
     "capabilities": {
         "streaming": false,
         "pushNotifications": false,
@@ -219,63 +239,68 @@ outside world can see.
 ## Sending a task
 
 Once you have an agent's interface URL and a skill, you send work as a JSON-RPC
-`message/send` POST to that URL:
+`SendMessage` POST to that URL, advertising the A2A protocol version you speak
+in the `A2A-Version` header (this server speaks `1.0`):
 
 ```
 curl -X POST http://localhost:42617/a2a/agent_alpha \
+  -H "Authorization: Bearer $ZEROCLAW_TOKEN" \
+  -H "A2A-Version: 1.0" \
   -H 'Content-Type: application/json' \
   -d '{
     "jsonrpc": "2.0",
     "id": 1,
-    "method": "message/send",
+    "method": "SendMessage",
     "params": {
       "message": {
-        "role": "user",
-        "parts": [{ "kind": "text", "text": "Reply with PONG" }]
+        "messageId": "msg-1",
+        "role": "ROLE_USER",
+        "parts": [{ "text": "Reply with PONG" }]
       }
     }
   }'
 ```
 
-The agent runs the turn and answers with a completed task. The reply is the text
-part inside the task's artifact:
+The agent runs the turn and answers with a completed task. The reply is the
+text part inside the task's artifact; the result is a `SendMessageResponse`
+whose `task` branch carries the `Task`:
 
 ```
 {
     "id": 1,
     "jsonrpc": "2.0",
     "result": {
-        "artifacts": [
-            {
-                "artifactId": "5346ae32-1b63-40c0-9aaa-345d815c792e",
-                "parts": [
-                    {
-                        "kind": "text",
-                        "text": "PONG"
-                    }
-                ]
-            }
-        ],
-        "contextId": "a2a_agent_alpha_06cb22f5-12bf-4b26-9ebc-9c063ab520a4",
-        "id": "0ef19fcb-b5e4-4c26-afce-d80451c8861e",
-        "kind": "task",
-        "status": {
-            "state": "completed"
+        "task": {
+            "id": "0ef19fcb-b5e4-4c26-afce-d80451c8861e",
+            "contextId": "a2a_agent_alpha_06cb22f5-12bf-4b26-9ebc-9c063ab520a4",
+            "status": { "state": "TASK_STATE_COMPLETED" },
+            "artifacts": [
+                {
+                    "artifactId": "5346ae32-1b63-40c0-9aaa-345d815c792e",
+                    "parts": [
+                        { "text": "PONG" }
+                    ]
+                }
+            ]
         }
     }
 }
 ```
 
 The interface URL is the same for discovery and for tasks; only the request
-changes. The endpoint accepts only `message/send`; any other `method` returns a
-JSON-RPC `-32601`, an empty message returns `-32602`, and a body that is not
-JSON-RPC returns HTTP `400`.
+changes. The endpoint accepts only `SendMessage` and only `A2A-Version: 1.0`;
+any other `method` returns a JSON-RPC `-32601`, an empty message returns
+`-32602`, an unsupported version returns a `VERSION_NOT_SUPPORTED` error, and a
+body that is not JSON-RPC returns HTTP `400`.
 
 ## Exposure and the one sharp edge
 
-The task endpoint shares the exact posture of the cards: it answers only when
-`[a2a.server] enabled` is set and the alias is enabled and published. A task POST
-to an unpublished or unknown alias returns `404`, the same as its card.
+The task endpoint shares the cards' enabled and published gates: it answers only
+when `[a2a.server] enabled` is set and the alias is enabled and published. A task
+POST to an unpublished or unknown alias returns `404`, the same as its card. It
+does not share the cards' auth posture, though: discovery cards stay public,
+while task invocation requires the gateway bearer token and returns `401` without
+it.
 
 One sharp edge to know about: the interface URL answers a bare GET with the web
 dashboard, not an agent, because the gateway falls back to serving the dashboard
@@ -287,7 +312,7 @@ HTTP/1.1 200 OK
 content-type: text/html
 ```
 
-Discovery (the `.well-known` paths) and the `message/send` POST are the supported
+Discovery (the `.well-known` paths) and the `SendMessage` POST are the supported
 surface. A bare GET on the interface URL is not part of the protocol; read the
 card at the `.well-known` path instead.
 
@@ -325,6 +350,14 @@ actually carries: it must live in one of the agent's skill bundles and its
 skill in a bundle the agent does not declare, is dropped silently rather than
 advertised.
 
+The most common cause of an empty `skills: []` array is setting
+`a2a.exposed_skills` on an agent that declares no `skill_bundles`.
+`exposed_skills` only narrows the agent's resolved skill set; it does not load
+skills on its own. With no bundle declared there is nothing for the filter to
+keep, so every name drops and the card advertises nothing. Add the owning
+bundle(s) to `agents.<alias>.skill_bundles`. Config validation surfaces this
+case as a startup warning (`a2a_exposed_skills_without_bundles`).
+
 ### What publishing actually exposes
 
 Read this before you publish. Once the server is enabled and an alias is
@@ -332,26 +365,31 @@ published, `POST /a2a/{alias}` runs a full agent turn for that alias: it invokes
 the agent through the same path the chat surfaces use, with the agent's entire
 configured toolset (shell, file, browser, and whatever else that alias carries).
 
-That endpoint is not behind the gateway's bearer/pairing auth. Authentication in
-this gateway is enforced per handler, and the A2A task handler does not gate on a
-token, by design: cross-deployment interop only works if a peer can reach the
-endpoint without sharing your login. The practical consequence is direct:
-**anyone who can reach the gateway listener can invoke a published agent, tools
-and all, with no credential**, while neighboring endpoints like `/api/config`
-require a bearer token.
+That task endpoint is behind the gateway's bearer/pairing auth, like every other
+write surface. A caller needs a pairing-derived bearer token to invoke a
+published agent; an unauthenticated request gets `401`, never an agent turn.
 
-This is a deliberate trade for frictionless agent-to-agent calls, not an
-oversight, but it means publishing is a real exposure decision. Before you flip
-the switches:
+The discovery cards are not behind that auth. The catalog and per-alias cards are
+readable without a token, so a published surface advertises its agent names and
+exposed skills to any caller who can reach the listener. That is the point of
+discovery: a peer reads the card before it ever pairs. It also means publishing
+exposes that metadata to anyone who can reach the gateway, even though invoking
+the agent still requires a token.
+
+Publishing is an exposure decision on both axes: the card metadata is public, and
+any holder of a valid token can invoke a published alias with its full toolset.
+Before you flip the switches:
 
 - Scope the bind posture. Bind the gateway to a private interface, or sit it
-  behind a reverse proxy that enforces auth, rather than exposing the listener
-  directly to an untrusted network.
+  behind a reverse proxy, rather than exposing the listener directly to an
+  untrusted network. This also bounds who can read the unauthenticated cards.
 - Publish only aliases whose full toolset you are willing to have invoked by any
-  reachable caller, and narrow `exposed_skills` to the minimum that interop
-  needs.
+  token holder, and whose names and skills you are willing to advertise
+  unauthenticated. Narrow `exposed_skills` to the minimum that interop needs.
 - Treat a published alias as a remotely-invokable execution surface when you
   decide which tools and skill bundles that alias carries.
+- Cross-deployment interop shares a token with the peer that calls you; scope and
+  rotate that credential like any other.
 
 ## How several deployments connect
 
@@ -376,6 +414,63 @@ personal, a `deploy` agent at team, and a `query` agent at data. To use any of
 them it fetches that agent's card and sends a task to that agent's URL, exactly
 as shown above. Nothing changes per deployment; it is the same two reads and one
 POST, pointed at a different host.
+
+## Calling out: the outbound A2A client
+
+Everything above is a deployment being discovered and called. The mirror
+direction is outbound: one deployment delegates tasks to a remote A2A agent and
+uses the replies in its own work. That is the outbound client, configured under
+`[a2a.client]`. It is off by default and registers nothing until you turn it on,
+so an unconfigured install carries no outbound A2A footprint.
+
+```toml
+[a2a.client]
+enabled = true                  # registers the a2a_* tools; default false
+
+[[a2a.client.peers]]
+name = "team"                   # the `peer` argument to every a2a_* tool
+base_url = "https://team.example.com"
+token = "${TEAM_A2A_TOKEN}"     # resolved from env at call time; empty = anonymous
+tags = ["production"]
+```
+
+Each `peer` names a remote A2A server origin. The client derives the well-known
+card path and the JSON-RPC task path from `base_url`; an agent caller never types
+a URL, only the `peer` name.
+
+Credentials are typed as secrets. A `token` of `${VAR}` is resolved from the
+environment at call time, a literal value is sent as-is, and an empty value
+sends no `Authorization` header. Because the field is marked a secret, config and
+schema surfaces treat it as write-only encrypted material rather than a readable
+value. That is the same secret posture `http_request` uses for its auth tokens.
+
+Outbound calls are an SSRF surface, so the policy defaults to rejecting peers on
+private, loopback, and link-local hosts. For a local or intra-net deployment
+pointed at `127.0.0.1` or an RFC1918 segment, either set `allow_private_hosts =
+true` or add the specific hosts to `allowed_private_hosts`; the allowlist pins
+just those hosts without loosening the global posture. Hostname resolution is
+pinned to the addresses that passed the guard, redirects are disabled, response
+bodies are bounded by `max_response_bytes`, and each request has a
+`request_timeout_secs` cap.
+
+The four tools differ in impact. `a2a_discover` and `a2a_get_task` are read
+operations and are not charged as actions. `a2a_send` and `a2a_cancel` mutate
+peer state, so they are Act operations: they require approval by default, and a
+read-only autonomy mode denies them before any network I/O. Treat `a2a_send` as a
+remote-execution grant to whichever skills the peer publishes.
+
+Turning the outbound client off is containment, not rollback. Setting
+`[a2a.client] enabled = false` stops the `a2a_*` tools from registering, so
+disabling it and restarting the daemon (rebuilding the registry) is the right
+move to contain an outbound egress incident. Containment does not take effect
+immediately for an already-running daemon: its agent tasks hold the already-built
+`a2a_*` tools until restart/registry reassembly, so an operator should treat
+egress as ongoing until then. Disabling the switch does not undo the inbound
+gateway migration (the `SendMessage` v1 surface) or the shared wire-model change,
+which ship in the same release: an external caller that already speaks v1 keeps
+working, and an operator who wants the pre-v1 inbound behavior must roll back the
+whole release rather than flip this one switch. The gateway version negotiation,
+the JSONRPC method names, and the enum and Part shapes all moved to v1 together.
 
 ## Use cases
 

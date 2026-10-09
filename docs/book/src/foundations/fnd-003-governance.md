@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 5
+> Starting v0.7.0 · Type: Governance · Rev. 19
 >
-> **Canonical reference** · Ratified by the team · Rev. 5
+> **Canonical reference** · Ratified by the team · Rev. 19
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -20,9 +20,23 @@
 |---|---|---|
 | 1 | 2026-04-09 | Initial draft |
 | 2 | 2026-04-09 | Added §6.4 Architectural Compliance: Human Review, AI Support; added Discussion Question on AI automation of architecture reviews |
-| 3 | 2026-05-24 | Added #6808 operational-label-policy pointers; current label behavior lives in maintainer docs |
-| 4 | 2026-05-24 | Added #6808 community-pickup and issue-risk/PR-risk operational pointers |
-| 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live |
+| 3 | 2026-05-24 | Added #6808 operational-label-policy pointers; current label behavior lives in maintainer docs ([#6899](https://github.com/zeroclaw-labs/zeroclaw/pull/6899)) |
+| 4 | 2026-05-24 | Added #6808 community-pickup and issue-risk/PR-risk operational pointers ([#6903](https://github.com/zeroclaw-labs/zeroclaw/pull/6903)) |
+| 5 | 2026-05-25 | Promoted #6808 feature-facing work-lane and label-governance policy into FND-003; clarified durable source boundaries, Discussions stewardship, Discord-to-GitHub handoff, and where operational gate questions live ([#6919](https://github.com/zeroclaw-labs/zeroclaw/pull/6919)) |
+| 6 | 2026-05-27 | Made board-level `Won't Do` a durable closure decision and delegated current terminal-label and replacement-process rules to maintainer sources ([#6929](https://github.com/zeroclaw-labs/zeroclaw/pull/6929)) |
+| 7 | 2026-06-07 | Expanded project-board planning ownership to an active owner or steward path and required stale-exemption reason plus active movement ownership ([#7011](https://github.com/zeroclaw-labs/zeroclaw/pull/7011)) |
+| 8 | 2026-06-14 | Replaced owner-or-steward requirements with contributor-visible routing evidence for project-board and stale-exemption policy ([#7571](https://github.com/zeroclaw-labs/zeroclaw/pull/7571)) |
+| 9 | 2026-06-16 | Made `.github/ISSUE_TEMPLATE/` the operational intake source, defined the current intake lanes, and kept judgment-only labels maintainer-applied ([#7652](https://github.com/zeroclaw-labs/zeroclaw/pull/7652)) |
+| 10 | 2026-06-23 | Standardized size-label spelling and changed PR-size labeling from required automation to a future optional mechanism aligned with maintainer policy ([#8111](https://github.com/zeroclaw-labs/zeroclaw/pull/8111)) |
+| 11 | 2026-07-05 | Changed the RFC lifecycle to issue-first governance and linked the foundational RFCs to their canonical FNDs ([#8694](https://github.com/zeroclaw-labs/zeroclaw/pull/8694)) |
+| 12 | 2026-07-12 | Revised issue stale timing and qualifying-activity policy; made the maintainer label guide the sole operational source ([#8989](https://github.com/zeroclaw-labs/zeroclaw/pull/8989)) |
+| 13 | 2026-07-18 | Replaced the universal ADR requirement with an explicit durable-disposition rule for accepted RFCs; reserved ADRs for significant architecture decisions ([#9136](https://github.com/zeroclaw-labs/zeroclaw/pull/9136)) |
+| 14 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records ([#9388](https://github.com/zeroclaw-labs/zeroclaw/pull/9388)) |
+| 15 | 2026-08-10 | Narrowed the RFC trigger to four project-level categories and named the ordinary work that does not require an RFC; replaced the seven-day discussion period with 48h ordinary / 72h exceptional; defined the 72-hour vote against an immutable snapshot, the 30-day active electorate, two-ballot quorum, silence-as-approval after quorum, non-vetoing `REVISE`, and outcome precedence; made two-thirds the default threshold and reserved unanimity for expensive or irreversible decisions; retired the nonexistent parallel `rfc:*` label family; added the GitHub bridge record for Core meeting decisions ([#9499](https://github.com/zeroclaw-labs/zeroclaw/pull/9499)) |
+| 16 | 2026-08-22 | Calibrated consequence-based PR risk routing, retained `risk:manual` as an automation freeze, and required two independent Core Team approvals for `risk:high` or `domain:security` PRs ([#10192](https://github.com/zeroclaw-labs/zeroclaw/pull/10192)) |
+| 17 | 2026-08-23 | Defined deferred RFC vote handling for unchanged snapshots: no-quorum and missing-threshold or explicit-unanimity cases enter another recorded 72-hour cycle on the same vote, existing explicit ballots count toward quorum and outcome until replaced, and material revisions return the proposal to discussion rather than renewing the unchanged snapshot ([#10288](https://github.com/zeroclaw-labs/zeroclaw/pull/10288)) |
+| 18 | 2026-09-08 | Implemented the accepted second-review exception with one non-author Core approval, clean exact-head advisory evidence, green required CI, and no unresolved holds or findings; added a five-business-date waiting condition ([RFC #10366](https://github.com/zeroclaw-labs/zeroclaw/issues/10366), [#10677](https://github.com/zeroclaw-labs/zeroclaw/pull/10677)) |
+| 19 | 2026-09-13 | Removed mandatory pre-vote RFC discussion timers, made stable snapshot readiness the vote-opening gate, made valid `REVISE` ballots stop the current snapshot, and required deferred unchanged snapshots to continue only through a recorded deadline and carried-ballot record ([#10549](https://github.com/zeroclaw-labs/zeroclaw/issues/10549)) |
 
 ---
 
@@ -74,7 +88,7 @@ These are three distinct concerns. Conflating them, putting everything in one bo
 |---|---|---|
 | Work pipeline (backlog → release) | **GitHub Projects v2** | Custom fields, multiple views, Kanban + roadmap, built-in automation, milestone tracking |
 | Community discussion and idea incubation | **GitHub Discussions** | Community-visible, no PR required, separates early conversation from committed work, promotes concrete outcomes into the owning tracked surface |
-| Governance and decision authority | **RFC process + Team Tiers + CODEOWNERS** | Already partially established via `docs/proposals/`; needs formalization and close loop |
+| Governance and decision authority | **RFC process + Team Tiers + CODEOWNERS** | Established through RFC issues, foundation docs, and CODEOWNERS; needs formalization and close loop |
 
 The key principle: **the Project board contains only work the team has committed to thinking about.** Early community discussion, ideas, Q&A, and showcases can live in Discussions when the lane is maintained. Work that has been evaluated, accepted, and scoped lives in the Project. This distinction is what keeps the board useful.
 
@@ -313,7 +327,7 @@ Anyone. No approval required.
 
 Community members who have had at least two PRs merged into the `master` branch.
 
-*How to become one:* Have two PRs merged. A Core Team member adds you to the Contributors team in GitHub and to `CONTRIBUTORS.md`.
+*How to become one:* Have two PRs merged, recognized by a Core Team member. Tier 2 has no durable membership record today; see §5.3.
 
 *What they gain beyond Community:*
 - Can be assigned issues
@@ -368,11 +382,19 @@ These always require explicit Core Team votes.
 
 ### 5.3 Recording Team Membership
 
-Team membership is recorded in two places:
+Membership itself is established by decision, not by any file or GitHub setting. Per §5.1, someone becomes Core Team by invitation from existing Core Team members, announced publicly in Discussions. That decision, and its public announcement, is the source of truth. Everything below is a record of something downstream of it, and none of them is a membership roster:
 
-**`CONTRIBUTORS.md`** at the repository root: a public record of everyone who has contributed, organized by tier. Updated by Core Team members as contributors are recognized.
+**The `core-contributors` GitHub team** and the repository collaborator list, in the organization settings: **access controls**, not membership records. They answer who can write to the repository, which is a consequence of membership rather than a definition of it. Expect them to differ from the member list in both directions. They include automation accounts that are not people, and access can be granted directly, held from before a membership decision, or still pending acceptance of an invitation. When you need to know who can push, read these. When you need to know who is Core Team, read the announcement that admitted them.
 
-**GitHub Teams** in the organization settings: `zeroclaw-core` and `zeroclaw-contributors` teams, referenced in CODEOWNERS and used for notification routing.
+**`.github/CODEOWNERS`** at the repository root: **review routing**, not membership. It records who is requested on which paths. Being listed does not confer membership and being a member does not imply being listed. Changes to it require an explicit Core Team vote, per §5.2.
+
+**The maintainer table in [Communication](../contributing/communication.md#maintainer-contacts)**: the human-readable summary of current members and what each works on. It is the closest thing to a published roster, and it is maintained by hand, so treat it as a summary of admission decisions rather than as an authority. For focus areas it is a convenience view over CODEOWNERS, and where those two disagree, CODEOWNERS wins.
+
+Removals work the same way as admissions: they are decisions, recorded where they are made. Revoking access or removing someone from CODEOWNERS implements a departure; it does not by itself constitute one.
+
+Revisions 1 through 7 of this document specified a `CONTRIBUTORS.md` file at the repository root as a tier-organized membership record, and named `zeroclaw-core` and `zeroclaw-contributors` GitHub teams. None of the three was ever created; the organization uses a single `core-contributors` team instead. RFC #6808 reached the same finding independently, recording that the FND-003 team-tier structure is not the visible current routing model and that new lane rules should not be built on it. Those references are retired here rather than left standing as a description of machinery that does not exist.
+
+Tier 2 has no durable membership record at present. Establishing one, or retiring the tier, is an open question for the team.
 
 ---
 
@@ -382,14 +404,14 @@ Team membership is recorded in two places:
 
 The `CODEOWNERS` file makes governance automatic. It defines which paths require review from which team before a PR can merge. GitHub enforces this as a required review: the PR cannot be merged until the requirement is satisfied.
 
-Create `.github/CODEOWNERS`:
+The block below is the original illustrative proposal, kept for the reasoning it shows about protected review routing. It is not the current file and should not be copied. `.github/CODEOWNERS` already exists and is actively maintained; it routes to individual handles rather than team handles, and its paths follow the post-microkernel crate layout established in #6537. The `@zeroclaw-labs/zeroclaw-core` and `@zeroclaw-labs/zeroclaw-contributors` handles used here were never created; see §5.3. Its broad routing paths are not the current `risk:high` classifier; read the live file and the [maintainer label guide](../maintainers/labels.md#risk-labels) for current routing and risk semantics.
 
 ```
-# CODEOWNERS — Automatic review routing by risk tier
-# See AGENTS.md for risk tier definitions.
-# See docs/proposals/project-governance.md for team tier definitions.
+# CODEOWNERS — Automatic review routing by protected surface
+# See the maintainer label guide for risk definitions.
+# See the governance foundation doc and RFC issue template for team tier definitions.
 
-# ── High Risk: requires Core Team approval ──────────────────────────────────
+# ── Protected review routing: Core Team review ──────────────────────────────
 
 src/security/**                 @zeroclaw-labs/zeroclaw-core
 src/gateway/**                  @zeroclaw-labs/zeroclaw-core
@@ -407,8 +429,8 @@ deny.toml                       @zeroclaw-labs/zeroclaw-core
 
 # ── Architecture documents: requires Core Team review ───────────────────────
 
-docs/proposals/**               @zeroclaw-labs/zeroclaw-core
-docs/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
+docs/book/src/foundations/**    @zeroclaw-labs/zeroclaw-core
+docs/book/src/architecture/decisions/**  @zeroclaw-labs/zeroclaw-core
 AGENTS.md                       @zeroclaw-labs/zeroclaw-core
 
 # ── Default: any Contributor or Core Team member can review ─────────────────
@@ -425,7 +447,7 @@ Configure the following branch protection rules for `master`:
 | Rule | Setting | Reason |
 |---|---|---|
 | Require a pull request before merging | Enabled | No direct pushes to master, ever |
-| Require approvals | 1 for Low/Medium risk; 2 for High risk | CODEOWNERS enforcement handles the "who" |
+| Require approvals | At least 1 GitHub approval in branch protection; `risk:high` or `domain:security` defaults to 2 independent Core Team approvals before merge, subject to the explicit expedited exception below | CODEOWNERS routes review; the conditional two-approval rule and its narrow exception are explicit merge requirements |
 | Require status checks to pass | `cargo fmt`, `cargo clippy`, `cargo test` | CI must be green before merge |
 | Require branches to be up to date | Enabled | Prevents merging stale code |
 | Require conversation resolution | Enabled | All review comments must be resolved |
@@ -434,6 +456,10 @@ Configure the following branch protection rules for `master`:
 | Allow deletions | Disabled | Protect the branch |
 
 **Why admins cannot bypass:** One of the most common mistakes in small team projects is treating branch protection as "for other people." When an admin can bypass, they will, under time pressure, in an emergency, "just this once." Then it becomes the norm. The rule must apply to everyone for it to mean anything. If there is a genuine emergency, the right response is to follow the process faster, not to skip it.
+
+The [expedited second-review lane](../maintainers/pr-workflow.md#expedited-second-review-lane) is the only standing exception to the two-Core default. It implements the accepted evidence-based second-review exception and adds a waiting condition based on this document's five-business-day review responsibility. The lane is not automatic, automated review is not an approval, and broad governance, security-floor, release, migration, and irreversible architecture changes continue to default to two human approvals. The maintainer PR workflow owns the full eligibility and accountability rules.
+
+GitHub's native approval count is configured per protected branch or ruleset target, not conditionally by PR label. Until a separately approved technical enforcement design has a machine-readable authority for Core Team approval, maintainers must apply the `risk:high OR domain:security` requirement through the documented merge checklist and retain an auditable review record. `risk:manual` freezes future automatic risk replacement only; it cannot lower this requirement.
 
 ### 6.3 Required Status Checks
 
@@ -472,7 +498,7 @@ A gate that flags valid architectural decisions because the tool misread the con
 
 **CODEOWNERS is the architectural compliance gate. The reviewer is the tool.**
 
-The `CODEOWNERS` configuration in §6.1 already enforces that PRs touching high-risk paths, crate boundaries, trait definitions, the dependency graph, `src/security/`, `.github/`, require review from a Core Team member. That Core Team member, equipped with the RFCs as their reference framework, is the architectural compliance check. They bring the contextual judgment that no automation can replicate.
+The `CODEOWNERS` configuration in §6.1 already routes protected review surfaces such as crate boundaries, trait definitions, the dependency graph, `src/security/`, and `.github/` to a Core Team reviewer. That routing is distinct from `risk:*` classification. The Core Team reviewer, equipped with the RFCs as their reference framework, is the architectural compliance check. They bring the contextual judgment that no automation can replicate.
 
 This is why the RFCs, the AGENTS.md files, and the documentation standards exist: not so a machine can parse them and produce a score, but so a human reviewer has a consistent, documented framework to apply. The RFC answers "why does this architecture exist." The reviewer answers "does this PR serve or undermine that why."
 
@@ -510,7 +536,7 @@ Current intake lanes:
 | `bug_report.yml` | Reproducible defects | Component, severity, reproduction, expected behavior, environment, privacy check |
 | `support_config.yml` | Setup, configuration, and usage help | Goal, observed behavior, redacted config or commands when relevant |
 | `feature_request.yml` | Ordinary feature ideas | User problem, proposed solution, non-goals, architecture/risk hints, expected routing |
-| `rfc_design.yml` | Architecture, governance, default, release, or contribution-model proposals | Problem, proposal, risks, breaking-change assessment, decision/revisit surface |
+| `rfc_design.yml` | Proposals crossing an RFC trigger in §8: security model, governance or contribution process, cross-cutting ownership refactor, or a new subsystem or capability boundary | Trigger crossed, problem, proposal, risks, breaking-change assessment, decision/revisit surface |
 | `roadmap_tracker.yml` | Active release, roadmap, RFC, implementation, cleanup, or audit trackers | Purpose, scope, linked work, routing evidence, close criteria, stale-exemption request |
 | `docs_issue.yml` | Missing, wrong, confusing, or outdated docs | Location, problem, expected documentation, related source of truth |
 | `contributor_task.yml` | Maintainer-scoped work intended for external contributors | Context, acceptance criteria, likely files, pickup fit, mentor or review contact |
@@ -525,77 +551,132 @@ Issue templates collect evidence; they do not decide final labels by themselves.
 
 The RFC process was established in the documentation RFC and the architecture RFC. This section defines the close loop: how an RFC moves from proposal to decision to action.
 
+**When an RFC is required.** An RFC records a durable project-level decision before implementation. Require one when the proposal is at least one of:
+
+- a new security layer, or a material change to the project's security model;
+- a governance, contribution-process, or project-authority change;
+- a cross-cutting architectural refactor that changes ownership or contracts across established boundaries; or
+- a new subsystem, or another project-wide capability boundary.
+
+Do not require an RFC merely because the work includes an ordinary feature addition, a schema or data migration, a configuration field or default change, or a bounded implementation refactor. Those proceed through an issue and a PR. They require an RFC only when their substantive effect also meets one of the triggers above.
+
+The trigger follows substantive project effect, not the issue title, the author, an AI-assisted origin, or the mere presence of a migration, feature, or default change. Security vulnerabilities use private reporting, never a public RFC.
+
+Maintainers may relabel or close a filed RFC as an ordinary issue, feature request, or implementation follow-up when it does not meet the trigger. The disposition states whether the underlying work remains valid and where it continues. This routes work; it is not a rejection on substance.
+
 ### 8.1 The Full RFC Lifecycle
 
+Discussion is encouraged before and during voting, but it is a readiness state rather than a mandatory timer. An RFC can enter a vote when the proposal has a visible stable snapshot, the vote opener identifies the RFC trigger, and a Core contributor is willing to put that snapshot to a decision.
+
+Body edits before a vote do not need a waiting period. The vote opener is responsible for deciding whether the body is stable enough to snapshot. Body edits after a vote opens either stop the current vote as a material replacement or remain outside the voted snapshot until the next revision.
+
 ```
-1. AUTHOR writes proposal → docs/proposals/<slug>.md
-           ↓
-2. AUTHOR opens PR with the proposal document
-           ↓
-3. AUTHOR opens RFC issue using the RFC issue template
-   linking to the PR
-           ↓
-4. DISCUSSION PERIOD — minimum 7 days
-   Anyone can comment. Core Team members engage substantively.
-   Discussions happen on the issue, not the PR.
-           ↓
-5. CORE TEAM VOTE on the issue
-   Format: comment with one of:
-     ✅ APPROVE — with brief rationale
-     ❌ REJECT — with specific objections
-     🔄 REVISE — with specific requests
-           ↓
-   ┌── Majority APPROVE ──────────────────────────────────────┐
-   │  RFC is accepted                                          │
-   │  PR is merged                                            │
-   │  Issue labeled rfc:accepted                              │
-   │  Author writes ADR(s) in docs/architecture/decisions/    │
-   │  ADR issue(s) linked back to RFC issue                   │
-   │  RFC issue closed                                        │
-   └──────────────────────────────────────────────────────────┘
-           ↓
-   ┌── Any REJECT ────────────────────────────────────────────┐
-   │  RFC is rejected                                          │
-   │  PR is closed (not merged)                               │
-   │  Issue labeled rfc:rejected                              │
-   │  Rejecting members document specific objections          │
-   │  RFC issue closed with rejection summary comment         │
-   └──────────────────────────────────────────────────────────┘
-           ↓
-   ┌── REVISE requested ──────────────────────────────────────┐
-   │  RFC is not voted on until revisions are complete        │
-   │  Issue labeled rfc:revision-requested                    │
-   │  Author revises proposal document                        │
-   │  Author re-requests review via issue comment             │
-   │  Process returns to step 4                               │
-   └──────────────────────────────────────────────────────────┘
+1. AUTHOR opens an RFC issue using the RFC issue template,
+   naming the trigger the proposal crosses
+           |
+2. SNAPSHOT PREPARATION / DISCUSSION
+   Anyone can comment. The author or a maintainer revises the body until
+   a Core contributor is willing to open a vote on a stable snapshot.
+           |
+3. VOTE OPENS against an immutable snapshot.
+   The vote-opening comment records:
+     - the immutable proposal snapshot (artifact, commit, or issue-body digest)
+     - the RFC trigger and why the snapshot is ready for a Core decision
+     - the assigned active electorate, and inactive Core notified for re-entry
+     - the threshold, and why it applies
+     - that quorum requires two explicit ballots
+     - the exact UTC deadline, 72 hours after opening
+           |
+4. CORE TEAM BALLOTS, one of:
+     APPROVE  accept the snapshot as written, optionally with implementation boundaries
+     REVISE   stop this snapshot and request a concrete body change
+     REJECT   reject the proposal, with a specific blocking reason
+           |
+5. OUTCOME, applied in this precedence order:
+     a. Valid eligible REVISE before deadline  -> RETURNED TO REVISION
+     b. Proposal body materially changed, or
+        author asks to revise                  -> RETURNED TO DISCUSSION
+     c. Fewer than two explicit ballots         -> DEFERRED
+     d. Quorum met and any final ballot REJECT  -> REJECTED
+     e. Quorum met, no valid REVISE/REJECT, and the
+        applicable threshold or required explicit
+        approvals remain missing               -> DEFERRED
+     f. Quorum met, no valid REVISE/REJECT, applicable
+        threshold satisfied                    -> ACCEPTED
 ```
+
+While a vote remains open, a member's latest `APPROVE` or `REJECT` ballot before the recorded deadline supersedes their earlier ballot. A valid `REVISE` is terminal for that snapshot and cannot be superseded by a later `APPROVE` inside the same stopped vote. The revised body starts a new snapshot.
+
+A `REVISE` ballot is valid when it names the affected contract or body term, the concrete body change or decision needed, and why the ambiguity prevents approval. A `REVISE` that names a body section or term and a requested change is valid on its face. The vote opener may ask for clarification, but may not set aside that ballot alone; if validity is disputed, one other Core contributor must agree that the ballot is invalid or the ballot stands.
+
+If a ballot only says `REVISE` without a reason, the vote opener asks for clarification. The vote does not stop and that ballot does not count toward quorum unless the voter cures it before the deadline or another Core contributor confirms it identifies a real body blocker.
+
+Accepted RFCs carry `status:accepted`. If non-blocking `APPROVE` boundaries or other implementation concerns were raised, the closing record or implementation handoff records how they will be handled. Rejected RFCs are closed with the blocking objection recorded and a link to any issue where the underlying problem continues; rejection ends the current proposal, not necessarily the problem.
+
+Deferred proposals enter another recorded 72-hour cycle against the same immutable snapshot when the vote deadline arrives with fewer than two explicit ballots, or with no valid `REVISE` or `REJECT` and the applicable threshold or explicit approvals still missing. A renewal is the same vote on the same snapshot, not a new vote on a new proposal. It does not recompute the assigned active electorate. The final electorate remains the active electorate assigned when the vote first opened, plus any current Core Team member who ballots in any cycle for that same snapshot. Existing explicit ballots count toward quorum and outcome in the renewed cycle, and carry forward until withdrawn or replaced by a later ballot, so voters do not need to recast unchanged ballots.
+
+The closing or status record for a deferred cycle must state the missing condition and link to a continuation or reopening record. The continuation or reopening record names the carried snapshot, carried ballots that have not been withdrawn or replaced, electorate so far, threshold, missing condition, `opened_at`, and `deadline = opened_at + 72 hours` unless Core records a different exact UTC deadline. The recorded deadline is the ballot cutoff. At the next cycle deadline, the same snapshot can be accepted, rejected, or deferred again.
+
+A proposal returns to discussion or revision when a valid `REVISE` stops the snapshot, the body materially changes, or the author asks to revise before a decision. A revised body may return to vote immediately or in the next coordinated vote batch once the new stable snapshot is visible. No automatic 48-hour or 72-hour waiting period restarts merely because the body changed.
+
+A vote batch is scheduling only. It does not change each RFC's snapshot, electorate, deadline, or ballot rules.
+
+Use the live `type:rfc` and `status:accepted` labels. There is no parallel `rfc:*` status label family.
+
+The current protocol applies to RFC votes opened after the documentation PR that ratifies that revision lands, unless Core explicitly records earlier use on a specific issue. It does not automatically invalidate earlier accepted RFCs; historical-process audit and correction work remain tracked separately.
+
+A vote may close early only when every member of the final active electorate has explicitly approved and no otherwise inactive Core contributor has asked for the full window. The closing record must say why it closed before the deadline. An exceptional unanimous vote may close early only on explicit approval from every assigned voter.
 
 ### 8.2 Vote Thresholds
 
-| Change Type | Vote Required | Rationale |
+**Two-thirds of the final active electorate is the default threshold**, rounded up to a whole voter. The final active electorate is the electorate assigned at opening plus any other current Core Team member who ballots in that same vote.
+
+- **Quorum** requires at least two current Core contributors to cast an explicit ballot. Silence never counts toward quorum.
+- **Silence counts as `APPROVE`** from the final active electorate once quorum is met, for ordinary votes only.
+- **`REVISE`** stops the current snapshot when valid.
+- **`REJECT`** vetoes acceptance once quorum is met.
+
+Silence-as-approval is evaluated only at the deadline for a vote that remains open and has no valid `REVISE` or `REJECT`. Silence never overrides a stopped snapshot.
+
+**Unanimity is reserved** for decisions whose cost or irreversibility makes supermajority approval inadequate, such as license or legal-ownership changes. The vote opening must explain why unanimity applies. A unanimous vote requires an explicit `APPROVE` from every assigned eligible Core contributor; silence cannot establish unanimity.
+
+**Active electorate.** An active Core contributor is a current Core Team member who cast an explicit `APPROVE`, `REVISE`, or `REJECT` ballot in a formally opened RFC vote during the preceding 30 days, and who has not publicly stepped away or recorded unavailability for the voting period. Inactive current Core members are notified and may join a vote's final electorate by balloting in it, which also reactivates them for later votes.
+
+Quorum and the denominator are determined separately for every vote. Activity is checked when the vote opens; later activity in a different concurrent vote does not change an already-open vote's electorate.
+
+### 8.2a Core Meeting Decisions and the GitHub Bridge
+
+GitHub is the source of truth for proposal text, discussion, vote openings, ballots, deadlines, and outcomes. Discord may announce or discuss an RFC but does not establish governance state.
+
+Core contributor meeting decisions recorded in the project's approved internal decision record may guide immediate maintainer action, and may supersede prior internal direction. Any such action that changes public project state must leave a GitHub bridge record on the affected issue, PR, tracker, or RFC. The bridge record names the meeting date or decision record, summarizes the decision applied, states the public action taken, and says whether it is a one-off exception or a durable rule change.
+
+Meeting decisions do not silently rewrite this document, contributor docs, labels, issue templates, or RFC outcomes. Durable governance changes become policy only when reflected in the relevant GitHub and documentation surfaces. For exceptional unanimous decisions, an internal meeting record cannot replace the required explicit GitHub approvals unless that record documents the approving members and the public issue records that basis.
+
+### 8.3 Durable Follow-Through and the ADR Connection
+
+For newly accepted RFCs, the final shape and durable follow-through must be visible from the RFC issue before implementation proceeds. Acceptance alone does not complete the governance handoff. For accepted RFCs audited after implementation, record the disposition retrospectively without reopening completed work.
+
+Each disposition record identifies the authoritative final shape, the selected disposition and rationale, the durable artifact or delivery tracker, and the owner or next action when follow-through remains.
+
+Use one of four dispositions:
+
+- **ADR:** required when the decision materially constrains future architecture. Indicators include a surprising system boundary, a non-obvious tradeoff, or a choice that materially limits future architecture alternatives.
+- **Standing-document update:** required when the durable result is an operational, reference, workflow, security, or user contract rather than a new architecture decision.
+- **Implementation or tracker follow-up:** required when an existing ADR, FND, or standing document already carries the decision and delivery work remains. Link the delivery tracker and its next action.
+- **No separate artifact:** permitted when an identified existing FND, ADR, standing document, completed implementation, or superseding decision already preserves the result and no additional delivery tracking remains. The issue must record that rationale and link the durable surface.
+
+An RFC is the discussion and acceptance surface. An ADR is the permanent record of a significant architecture decision, not a mandatory summary of every accepted RFC. Standing documents and implementation trackers do not replace an ADR when the accepted decision meets the architecture threshold above.
+
+### 8.4 Foundational RFCs
+
+The early proposal documents have since been represented as RFC issues
+and foundation documents:
+
+| RFC issue | Current durable surface | Priority |
 |---|---|---|
-| Documentation, tooling, non-breaking features | Simple majority of active Core Team members | Low stakes, fast iteration |
-| API changes, new subsystems, behavioral changes | Two-thirds majority of Core Team | Moderate stakes, needs real consensus |
-| Architecture changes, security model changes, breaking changes | Unanimous agreement of all Core Team members | High stakes, affects everyone |
-
-"Active" Core Team members are those who have participated in at least one vote in the past 90 days. Inactive members do not count against majority thresholds but are notified of votes.
-
-### 8.3 The ADR Connection
-
-Every accepted RFC must produce at least one ADR before the corresponding implementation can begin. The ADR is not a summary of the RFC: it is the permanent record of the specific decision made, in the Nygard format defined in the documentation RFC. The RFC can be long and exploratory. The ADR is short and definitive.
-
-RFCs are proposals. ADRs are decisions. Both are necessary. Neither replaces the other.
-
-### 8.4 Existing RFCs in This Repository
-
-The following RFCs have been filed as of this writing and should be converted to formal RFC issues immediately:
-
-| RFC Document | Issue to create | Priority |
-|---|---|---|
-| `docs/proposals/microkernel-architecture.md` | Microkernel Architecture RFC (v0.7.0+) | High |
-| `docs/proposals/documentation-standards.md` | Documentation Standards and i18n RFC | High |
-| `docs/proposals/project-governance.md` | Team Organization and Governance RFC | Medium |
+| [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574) | [FND-001: Intentional architecture](./fnd-001-intentional-architecture.md) | High |
+| [#5576](https://github.com/zeroclaw-labs/zeroclaw/issues/5576) | [FND-002: Documentation standards](./fnd-002-documentation-standards.md) | High |
+| [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577) | [FND-003: Governance](./fnd-003-governance.md) | Medium |
 
 ---
 
@@ -647,9 +728,9 @@ Use `#f1f5f9` (light gray) for all component labels to distinguish them visually
 
 | Label | Color | Use |
 |---|---|---|
-| `risk:low` | `#dcfce7` | Docs, tests, minor changes |
-| `risk:medium` | `#fef9c3` | Most `src/**` changes |
-| `risk:high` | `#fee2e2` | Security, gateway, runtime, CI |
+| `risk:low` | `#dcfce7` | Documentation, fixtures, generated references, and mechanical metadata with no production, compatibility, build, release, or governance effect |
+| `risk:medium` | `#fef9c3` | Ordinary behavioral production work, including most runtime, gateway, provider, channel, tool, config, application, and CI changes |
+| `risk:high` | `#fee2e2` | Concrete trust, credential, compatibility, governance, or release-authority boundary requiring deep review and defaulting to two independent Core Team approvals; see the [expedited second-review lane](../maintainers/pr-workflow.md#expedited-second-review-lane) |
 
 ### `status:` Where is this in the process?
 
@@ -661,7 +742,7 @@ This table records governance intent and historical taxonomy shape. For current 
 | `status:accepted` | `#0e8a16` Green | RFC or work item ratified; not stale-exempt by itself |
 | `status:blocked` | `#b60205` Red | Waiting on a recorded unresolved external dependency, maintainer decision, or linked prerequisite |
 | `status:in-progress` | `#0075ca` Blue | Open PR is actively targeting the issue; verify live PR state during stale passes |
-| `status:stale` | `#e4e669` Yellow | No original-author activity for the stale threshold window |
+| `status:stale` | `#e4e669` Yellow | Issue is in the response window defined by the [maintainer label guide](../maintainers/labels.md#issue-stale-policy) |
 | `status:no-stale` | `#0e8a16` Green | Explicit stale exemption for accepted or otherwise long-lived work; target policy requires a recorded reason and visible routing evidence in the operational source |
 | `status:help-wanted` | `#059669` Green | Looking for a contributor |
 | `status:good-first-issue` | `#059669` Green | Suitable for new contributors |
@@ -673,7 +754,7 @@ Terminal closure labels are operational policy, not part of the historical `stat
 
 ### `rfc:` RFC-specific status
 
-`rfc:accepted` · `rfc:rejected` · `rfc:revision-requested`
+Retired in Rev. 15 and never created as live labels. RFC state uses the live `type:rfc` and `status:accepted` labels; see §8.1.
 
 ---
 
@@ -705,7 +786,7 @@ An item is **Done** when all of the following are true:
 
 - [ ] All items in the milestone are in `Done` status or explicitly moved to the next milestone with a comment explaining why
 - [ ] The CHANGELOG.md entry for the release is complete
-- [ ] All ADRs spawned by accepted RFCs in this milestone are written and accepted
+- [ ] Every accepted RFC in this milestone has a recorded durable disposition; required ADRs and standing-document updates are merged, and remaining delivery trackers are linked
 - [ ] The release has been tested on at least one platform (Linux x86_64 at minimum)
 - [ ] The release tag follows Semantic Versioning
 
@@ -735,19 +816,19 @@ Configure these in the Project's built-in automation settings:
 
 **Auto-label by changed files:**
 
-The active path labeler applies scope labels to PRs based on changed files. Risk and size labels are currently maintainer-applied; the maintainer label guide is the live source for label names, automation status, and risk semantics.
+The active path labeler applies scope labels to PRs based on changed files, and the active size labeler recalculates canonical `size:*` labels from PR file metadata. Risk labels remain maintainer-applied; the maintainer label guide is the live source for label names, automation status, and risk semantics.
 
 **Auto-request CODEOWNERS review (built into CODEOWNERS: no Action needed):**
 
 GitHub enforces CODEOWNERS automatically when the file exists and branch protection requires it. No Action required.
 
-**Stale issue management (`.github/workflows/stale.yml`):**
+**Stale issue management (maintainer-run):**
 
-Issues with no activity for 45 days are labeled `status:stale` and a comment is posted asking if the issue is still relevant. Issues with no activity for 15 days after the stale label is applied are closed. This prevents the backlog from accumulating hundreds of issues that are months old and no longer relevant. Exclude `priority:p0`, `type:rfc`, issues with open linked PRs, and issues with `status:blocked` while a recorded blocker remains unresolved. The intended `status:no-stale` follow-up is to exclude it only while the operational source records both the stale-exemption reason and contributor-visible routing evidence. The maintainer label guide and issue-triage protocol carry the current operational details.
+No GitHub Actions stale workflow is currently configured in the repository. Maintainers run stale passes to prevent inactive issues from accumulating while preserving a defined response window for the affected community. The [issue stale policy](../maintainers/labels.md#issue-stale-policy) is the sole operational source for timing, qualifying activity, exclusions, and re-engagement; the issue-triage protocol carries only the execution mechanics.
 
-**PR size labeling (future/optional):**
+**PR size labeling (active):**
 
-If size automation is added later, it should follow the maintainer label guide's live names (`size:XS` through `size:XL`) and recalculate on pushed updates so the label describes the diff under review. Until then, size labels are maintainer-applied.
+The size labeler follows the maintainer label guide's live names (`size:XS` through `size:XL`) and recalculates on PR open, reopen, and pushed updates so the label describes the diff under review. It reads GitHub PR metadata and executes only the trusted classifier from the workflow revision; it does not check out or execute pull-request code.
 
 **Milestone check on PR merge (`.github/workflows/milestone-check.yml`):**
 
@@ -793,11 +874,10 @@ Establish the full workflow and populate the backlog from the accepted RFCs.
 - [ ] Populate the Backlog with deliverables from the microkernel architecture RFC
 - [ ] Populate the Backlog with deliverables from the documentation standards RFC
 - [ ] Conduct the first formal RFC votes on the three existing proposals
-- [ ] Write ADRs for accepted RFCs (ADR-001 through ADR-007 per the docs RFC)
-- [ ] Add the `CONTRIBUTORS.md` file with current team members in their tiers
+- [ ] Complete the selected foundational ADR set (ADR-001 through ADR-007 per the docs RFC)
 - [ ] Implement the auto-label by path Actions workflow
 - [ ] Implement the stale issue management workflow
-- [ ] Create the `zeroclaw-core` and `zeroclaw-contributors` GitHub Teams
+- [x] Create the Core Team GitHub team, shipped as a single `core-contributors` team rather than the two originally planned. The `CONTRIBUTORS.md` roster item that sat alongside it is retired; see §5.3.
 
 **Success signal:** The team is using the board daily. Items move through stages with visible gate checks. The RFC for the microkernel architecture has a recorded vote outcome.
 
@@ -807,7 +887,7 @@ Establish the full workflow and populate the backlog from the accepted RFCs.
 
 As the plugin system becomes usable, external contributors will start arriving. The contribution infrastructure must be ready.
 
-- [ ] Implement the PR size labeling workflow
+- [x] Implement the PR size labeling workflow
 - [ ] Create the first batch of `good first issue` items (minimum 5) for the plugin SDK work
 - [ ] Add the `Good First Issue Index` as a pinned issue with links to current good first issues
 - [ ] Establish the idea promotion threshold and promote the first Discussion idea to an issue

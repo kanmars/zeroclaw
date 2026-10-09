@@ -1,5 +1,4 @@
 //! Config Schema Boundary Tests
-//!
 //! Validates: config defaults, backward compatibility, invalid input rejection,
 //! and gateway/security/agent config boundary conditions.
 
@@ -14,9 +13,6 @@ fn migrate(toml_str: &str) -> Config {
 // Invalid value fail-fast
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Regression test for #5414, #5320, #5483, #5507: Option<T> fields
-/// (api_key) and serde aliases (model_provider) must not be flagged as
-/// unknown config keys.
 #[test]
 fn config_valid_keys_not_flagged_as_unknown() {
     // api_key: Option<T> defaulting to None — TOML omits it.
@@ -193,6 +189,7 @@ fn gateway_config_toml_roundtrip() {
         host: "0.0.0.0".into(),
         require_pairing: false,
         pair_rate_limit_per_minute: 5,
+        webhook_secret: Some("synthetic-gateway-secret".into()),
         path_prefix: Some("/zeroclaw".into()),
         ..Default::default()
     };
@@ -204,6 +201,10 @@ fn gateway_config_toml_roundtrip() {
     assert_eq!(parsed.host, "0.0.0.0");
     assert!(!parsed.require_pairing);
     assert_eq!(parsed.pair_rate_limit_per_minute, 5);
+    assert_eq!(
+        parsed.webhook_secret.as_deref(),
+        Some("synthetic-gateway-secret")
+    );
     assert_eq!(parsed.path_prefix.as_deref(), Some("/zeroclaw"));
 }
 
@@ -328,7 +329,11 @@ fn gateway_path_prefix_accepts_none() {
 #[test]
 fn security_config_defaults() {
     let sec = SecurityConfig::default();
-    assert!(sec.audit.enabled, "audit should be enabled by default");
+    assert!(
+        sec.audit.enabled,
+        "audit should default to enabled: it carries the certificate issuance \
+         and renewal trail, which a default of false would silently drop"
+    );
     // V3: sandbox/resource limits live on risk_profiles entries, not SecurityConfig.
     let profile = RiskProfileConfig::default();
     assert!(
@@ -580,12 +585,12 @@ allowed_users = ["@user:example.com"]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Issue #3456 – top-level [cli] section must not clash with channels.cli
+// – top-level [cli] section must not clash with channels.cli
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn config_toplevel_cli_section_with_whatsapp_parses() {
-    // Exact config from issue #3456
+    // Exact config from
     let toml_str = r#"
 [cli]
 

@@ -45,6 +45,12 @@ impl SuiteReport {
         self.cases.iter().all(CaseReport::passed)
     }
 
+    /// Process exit code for a completed run: 0 iff every case passed.
+    /// Kept as a pure function so the CLI gate is testable at its real boundary.
+    pub fn exit_code(&self) -> i32 {
+        if self.all_passed() { 0 } else { 1 }
+    }
+
     /// Render a human-readable table. Failing checks are listed beneath their case.
     pub fn render_table(&self) -> String {
         let mut s = String::new();
@@ -107,5 +113,142 @@ impl SuiteReport {
             "cases": cases,
         });
         serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grade(check: &str, passed: bool, detail: &str) -> GradeResult {
+        GradeResult {
+            check: check.to_string(),
+            passed,
+            detail: detail.to_string(),
+        }
+    }
+
+    fn case(name: &str, grades: Vec<GradeResult>, error: Option<&str>) -> CaseReport {
+        CaseReport {
+            name: name.to_string(),
+            source: "fixture.json".to_string(),
+            grades,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn case_passes_only_when_no_error_and_all_checks_pass() {
+        assert!(
+            case(
+                "a",
+                vec![grade("c1", true, ""), grade("c2", true, "")],
+                None
+            )
+            .passed()
+        );
+        // One failing check fails the case.
+        assert!(
+            !case(
+                "a",
+                vec![grade("c1", true, ""), grade("c2", false, "")],
+                None
+            )
+            .passed()
+        );
+        // A run error fails the case even when every check passed.
+        assert!(!case("a", vec![grade("c1", true, "")], Some("trace exhausted")).passed());
+        // No checks and no error passes vacuously.
+        assert!(case("a", vec![], None).passed());
+    }
+
+    #[test]
+    fn suite_counts_reflect_per_case_pass_fail() {
+        let suite = SuiteReport {
+            cases: vec![
+                case("ok", vec![grade("c", true, "")], None),
+                case("bad", vec![grade("c", false, "")], None),
+                case("err", vec![], Some("boom")),
+            ],
+        };
+        assert_eq!(suite.passed_count(), 1);
+        assert_eq!(suite.failed_count(), 2);
+        assert!(!suite.all_passed());
+    }
+
+    #[test]
+    fn exit_code_is_zero_when_all_cases_pass() {
+        let suite = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        assert!(suite.all_passed());
+        assert_eq!(suite.exit_code(), 0);
+    }
+
+    #[test]
+    fn exit_code_is_one_when_any_case_fails() {
+        let suite = SuiteReport {
+            cases: vec![
+                case("ok", vec![grade("c", true, "")], None),
+                case("bad", vec![grade("c", false, "")], None),
+            ],
+        };
+        assert!(!suite.all_passed());
+        assert_eq!(suite.exit_code(), 1);
+    }
+
+    #[test]
+    fn empty_suite_passes_vacuously() {
+        let suite = SuiteReport { cases: vec![] };
+        assert_eq!(suite.passed_count(), 0);
+        assert_eq!(suite.failed_count(), 0);
+        assert!(suite.all_passed());
+    }
+
+    #[test]
+    fn render_table_marks_failures_and_lists_failing_checks() {
+        let suite = SuiteReport {
+            cases: vec![
+                case("ok", vec![grade("c", true, "")], None),
+                case(
+                    "bad",
+                    vec![grade("response_contains", false, "not found")],
+                    None,
+                ),
+            ],
+        };
+        let table = suite.render_table();
+        assert!(table.contains("✓ ok"));
+        assert!(table.contains("✗ bad"));
+        assert!(table.contains("response_contains: not found"));
+        assert!(table.contains("1/2 cases passed"));
+        assert!(table.contains("(1 failed)"));
+    }
+
+    #[test]
+    fn render_table_reports_run_errors() {
+        let suite = SuiteReport {
+            cases: vec![case("err", vec![], Some("trace exhausted"))],
+        };
+        let table = suite.render_table();
+        assert!(table.contains("run error: trace exhausted"));
+    }
+
+    #[test]
+    fn to_json_serializes_aggregate_and_cases() {
+        let suite = SuiteReport {
+            cases: vec![
+                case("ok", vec![grade("c", true, "")], None),
+                case("bad", vec![grade("c", false, "")], None),
+            ],
+        };
+        let json: serde_json::Value = serde_json::from_str(&suite.to_json()).unwrap();
+        assert_eq!(json["passed"].as_u64(), Some(1));
+        assert_eq!(json["failed"].as_u64(), Some(1));
+        assert_eq!(json["total"].as_u64(), Some(2));
+        assert_eq!(json["all_passed"].as_bool(), Some(false));
+        assert_eq!(json["cases"].as_array().unwrap().len(), 2);
+        assert_eq!(json["cases"][0]["name"].as_str(), Some("ok"));
+        assert_eq!(json["cases"][0]["passed"].as_bool(), Some(true));
     }
 }

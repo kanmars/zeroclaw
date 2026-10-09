@@ -1,13 +1,8 @@
 //! Conflict resolution for memory entries.
-//!
-//! Before storing Core memories, performs a semantic similarity check against
-//! existing entries. If cosine similarity exceeds a threshold but content
-//! differs, the old entry is marked as superseded.
 
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 
 /// Check for conflicting memories and mark old ones as superseded.
-///
 /// Returns the list of entry IDs that were superseded.
 pub async fn check_and_resolve_conflicts(
     memory: &dyn Memory,
@@ -64,7 +59,6 @@ pub fn mark_superseded(
 }
 
 /// Simple text-based conflict detection without embeddings.
-///
 /// Uses token overlap (Jaccard similarity) as a fast approximation
 /// when vector embeddings are unavailable.
 pub fn jaccard_similarity(a: &str, b: &str) -> f64 {
@@ -141,6 +135,7 @@ mod tests {
     fn find_text_conflicts_filters_correctly() {
         let entries = vec![
             MemoryEntry {
+                principal_id: None,
                 id: "1".into(),
                 key: "pref".into(),
                 content: "User prefers Rust for systems work".into(),
@@ -151,10 +146,14 @@ mod tests {
                 namespace: "default".into(),
                 importance: Some(0.7),
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: None,
                 agent_id: None,
             },
             MemoryEntry {
+                principal_id: None,
                 id: "2".into(),
                 key: "daily1".into(),
                 content: "User prefers Rust for systems work".into(),
@@ -165,6 +164,9 @@ mod tests {
                 namespace: "default".into(),
                 importance: Some(0.3),
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: None,
                 agent_id: None,
             },
@@ -187,6 +189,7 @@ mod tests {
     #[test]
     fn find_text_conflicts_skips_superseded_and_identical() {
         let entry = |id: &str, content: &str, superseded: Option<String>| MemoryEntry {
+            principal_id: None,
             id: id.into(),
             key: "k".into(),
             content: content.into(),
@@ -197,6 +200,9 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: superseded,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         };

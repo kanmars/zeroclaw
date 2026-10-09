@@ -16,12 +16,6 @@ use zeroclaw_api::channel::{
 
 const GROUP_TARGET_PREFIX: &str = "group:";
 
-/// How many recent inbound messages we remember for the purpose of
-/// addressing outbound reactions back at them. signal-cli's `sendReaction`
-/// is keyed on `(targetAuthor, targetTimestamp)`, but we don't want those
-/// values to leak into the generic `ChannelMessage.id` (which flows into
-/// logs, memory keys, thread roots, and tool args). Instead we mint an
-/// opaque id and remember the mapping channel-locally.
 const RECENT_TARGETS_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,11 +32,6 @@ struct ReactionTarget {
     timestamp_ms: u64,
 }
 
-/// Signal channel using signal-cli daemon's native JSON-RPC + SSE API.
-///
-/// Connects to a running `signal-cli daemon --http <host:port>`.
-/// Listens via SSE at `/api/v1/events` and sends via JSON-RPC at
-/// `/api/v1/rpc`.
 #[derive(Clone)]
 pub struct SignalChannel {
     http_url: String,
@@ -61,7 +50,7 @@ pub struct SignalChannel {
     ignore_stories: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
-    pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
+    pending_approvals: Arc<Mutex<HashMap<String, crate::util::PendingApproval>>>,
     /// Seconds to wait for an operator reply to a `request_approval` prompt
     /// before treating the silence as a deny. Default 300.
     approval_timeout_secs: u64,
@@ -86,6 +75,8 @@ struct Envelope {
     source: Option<String>,
     #[serde(rename = "sourceNumber", default)]
     source_number: Option<String>,
+    #[serde(rename = "sourceUuid", default)]
+    source_uuid: Option<String>,
     #[serde(rename = "dataMessage", default)]
     data_message: Option<DataMessage>,
     #[serde(rename = "storyMessage", default)]
@@ -104,12 +95,45 @@ struct DataMessage {
     group_info: Option<GroupInfo>,
     #[serde(default)]
     attachments: Option<Vec<serde_json::Value>>,
+    /// Poll-vote payload. Some signal-cli builds surface poll responses
+    /// as `pollAnswer` on the inbound dataMessage; without this field
+    /// the deserializer silently dropped the data and consumers never
+    /// learned the user voted.
+    #[serde(rename = "pollAnswer", default)]
+    poll_answer: Option<PollAnswer>,
+    /// Native signal-cli daemon 0.14.x emits poll responses as `pollVote`.
+    #[serde(rename = "pollVote", default)]
+    poll_vote: Option<PollAnswer>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GroupInfo {
     #[serde(rename = "groupId", default)]
     group_id: Option<String>,
+}
+
+/// Inbound poll-vote payload.
+///
+/// Real signal-cli `pollVote` payloads carry selected option indexes.
+/// We also accept older/alternate `pollAnswer` title fields when present,
+/// but callers should treat the index path as the reliable Signal shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PollAnswer {
+    /// Server-assigned poll id this answer is for, when the upstream
+    /// payload supplies one. Real `pollVote` payloads usually omit it.
+    #[serde(rename = "pollId", default)]
+    pub poll_id: Option<u64>,
+    /// 0-based indices of the options the user selected. Single-choice
+    /// polls (the common case for agent prompts) yield a 1-element
+    /// vec; multi-select would yield more.
+    #[serde(rename = "selectedIndices", alias = "optionIndexes", default)]
+    pub selected_indices: Vec<u32>,
+    /// Display titles of the selected options, if an older/alternate
+    /// payload supplies them. Real `pollVote` payloads normally omit
+    /// titles; consumers should resolve `selected_indices` against the
+    /// original poll's option list.
+    #[serde(rename = "selectedTitles", default)]
+    pub selected_titles: Vec<String>,
 }
 
 impl SignalChannel {
@@ -170,12 +194,20 @@ impl SignalChannel {
         builder.build().expect("Signal HTTP client should build")
     }
 
-    /// Effective sender: prefer `sourceNumber` (E.164), fall back to `source`.
+    /// Effective sender: prefer `sourceNumber` (E.164), then `source`, then `sourceUuid`.
     fn sender(envelope: &Envelope) -> Option<String> {
         envelope
             .source_number
             .as_deref()
-            .or(envelope.source.as_deref())
+            .filter(|sender| !sender.is_empty())
+            .or(envelope
+                .source
+                .as_deref()
+                .filter(|sender| !sender.is_empty()))
+            .or(envelope
+                .source_uuid
+                .as_deref()
+                .filter(|sender| !sender.is_empty()))
             .map(String::from)
     }
 
@@ -209,15 +241,31 @@ impl SignalChannel {
         }
     }
 
-    /// Build the JSON-RPC params for signal-cli's `sendReaction` method.
-    ///
-    /// `targetAuthor` and `targetTimestamp` are recovered from
-    /// `recent_targets` rather than parsed out of `message_id`, so the
-    /// generic id stays opaque and the Signal sender never leaks into
-    /// the surfaces that consume `ChannelMessage.id`.
-    ///
-    /// Extracted from `add_reaction` / `remove_reaction` so the wire
-    /// shape is unit-testable without a live daemon.
+    fn canonical_destination(recipient: &str) -> String {
+        match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(value) => value,
+            RecipientTarget::Group(value) => format!("{GROUP_TARGET_PREFIX}{value}"),
+        }
+    }
+
+    async fn resolve_approval_reply(
+        &self,
+        message: &ChannelMessage,
+    ) -> Option<crate::util::PendingApprovalResolution> {
+        let (token, response) = crate::util::parse_approval_reply(&message.content)?;
+        let destination = Self::canonical_destination(&message.reply_target);
+        Some(
+            crate::util::resolve_pending_approval(
+                &self.pending_approvals,
+                &token,
+                response,
+                self.is_sender_allowed(&message.sender),
+                &destination,
+            )
+            .await,
+        )
+    }
+
     fn build_reaction_params(
         &self,
         channel_id: &str,
@@ -253,12 +301,38 @@ impl SignalChannel {
         Ok(params)
     }
 
-    /// Check whether the message passes the group/DM filter.
+    /// Build the JSON-RPC params for signal-cli's native `sendPollCreate`
+    /// method.
     ///
-    /// - `dm_only = true`: only DMs accepted; all group messages rejected.
-    /// - `dm_only = false`, `group_ids` empty: accept all (DMs and any group).
-    /// - `dm_only = false`, `group_ids` non-empty: accept DMs and listed
-    ///   groups only.
+    /// Signal poll answers correlate by option index in real `pollVote`
+    /// payloads. Callback ids are intentionally not represented in this wire
+    /// shape; `Channel::send_choice` documents that callers needing stable
+    /// callback ids must maintain that mapping above the channel layer.
+    fn build_poll_params(
+        &self,
+        recipient: &str,
+        question: &str,
+        options: &[String],
+        multiple_choice: bool,
+    ) -> serde_json::Value {
+        match Self::parse_recipient_target(recipient) {
+            RecipientTarget::Direct(number) => serde_json::json!({
+                "recipient": [number],
+                "account": &self.account,
+                "question": question,
+                "option": options,
+                "no-multi": !multiple_choice,
+            }),
+            RecipientTarget::Group(group_id) => serde_json::json!({
+                "group-id": group_id,
+                "account": &self.account,
+                "question": question,
+                "option": options,
+                "no-multi": !multiple_choice,
+            }),
+        }
+    }
+
     fn matches_group(&self, data_msg: &DataMessage) -> bool {
         let incoming_group = data_msg
             .group_info
@@ -340,32 +414,61 @@ impl SignalChannel {
         Ok(parsed.get("result").cloned())
     }
 
-    /// Process a single SSE envelope, returning a ChannelMessage if valid.
-    fn process_envelope(&self, envelope: &Envelope) -> Option<ChannelMessage> {
+    /// Process a single SSE envelope, returning one or more
+    /// `ChannelMessage`s. Most envelopes produce 0 or 1 messages; a
+    /// multi-select poll vote produces N (one per selected option).
+    ///
+    /// Inbound shape may be plain text (`dataMessage.message`) OR a
+    /// poll-vote (`dataMessage.pollAnswer` or `dataMessage.pollVote`). For
+    /// poll-votes we emit a synthetic message per selected option whose `content` is a
+    /// documented sentinel: `"[choice-index]N"` for real signal-cli
+    /// `pollVote` payloads, or `"[choice]<selected-title>"` when an
+    /// alternate payload supplies titles. Consumers
+    /// can match this prefix to correlate the vote with their original
+    /// option set, or ignore it if they don't handle poll votes.
+    ///
+    /// Single-select polls (`multiple_choice = false`) emit at most one
+    /// message; multi-select polls emit one per selected option, each
+    /// resolvable independently. Callers that conflate the two should
+    /// treat any vec from this method as "the user's reply set" and
+    /// dispatch each entry through their normal inbound pipeline.
+    fn process_envelope(&self, envelope: &Envelope) -> Vec<ChannelMessage> {
         // Skip story messages when configured
         if self.ignore_stories && envelope.story_message.is_some() {
-            return None;
+            return Vec::new();
         }
 
-        let data_msg = envelope.data_message.as_ref()?;
+        let Some(data_msg) = envelope.data_message.as_ref() else {
+            return Vec::new();
+        };
 
         // Skip attachment-only messages when configured
         if self.ignore_attachments {
             let has_attachments = data_msg.attachments.as_ref().is_some_and(|a| !a.is_empty());
-            if has_attachments && data_msg.message.is_none() {
-                return None;
+            if has_attachments
+                && data_msg.message.is_none()
+                && data_msg.poll_answer.is_none()
+                && data_msg.poll_vote.is_none()
+            {
+                return Vec::new();
             }
         }
 
-        let text = data_msg.message.as_deref().filter(|t| !t.is_empty())?;
-        let sender = Self::sender(envelope)?;
+        let Some(sender) = Self::sender(envelope) else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "dropping Signal envelope without a resolvable sender identity"
+            );
+            return Vec::new();
+        };
 
         if !self.is_sender_allowed(&sender) {
-            return None;
+            return Vec::new();
         }
 
         if !self.matches_group(data_msg) {
-            return None;
+            return Vec::new();
         }
 
         let target = self.reply_target(data_msg, &sender);
@@ -383,35 +486,71 @@ impl SignalChannel {
                 .unwrap_or(u64::MAX)
             });
 
-        // Opaque id: timestamp is convenient for debugging, the random
-        // suffix disambiguates two senders that happen to post at the same
-        // millisecond in a group. Crucially, neither component reveals the
-        // sender — that lives only in the channel-local `recent_targets`
-        // map and the `sender` field on `ChannelMessage`.
-        let id = format!("sig_{timestamp}_{}", Self::random_id_suffix());
-        self.recent_targets.lock().put(
-            id.clone(),
-            ReactionTarget {
-                author: sender.clone(),
-                timestamp_ms: timestamp,
-            },
-        );
+        // Build the list of synthetic content strings. For poll votes,
+        // emit one entry per selected title (or per selected index when
+        // titles are absent). For text messages, emit one entry with
+        // the raw body.
+        let contents: Vec<String> = if let Some(pa) = data_msg
+            .poll_answer
+            .as_ref()
+            .or(data_msg.poll_vote.as_ref())
+        {
+            if !pa.selected_titles.is_empty() {
+                pa.selected_titles
+                    .iter()
+                    .map(|t| format!("[choice]{t}"))
+                    .collect()
+            } else if !pa.selected_indices.is_empty() {
+                pa.selected_indices
+                    .iter()
+                    .map(|i| format!("[choice-index]{}", i + 1))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            data_msg
+                .message
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(|t| vec![t.to_string()])
+                .unwrap_or_default()
+        };
+        contents
+            .into_iter()
+            .enumerate()
+            .map(|(idx, content)| {
+                // Opaque id: timestamp is convenient for debugging, the random
+                // suffix disambiguates senders and multi-select poll entries
+                // without revealing the sender. The sender stays only in the
+                // channel-local `recent_targets` map and on `ChannelMessage`.
+                let id = format!("sig_{timestamp}_{}_{}", idx, Self::random_id_suffix());
+                self.recent_targets.lock().put(
+                    id.clone(),
+                    ReactionTarget {
+                        author: sender.clone(),
+                        timestamp_ms: timestamp,
+                    },
+                );
 
-        Some(ChannelMessage {
-            id,
-            sender: sender.clone(),
-            reply_target: target,
-            content: text.to_string(),
-            channel: "signal".to_string(),
-            channel_alias: Some(self.alias.clone()),
-            timestamp: timestamp / 1000, // millis → secs
-            thread_ts: None,
-            interruption_scope_id: None,
-            attachments: vec![],
-            subject: None,
-        })
+                ChannelMessage {
+                    id,
+                    sender: sender.clone(),
+                    reply_target: target.clone(),
+                    content,
+                    channel: "signal".to_string(),
+                    channel_alias: Some(self.alias.clone()),
+                    timestamp: timestamp / 1000, // millis -> secs
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: vec![],
+                    subject: None,
+
+                    ..Default::default()
+                }
+            })
+            .collect()
     }
-
     fn random_id_suffix() -> String {
         use rand::RngExt;
         const CHARSET: &[u8] = b"0123456789abcdef";
@@ -419,6 +558,37 @@ impl SignalChannel {
         (0..6)
             .map(|_| CHARSET[rng.random_range(0..CHARSET.len())] as char)
             .collect()
+    }
+
+    /// Send a multiple-choice poll to `recipient` (E.164 number, UUID,
+    /// or `group:<id>`).
+    ///
+    /// Sent via signal-cli daemon's JSON-RPC `sendPollCreate` method. The
+    /// poll renders as native UI in modern Signal clients and emits a
+    /// poll-vote event (`pollAnswer` or `pollVote`, depending on signal-cli
+    /// version) back through the SSE stream when the user votes — see
+    /// `process_envelope` for how that flows back to consumers, normally as
+    /// a synthetic `[choice-index]N` `ChannelMessage`.
+    ///
+    /// `multiple_choice = false` → single-select poll (the common case
+    /// for "pick one of N" agent prompts). Pass `true` to allow
+    /// multi-select.
+    pub async fn send_poll(
+        &self,
+        recipient: &str,
+        question: &str,
+        options: &[String],
+        multiple_choice: bool,
+    ) -> anyhow::Result<()> {
+        if options.len() < 2 {
+            anyhow::bail!(
+                "Signal poll requires at least 2 options (got {}); render as text instead",
+                options.len()
+            );
+        }
+        let params = self.build_poll_params(recipient, question, options, multiple_choice);
+        self.rpc_request("sendPollCreate", params).await?;
+        Ok(())
     }
 }
 
@@ -437,6 +607,24 @@ impl Channel for SignalChannel {
         "signal"
     }
 
+    /// A Signal 1:1 DM carries the bare sender (E.164 / UUID) as its
+    /// `reply_target`, whereas a group message carries `group:<id>`
+    /// (`GROUP_TARGET_PREFIX`). Reusing `parse_recipient_target` — the same
+    /// classifier `send`/`reply_target` rely on — a `Direct` target is a DM.
+    ///
+    /// Without this override Signal fell back to the trait default (`false`),
+    /// so every DM was treated as non-direct and ran through the reply-intent
+    /// precheck; plain 1:1 messages (e.g. a greeting) could be classified
+    /// `NO_REPLY` and silently dropped. Reporting DMs as direct lets the
+    /// orchestrator skip the classifier and always answer them, while group
+    /// traffic still goes through the precheck.
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        matches!(
+            Self::parse_recipient_target(&msg.reply_target),
+            RecipientTarget::Direct(_)
+        )
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let params = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
@@ -453,6 +641,55 @@ impl Channel for SignalChannel {
 
         self.rpc_request("send", params).await?;
         Ok(())
+    }
+
+    async fn send_choice(
+        &self,
+        recipient: &str,
+        prompt: &str,
+        options: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        // Signal supports native polls via signal-cli JSON-RPC
+        // sendPollCreate. Single-select (`no-multi=true`) is the right default
+        // for "pick one of N" prompts; consumers needing multi-select
+        // should call SignalChannel::send_poll directly.
+        //
+        // Empty options → no-op (send only the prompt if any) so we
+        // don't ship a useless "(reply with name or number)" header
+        // with nothing under it. See Channel::send_choice docs.
+        let trimmed_prompt = prompt.trim();
+        if options.is_empty() {
+            if trimmed_prompt.is_empty() {
+                return Ok(());
+            }
+            return self
+                .send(&SendMessage::new(trimmed_prompt, recipient))
+                .await;
+        }
+
+        // Polls require ≥2 options per Signal protocol; for exactly
+        // 1 option, fall back to text — a 1-option poll is a UX
+        // anti-pattern. The callback ids passed in here are dropped
+        // on the wire because real Signal poll votes correlate by
+        // option index. Per the trait's docs, callers needing stable
+        // callback ids should maintain a side map keyed by poll option
+        // index.
+        if options.len() >= 2 {
+            let labels: Vec<String> = options.iter().map(|(_, l)| l.clone()).collect();
+            return self.send_poll(recipient, prompt, &labels, false).await;
+        }
+        // Single-option text fallback.
+        let mut text = String::new();
+        if !trimmed_prompt.is_empty() {
+            text.push_str(trimmed_prompt);
+            text.push_str("\n\n");
+        }
+        text.push_str("(reply with name or number)\n");
+        for (idx, (_id, label)) in options.iter().enumerate() {
+            text.push_str(&format!("{}. {}\n", idx + 1, label.trim()));
+        }
+        let trimmed = text.trim_end().to_string();
+        self.send(&SendMessage::new(trimmed, recipient)).await
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
@@ -563,21 +800,27 @@ impl Channel for SignalChannel {
                         if !current_data.is_empty() {
                             match serde_json::from_str::<SseEnvelope>(&current_data) {
                                 Ok(sse) => {
-                                    if let Some(ref envelope) = sse.envelope
-                                        && let Some(msg) = self.process_envelope(envelope)
-                                    {
-                                        if let Some((token, response)) =
-                                            crate::util::parse_approval_reply(&msg.content)
-                                        {
-                                            let mut map = self.pending_approvals.lock().await;
-                                            if let Some(sender) = map.remove(&token) {
-                                                let _ = sender.send(response);
-                                                current_data.clear();
+                                    if let Some(ref envelope) = sse.envelope {
+                                        let mut consumed_as_approval = false;
+                                        let messages = self.process_envelope(envelope);
+                                        for msg in messages {
+                                            if let Some(resolution) =
+                                                self.resolve_approval_reply(&msg).await
+                                                && !matches!(
+                                                    resolution,
+                                                    crate::util::PendingApprovalResolution::NotFound
+                                                )
+                                            {
+                                                consumed_as_approval = true;
                                                 continue;
                                             }
+                                            if tx.send(msg).await.is_err() {
+                                                return Ok(());
+                                            }
                                         }
-                                        if tx.send(msg).await.is_err() {
-                                            return Ok(());
+                                        if consumed_as_approval {
+                                            current_data.clear();
+                                            continue;
                                         }
                                     }
                                 }
@@ -610,19 +853,18 @@ impl Channel for SignalChannel {
             if !current_data.is_empty() {
                 match serde_json::from_str::<SseEnvelope>(&current_data) {
                     Ok(sse) => {
-                        if let Some(ref envelope) = sse.envelope
-                            && let Some(msg) = self.process_envelope(envelope)
-                        {
-                            if let Some((token, response)) =
-                                crate::util::parse_approval_reply(&msg.content)
-                            {
-                                let mut map = self.pending_approvals.lock().await;
-                                if let Some(sender) = map.remove(&token) {
-                                    let _ = sender.send(response);
+                        if let Some(ref envelope) = sse.envelope {
+                            for msg in self.process_envelope(envelope) {
+                                if let Some(resolution) = self.resolve_approval_reply(&msg).await
+                                    && !matches!(
+                                        resolution,
+                                        crate::util::PendingApprovalResolution::NotFound
+                                    )
+                                {
                                     continue;
                                 }
+                                let _ = tx.send(msg).await;
                             }
-                            let _ = tx.send(msg).await;
                         }
                     }
                     Err(e) => {
@@ -705,37 +947,75 @@ impl Channel for SignalChannel {
         Ok(())
     }
 
+    /// Delegates to [`Self::request_approval_attributed`] and drops the
+    /// provenance, so the prompt/timeout logic lives in exactly one place.
     async fn request_approval(
         &self,
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|attributed| attributed.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
         let token = crate::util::new_approval_token();
-        let text = format!(
-            "APPROVAL REQUIRED [{}]\nTool: {}\nArgs: {}\n\nReply: \"{} yes\", \"{} no\", or \"{} always\"",
-            token, request.tool_name, request.arguments_summary, token, token, token,
+        let text = crate::util::build_yesno_approval_prompt(
+            &token,
+            &request.tool_name,
+            &request.arguments_summary,
+            request.position_counter(),
         );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(token.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            token.clone(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: Self::canonical_destination(recipient),
+                tool_name: request.tool_name.clone(),
+            },
+        );
+        let mut guard = crate::util::PendingApprovalGuard::new(
+            Arc::clone(&self.pending_approvals),
+            token.clone(),
+        );
 
         if let Err(err) = self.send(&SendMessage::new(text, recipient)).await {
-            self.pending_approvals.lock().await.remove(&token);
+            guard.remove().await;
             return Err(err);
         }
 
-        let response =
+        // Only a real token-echo reply is an operator decision; the
+        // dropped-sender and timeout arms are the runtime denying on its own.
+        let attributed =
             match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
-                Ok(Ok(resp)) => resp,
-                _ => {
-                    self.pending_approvals.lock().await.remove(&token);
-                    ChannelApprovalResponse::Deny
+                Ok(Ok(resp)) => {
+                    guard.disarm();
+                    zeroclaw_api::channel::AttributedApprovalResponse::operator(resp)
+                }
+                Ok(Err(_)) => {
+                    guard.remove().await;
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::Unreachable,
+                    )
+                }
+                Err(_) => {
+                    guard.remove().await;
+                    zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(
+                        ChannelApprovalResponse::Deny,
+                        zeroclaw_api::channel::ApprovalSource::TimedOut,
+                    )
                 }
             };
-        Ok(Some(response))
+        Ok(Some(attributed))
     }
 }
 
@@ -747,15 +1027,31 @@ mod tests {
         Envelope {
             source: source_number.map(String::from),
             source_number: source_number.map(String::from),
+            source_uuid: None,
             data_message: message.map(|m| DataMessage {
                 message: Some(m.to_string()),
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: None,
+                poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         }
+    }
+
+    fn make_channel() -> SignalChannel {
+        SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["+1111111111".into()]),
+            false,
+            false,
+        )
     }
 
     #[test]
@@ -910,6 +1206,8 @@ mod tests {
             timestamp: Some(1000),
             group_info: None,
             attachments: None,
+            poll_answer: None,
+            poll_vote: None,
         };
         assert!(ch.matches_group(&dm));
 
@@ -920,6 +1218,8 @@ mod tests {
                 group_id: Some("group123".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
+            poll_vote: None,
         };
         assert!(ch.matches_group(&group));
     }
@@ -946,6 +1246,8 @@ mod tests {
                 group_id: Some("group123".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
+            poll_vote: None,
         };
         assert!(ch.matches_group(&matching));
 
@@ -956,6 +1258,8 @@ mod tests {
                 group_id: Some("other_group".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
+            poll_vote: None,
         };
         assert!(!ch.matches_group(&non_matching));
     }
@@ -980,6 +1284,8 @@ mod tests {
             timestamp: Some(1000),
             group_info: None,
             attachments: None,
+            poll_answer: None,
+            poll_vote: None,
         };
         assert!(ch.matches_group(&dm));
 
@@ -990,6 +1296,8 @@ mod tests {
                 group_id: Some("group123".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
+            poll_vote: None,
         };
         assert!(!ch.matches_group(&group));
     }
@@ -1014,6 +1322,8 @@ mod tests {
             timestamp: Some(1000),
             group_info: None,
             attachments: None,
+            poll_answer: None,
+            poll_vote: None,
         };
         assert_eq!(ch.reply_target(&dm, "+1111111111"), "+1111111111");
     }
@@ -1040,8 +1350,39 @@ mod tests {
                 group_id: Some("group123".to_string()),
             }),
             attachments: None,
+            poll_answer: None,
+            poll_vote: None,
         };
         assert_eq!(ch.reply_target(&group, "+1111111111"), "group:group123");
+    }
+
+    #[test]
+    fn is_direct_message_true_for_dm_target_false_for_group() {
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+            false,
+        );
+        let e164_dm = ChannelMessage {
+            reply_target: "+1111111111".to_string(),
+            ..Default::default()
+        };
+        let uuid_dm = ChannelMessage {
+            reply_target: "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string(),
+            ..Default::default()
+        };
+        let group = ChannelMessage {
+            reply_target: "group:group123".to_string(),
+            ..Default::default()
+        };
+        assert!(ch.is_direct_message(&e164_dm));
+        assert!(ch.is_direct_message(&uuid_dm));
+        assert!(!ch.is_direct_message(&group));
     }
 
     #[test]
@@ -1057,6 +1398,22 @@ mod tests {
         assert_eq!(
             SignalChannel::parse_recipient_target("group:abc123"),
             RecipientTarget::Group("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn canonical_destination_normalizes_bare_and_prefixed_groups() {
+        assert_eq!(
+            SignalChannel::canonical_destination("abc123"),
+            "group:abc123"
+        );
+        assert_eq!(
+            SignalChannel::canonical_destination("group:abc123"),
+            "group:abc123"
+        );
+        assert_eq!(
+            SignalChannel::canonical_destination("+1234567890"),
+            "+1234567890"
         );
     }
 
@@ -1100,6 +1457,7 @@ mod tests {
         let env = Envelope {
             source: Some("uuid-123".to_string()),
             source_number: Some("+1111111111".to_string()),
+            source_uuid: Some("uuid-456".to_string()),
             data_message: None,
             story_message: None,
             timestamp: Some(1000),
@@ -1112,6 +1470,7 @@ mod tests {
         let env = Envelope {
             source: Some("uuid-123".to_string()),
             source_number: None,
+            source_uuid: Some("uuid-456".to_string()),
             data_message: None,
             story_message: None,
             timestamp: Some(1000),
@@ -1138,16 +1497,21 @@ mod tests {
         let env = Envelope {
             source: Some(uuid.to_string()),
             source_number: None,
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("Hello from privacy user".to_string()),
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: None,
+                poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
-        let msg = ch.process_envelope(&env).unwrap();
+        let mut msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
         assert_eq!(msg.sender, uuid);
         assert_eq!(msg.reply_target, uuid);
         assert_eq!(msg.content, "Hello from privacy user");
@@ -1191,6 +1555,7 @@ mod tests {
         let env = Envelope {
             source: Some(uuid.to_string()),
             source_number: None,
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("Group msg from privacy user".to_string()),
                 timestamp: Some(1_700_000_000_000),
@@ -1198,11 +1563,15 @@ mod tests {
                     group_id: Some("testgroup".to_string()),
                 }),
                 attachments: None,
+                poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
-        let msg = ch.process_envelope(&env).unwrap();
+        let mut msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
         assert_eq!(msg.sender, uuid);
         assert_eq!(msg.reply_target, "group:testgroup");
 
@@ -1212,15 +1581,75 @@ mod tests {
     }
 
     #[test]
-    fn sender_none_when_both_missing() {
-        let env = Envelope {
-            source: None,
-            source_number: None,
-            data_message: None,
-            story_message: None,
-            timestamp: None,
-        };
+    fn sender_falls_back_to_source_uuid() {
+        let env: Envelope = serde_json::from_str(
+            r#"{
+                "source": "",
+                "sourceNumber": "",
+                "sourceUuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            SignalChannel::sender(&env),
+            Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string())
+        );
+    }
+
+    #[test]
+    fn sender_none_when_all_sources_missing() {
+        let env: Envelope = serde_json::from_str(
+            r#"{
+                "source": "",
+                "sourceNumber": null,
+                "sourceUuid": "",
+                "dataMessage": {
+                    "message": "unattributed",
+                    "timestamp": 1700000000000
+                }
+            }"#,
+        )
+        .unwrap();
+
         assert_eq!(SignalChannel::sender(&env), None);
+        assert!(make_channel().process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_source_uuid_respects_allowlist() {
+        let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let raw = format!(
+            r#"{{
+                "source": null,
+                "sourceNumber": null,
+                "sourceUuid": "{uuid}",
+                "timestamp": 1700000000000,
+                "dataMessage": {{
+                    "message": "Hello from sourceUuid",
+                    "timestamp": 1700000000000
+                }}
+            }}"#
+        );
+        let env: Envelope = serde_json::from_str(&raw).unwrap();
+
+        let allowed = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            Vec::new(),
+            false,
+            "signal_test_alias",
+            Arc::new(move || vec![uuid.to_string()]),
+            false,
+            false,
+        );
+        let denied = make_channel();
+
+        let messages = allowed.process_envelope(&env);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].sender, uuid);
+        assert_eq!(messages[0].content, "Hello from sourceUuid");
+        assert!(denied.process_envelope(&env).is_empty());
     }
 
     #[test]
@@ -1239,7 +1668,9 @@ mod tests {
             ignore_stories,
         );
         let env = make_envelope(Some("+1111111111"), Some("Hello!"));
-        let msg = ch.process_envelope(&env).unwrap();
+        let mut msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
         assert_eq!(msg.content, "Hello!");
         assert_eq!(msg.sender, "+1111111111");
         assert_eq!(msg.channel, "signal");
@@ -1276,7 +1707,7 @@ mod tests {
             ignore_stories,
         );
         let env = make_envelope(Some("+9999999999"), Some("Hello!"));
-        assert!(ch.process_envelope(&env).is_none());
+        assert!(ch.process_envelope(&env).is_empty());
     }
 
     #[test]
@@ -1295,7 +1726,7 @@ mod tests {
             ignore_stories,
         );
         let env = make_envelope(Some("+1111111111"), Some(""));
-        assert!(ch.process_envelope(&env).is_none());
+        assert!(ch.process_envelope(&env).is_empty());
     }
 
     #[test]
@@ -1314,7 +1745,7 @@ mod tests {
             ignore_stories,
         );
         let env = make_envelope(Some("+1111111111"), None);
-        assert!(ch.process_envelope(&env).is_none());
+        assert!(ch.process_envelope(&env).is_empty());
     }
 
     #[test]
@@ -1334,7 +1765,7 @@ mod tests {
         );
         let mut env = make_envelope(Some("+1111111111"), Some("story text"));
         env.story_message = Some(serde_json::json!({}));
-        assert!(ch.process_envelope(&env).is_none());
+        assert!(ch.process_envelope(&env).is_empty());
     }
 
     #[test]
@@ -1355,16 +1786,19 @@ mod tests {
         let env = Envelope {
             source: Some("+1111111111".to_string()),
             source_number: Some("+1111111111".to_string()),
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: None,
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: Some(vec![serde_json::json!({"contentType": "image/png"})]),
+                poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
-        assert!(ch.process_envelope(&env).is_none());
+        assert!(ch.process_envelope(&env).is_empty());
     }
 
     #[test]
@@ -1385,6 +1819,7 @@ mod tests {
         let env = Envelope {
             source: Some("+1111111111".to_string()),
             source_number: Some("+1111111111".to_string()),
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("group hello".to_string()),
                 timestamp: Some(1_700_000_000_000),
@@ -1392,11 +1827,15 @@ mod tests {
                     group_id: Some("group_xyz".to_string()),
                 }),
                 attachments: None,
+                poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
-        let msg = ch.process_envelope(&env).unwrap();
+        let mut msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
         assert_eq!(msg.sender, "+1111111111");
         assert_eq!(msg.reply_target, "group:group_xyz");
         assert_eq!(msg.content, "group hello");
@@ -1437,6 +1876,7 @@ mod tests {
         let env = Envelope {
             source: Some("+1111111111".to_string()),
             source_number: Some("+1111111111".to_string()),
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("group hello".to_string()),
                 timestamp: Some(1_700_000_000_000),
@@ -1444,11 +1884,15 @@ mod tests {
                     group_id: Some("group_xyz".to_string()),
                 }),
                 attachments: None,
+                poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
-        let msg = ch.process_envelope(&env).unwrap();
+        let mut msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
         let target = ch
             .recent_targets
             .lock()
@@ -1567,13 +2011,88 @@ mod tests {
             ignore_stories,
         );
         let (tx, rx) = tokio::sync::oneshot::channel();
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert("abc123".to_string(), tx);
-        // simulate listen() routing
-        let sender = ch.pending_approvals.lock().await.remove("abc123").unwrap();
-        sender.send(ChannelApprovalResponse::Approve).unwrap();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "+1111111111".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        let resolution = crate::util::resolve_pending_approval(
+            &ch.pending_approvals,
+            "abc123",
+            ChannelApprovalResponse::Approve,
+            true,
+            "+1111111111",
+        )
+        .await;
+        assert_eq!(resolution, crate::util::PendingApprovalResolution::Resolved);
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn approval_reply_uses_canonical_group_destination_and_rejects_replay() {
+        let ch = make_channel();
+        let mut group_envelope = make_envelope(Some("+1111111111"), Some("abc123 deny"));
+        group_envelope.data_message.as_mut().unwrap().group_info = Some(GroupInfo {
+            group_id: Some("group123".to_string()),
+        });
+        let (approval_tx, mut approval_rx) = oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "abc123".to_string(),
+            crate::util::PendingApproval {
+                sender: approval_tx,
+                destination: "group:other-group".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        let msg = ch.process_envelope(&group_envelope).pop().unwrap();
+        assert_eq!(
+            ch.resolve_approval_reply(&msg).await,
+            Some(crate::util::PendingApprovalResolution::Rejected)
+        );
+        assert!(ch.pending_approvals.lock().await.contains_key("abc123"));
+        assert!(matches!(
+            approval_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        let mut right_envelope = group_envelope;
+        right_envelope.data_message.as_mut().unwrap().message = Some("abc123 approve".to_string());
+        right_envelope.data_message.as_mut().unwrap().group_info = Some(GroupInfo {
+            group_id: Some("other-group".to_string()),
+        });
+        let right_msg = ch.process_envelope(&right_envelope).pop().unwrap();
+        assert_eq!(
+            ch.resolve_approval_reply(&right_msg).await,
+            Some(crate::util::PendingApprovalResolution::Resolved)
+        );
+        assert_eq!(approval_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert_eq!(
+            ch.resolve_approval_reply(&right_msg).await,
+            Some(crate::util::PendingApprovalResolution::NotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_reply_resolves_direct_e164_destination() {
+        let ch = make_channel();
+        let (tx, rx) = oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            "direct".to_string(),
+            crate::util::PendingApproval {
+                sender: tx,
+                destination: "+1111111111".to_string(),
+                tool_name: "tool".to_string(),
+            },
+        );
+        let envelope = make_envelope(Some("+1111111111"), Some("direct yes"));
+        let msg = ch.process_envelope(&envelope).pop().unwrap();
+        assert_eq!(
+            ch.resolve_approval_reply(&msg).await,
+            Some(crate::util::PendingApprovalResolution::Resolved)
+        );
         assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
     }
 
@@ -1666,16 +2185,21 @@ mod tests {
         let env = Envelope {
             source: Some(uuid.to_string()),
             source_number: None,
+            source_uuid: None,
             data_message: Some(DataMessage {
                 message: Some("hi".to_string()),
                 timestamp: Some(1_700_000_000_000),
                 group_info: None,
                 attachments: None,
+                poll_answer: None,
+                poll_vote: None,
             }),
             story_message: None,
             timestamp: Some(1_700_000_000_000),
         };
-        let msg = ch.process_envelope(&env).unwrap();
+        let mut msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        let msg = msgs.remove(0);
         let params = ch
             .build_reaction_params(&msg.reply_target, &msg.id, "\u{1F44D}", false)
             .unwrap();
@@ -1693,5 +2217,180 @@ mod tests {
             err.to_string().contains("no recent inbound Signal message"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn build_poll_params_dm_uses_send_poll_create_shape() {
+        let ch = make_reaction_channel();
+        let options = vec!["Alpha".to_string(), "Beta".to_string()];
+        let params = ch.build_poll_params("+1111111111", "Pick one", &options, false);
+
+        assert_eq!(
+            params["recipient"],
+            serde_json::json!(["+1111111111".to_string()])
+        );
+        assert!(params.get("group-id").is_none());
+        assert_eq!(params["account"], "+1234567890");
+        assert_eq!(params["question"], "Pick one");
+        assert_eq!(params["option"], serde_json::json!(["Alpha", "Beta"]));
+        assert_eq!(params["no-multi"], true);
+        assert!(params.get("options").is_none());
+        assert!(params.get("multi").is_none());
+    }
+
+    #[test]
+    fn build_poll_params_group_preserves_multi_select() {
+        let ch = make_reaction_channel();
+        let options = vec!["Alpha".to_string(), "Beta".to_string()];
+        let params = ch.build_poll_params("group:abc", "Pick any", &options, true);
+
+        assert_eq!(params["group-id"], "abc");
+        assert!(params.get("recipient").is_none());
+        assert_eq!(params["account"], "+1234567890");
+        assert_eq!(params["question"], "Pick any");
+        assert_eq!(params["option"], serde_json::json!(["Alpha", "Beta"]));
+        assert_eq!(params["no-multi"], false);
+        assert!(params.get("groupId").is_none());
+        assert!(params.get("options").is_none());
+        assert!(params.get("multi").is_none());
+    }
+
+    fn poll_envelope(
+        sender: Option<&str>,
+        selected_titles: Vec<&str>,
+        selected_indices: Vec<u32>,
+    ) -> Envelope {
+        Envelope {
+            source: sender.map(String::from),
+            source_number: sender.map(String::from),
+            source_uuid: None,
+            data_message: Some(DataMessage {
+                message: None,
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                attachments: None,
+                poll_answer: Some(PollAnswer {
+                    poll_id: Some(1),
+                    selected_indices,
+                    selected_titles: selected_titles.iter().map(|s| s.to_string()).collect(),
+                }),
+                poll_vote: None,
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        }
+    }
+
+    fn poll_vote_envelope(sender: Option<&str>, option_indexes: Vec<u32>) -> Envelope {
+        Envelope {
+            source: sender.map(String::from),
+            source_number: sender.map(String::from),
+            source_uuid: None,
+            data_message: Some(DataMessage {
+                message: None,
+                timestamp: Some(1_700_000_000_000),
+                group_info: None,
+                attachments: None,
+                poll_answer: None,
+                poll_vote: Some(PollAnswer {
+                    poll_id: Some(1),
+                    selected_indices: option_indexes,
+                    selected_titles: Vec::new(),
+                }),
+            }),
+            story_message: None,
+            timestamp: Some(1_700_000_000_000),
+        }
+    }
+
+    #[test]
+    fn process_envelope_poll_answer_emits_choice_sentinel() {
+        let ch = make_channel();
+        let env = poll_envelope(Some("+1111111111"), vec!["Librarian"], vec![0]);
+        let msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice]Librarian");
+        assert_eq!(msgs[0].sender, "+1111111111");
+        assert_eq!(msgs[0].channel, "signal");
+    }
+
+    #[test]
+    fn process_envelope_poll_answer_falls_back_to_index() {
+        let ch = make_channel();
+        // No titles provided; only index 2 (0-based) → emits "[choice-index]3".
+        let env = poll_envelope(Some("+1111111111"), vec![], vec![2]);
+        let msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice-index]3");
+    }
+
+    #[test]
+    fn process_envelope_poll_vote_falls_back_to_index() {
+        let ch = make_channel();
+        // signal-cli daemon 0.14.x emits native poll votes as
+        // dataMessage.pollVote.optionIndexes.
+        let env = poll_vote_envelope(Some("+1111111111"), vec![0]);
+        let msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[choice-index]1");
+    }
+
+    #[test]
+    fn poll_vote_option_indexes_deserializes_from_signal_cli_shape() {
+        let env: Envelope = serde_json::from_value(serde_json::json!({
+            "source": "+1111111111",
+            "sourceNumber": "+1111111111",
+            "timestamp": 1_700_000_000_000_u64,
+            "dataMessage": {
+                "timestamp": 1_700_000_000_000_u64,
+                "pollVote": {
+                    "targetSentTimestamp": 1_700_000_000_000_u64,
+                    "optionIndexes": [0],
+                    "voteCount": 1
+                }
+            }
+        }))
+        .unwrap();
+
+        let vote = env
+            .data_message
+            .as_ref()
+            .and_then(|dm| dm.poll_vote.as_ref())
+            .unwrap();
+        assert_eq!(vote.selected_indices, vec![0]);
+        assert!(vote.selected_titles.is_empty());
+    }
+
+    #[test]
+    fn process_envelope_poll_answer_multi_select_emits_one_per_title() {
+        let ch = make_channel();
+        let env = poll_envelope(
+            Some("+1111111111"),
+            vec!["Librarian", "Critic", "Custodian"],
+            vec![0, 1, 2],
+        );
+        let msgs = ch.process_envelope(&env);
+        assert_eq!(msgs.len(), 3, "multi-select must emit one msg per title");
+        assert_eq!(msgs[0].content, "[choice]Librarian");
+        assert_eq!(msgs[1].content, "[choice]Critic");
+        assert_eq!(msgs[2].content, "[choice]Custodian");
+        // Ids must differ so downstream dedupe doesn't drop selections.
+        assert_ne!(msgs[0].id, msgs[1].id);
+        assert_ne!(msgs[1].id, msgs[2].id);
+    }
+
+    #[test]
+    fn process_envelope_poll_answer_denied_sender_drops() {
+        let ch = make_channel();
+        let env = poll_envelope(Some("+9999999999"), vec!["Librarian"], vec![0]);
+        assert!(ch.process_envelope(&env).is_empty());
+    }
+
+    #[test]
+    fn process_envelope_empty_poll_answer_emits_nothing() {
+        let ch = make_channel();
+        // PollAnswer present but both vecs empty (signal-cli weirdness).
+        let env = poll_envelope(Some("+1111111111"), vec![], vec![]);
+        assert!(ch.process_envelope(&env).is_empty());
     }
 }

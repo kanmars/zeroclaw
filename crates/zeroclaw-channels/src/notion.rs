@@ -13,11 +13,6 @@ const RETRY_BASE_DELAY_MS: u64 = 2000;
 /// Maximum number of characters to include from an error response body.
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
-/// Notion channel — polls a Notion database for pending tasks and writes results back.
-///
-/// The channel connects to the Notion API, queries a database for rows with a "pending"
-/// status, dispatches them as channel messages, and writes results back when processing
-/// completes. It supports crash recovery by resetting stale "running" tasks on startup.
 pub struct NotionChannel {
     api_key: String,
     database_id: String,
@@ -60,7 +55,7 @@ impl NotionChannel {
             alias: alias.into(),
             status_type: Arc::new(RwLock::new("select".to_string())),
             inflight: Arc::new(RwLock::new(HashSet::new())),
-            http: reqwest::Client::new(),
+            http: zeroclaw_config::schema::build_runtime_proxy_client("channel.notion"),
             recover_stale,
         }
     }
@@ -81,8 +76,18 @@ impl NotionChannel {
                 anyhow::Error::msg(format!("Invalid Notion API key header value: {e}"))
             })?,
         );
-        headers.insert("Notion-Version", NOTION_VERSION.parse().unwrap());
-        headers.insert("Content-Type", "application/json".parse().unwrap());
+        headers.insert(
+            "Notion-Version",
+            NOTION_VERSION.parse().map_err(|e| {
+                anyhow::Error::msg(format!("Invalid Notion-Version header value: {e}"))
+            })?,
+        );
+        headers.insert(
+            "Content-Type",
+            "application/json".parse().map_err(|e| {
+                anyhow::Error::msg(format!("Invalid Content-Type header value: {e}"))
+            })?,
+        );
         Ok(headers)
     }
 
@@ -301,7 +306,7 @@ impl NotionChannel {
                         ),
                     }
                 });
-                let short_id_end = crate::util::floor_char_boundary(page_id, 8);
+                let short_id_end = page_id.floor_char_boundary(8);
                 let short_id = &page_id[..short_id_end];
                 if let Err(e) = self
                     .api_call(reqwest::Method::PATCH, &page_url, Some(payload))
@@ -418,7 +423,7 @@ impl Channel for NotionChannel {
                         );
 
                         if input_text.trim().is_empty() {
-                            let short_end = crate::util::floor_char_boundary(&page_id, 8);
+                            let short_end = page_id.floor_char_boundary(8);
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(
@@ -472,6 +477,8 @@ impl Channel for NotionChannel {
                                 interruption_scope_id: None,
                                 attachments: vec![],
                                 subject: None,
+
+                                ..Default::default()
                             })
                             .await
                             .is_err()
@@ -508,6 +515,15 @@ impl Channel for NotionChannel {
         self.api_call(reqwest::Method::GET, &url, None)
             .await
             .is_ok()
+    }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in the Notion API.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -554,7 +570,7 @@ fn truncate_result(value: &str) -> String {
     }
     let cut = MAX_RESULT_LENGTH.saturating_sub(30);
     // Ensure we cut on a char boundary
-    let end = crate::util::floor_char_boundary(value, cut);
+    let end = value.floor_char_boundary(cut);
     format!("{}\n\n... [output truncated]", &value[..end])
 }
 

@@ -1,36 +1,11 @@
 //! Quickstart preset tables and submission shape.
-//!
-//! Two preset tables — [`RISK_PRESETS`] and [`RUNTIME_PRESETS`] — give
-//! the Quickstart UI a fixed-shape menu of named, opinionated profile
-//! defaults the user can pick from. Each preset carries:
-//!
-//! - `preset_name`  — the alias key written to config when picked
-//!   (`risk-profiles.<preset_name>` / `runtime-profiles.<preset_name>`).
-//!   Never `default`. The preset is canonical: picking it again
-//!   overwrites the alias of the same name with the preset's struct
-//!   values.
-//! - `label` / `help` — the strings the UI renders.
-//! - `values` — a struct literal of [`RiskProfileConfig`] /
-//!   [`RuntimeProfileConfig`] field values. The Quickstart writes
-//!   these verbatim into the corresponding config table on apply.
-//!
-//! Adding or removing a preset is one row in the `risk_presets!` /
-//! `runtime_presets!` table below; every consumer dispatches off
-//! `&'static [RiskPreset]` / `&'static [RuntimePreset]` so drift is
-//! impossible.
-//!
-//! [`BuilderSubmission`] is the single payload shape both surfaces
-//! (web gateway HTTP route, zerocode RPC route) and the CLI build and
-//! hand to `zeroclaw-runtime`'s apply path. The runtime validates and
-//! writes atomically. There is exactly one type, one validator, one
-//! apply function — surface code never assembles config directly.
 
 use serde::{Deserialize, Serialize};
 
 use crate::autonomy::AutonomyLevel;
-use crate::autonomy::DelegationPolicy;
+use crate::autonomy::{DelegationMode, DelegationPolicy};
 use crate::policy::{default_allowed_commands, default_forbidden_paths};
-use crate::schema::{RiskProfileConfig, RuntimeProfileConfig};
+use crate::schema::{RiskProfileConfig, RuntimeProfileConfig, SkillsPromptInjectionMode};
 
 // ─────────────────────────────────────────────────────────────────────
 // Risk presets
@@ -107,23 +82,18 @@ fn locked_down_risk() -> RiskProfileConfig {
         always_ask: vec![],
         allowed_roots: vec![],
         delegation_policy: DelegationPolicy::default(),
+        approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
 
 fn balanced_risk() -> RiskProfileConfig {
-    // Trusted-local daily-driver shape: Supervised autonomy, workspace-scoped
-    // with sensitive paths blocked, sandbox on, and any command permitted with
-    // high-risk commands still gated. `allowed_commands: ["*"]` lifts the
-    // medium-risk allowlist friction, while `block_high_risk_commands: true`
-    // keeps the `*` wildcard from exempting high-risk commands: `*` is not an
-    // explicit allowlist entry, so a high-risk command matched only by `*` is
-    // blocked outright (it never reaches the approval branch), not merely
-    // prompted. Medium-risk approval is off so routine work does not interrupt.
     RiskProfileConfig {
         level: AutonomyLevel::Supervised,
         workspace_only: true,
@@ -135,11 +105,16 @@ fn balanced_risk() -> RiskProfileConfig {
         auto_approve: vec![],
         always_ask: vec![],
         allowed_roots: vec![],
-        delegation_policy: DelegationPolicy::default(),
+        delegation_policy: DelegationPolicy {
+            mode: DelegationMode::Allow,
+        },
+        approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(true),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -148,25 +123,24 @@ fn yolo_risk() -> RiskProfileConfig {
     RiskProfileConfig {
         level: AutonomyLevel::Full,
         workspace_only: false,
-        // YOLO means "no command denylist" — but an EMPTY allowlist is
-        // deny-by-default (`is_command_allowed` rejects any command not
-        // matched by an entry), so `vec![]` blocks every shell command.
-        // The `*` wildcard + `block_high_risk_commands: false` is what
-        // actually grants unrestricted execution (the trusted-env path in
-        // `is_command_allowed`).
         allowed_commands: vec!["*".to_string()],
         forbidden_paths: vec![],
         require_approval_for_medium_risk: false,
         block_high_risk_commands: false,
         shell_env_passthrough: vec![],
-        auto_approve: vec![],
+        auto_approve: vec!["*".to_string()],
         always_ask: vec![],
         allowed_roots: vec![],
-        delegation_policy: DelegationPolicy::default(),
+        delegation_policy: DelegationPolicy {
+            mode: DelegationMode::Allow,
+        },
+        approval_route: None,
         allowed_tools: vec![],
+        deny_all_tools: false,
         excluded_tools: vec![],
         sandbox_enabled: Some(false),
         sandbox_backend: None,
+        sandbox_image: None,
         firejail_args: vec![],
     }
 }
@@ -174,6 +148,12 @@ fn yolo_risk() -> RiskProfileConfig {
 // ─────────────────────────────────────────────────────────────────────
 // Runtime presets
 // ─────────────────────────────────────────────────────────────────────
+
+/// Canonical fallback used when no provider-specific runtime recommendation exists.
+pub const DEFAULT_RUNTIME_PRESET_NAME: &str = "unbounded";
+
+/// Canonical compact runtime recommended by local inference backends.
+pub const LOCAL_SMALL_RUNTIME_PRESET_NAME: &str = "local_small";
 
 /// One row in the Runtime preset table. Same shape and contract as
 /// [`RiskPreset`] — see its docs for the per-field semantics.
@@ -204,6 +184,14 @@ pub const RUNTIME_PRESETS: &[RuntimePreset] = &[
         values: tight_runtime,
     },
     RuntimePreset {
+        preset_name: LOCAL_SMALL_RUNTIME_PRESET_NAME,
+        label: "Local Small",
+        help: "Compact no-text-fallback profile for smaller local models. \
+               Keeps context and tool results small, disables parallel tool \
+               fan-out, and requires native or structured tool calls.",
+        values: local_small_runtime,
+    },
+    RuntimePreset {
         preset_name: "balanced",
         label: "Balanced",
         help: "Middle-of-the-road operational defaults. Suits most users \
@@ -211,7 +199,7 @@ pub const RUNTIME_PRESETS: &[RuntimePreset] = &[
         values: balanced_runtime,
     },
     RuntimePreset {
-        preset_name: "unbounded",
+        preset_name: DEFAULT_RUNTIME_PRESET_NAME,
         label: "Unbounded",
         help: "Wide-open budgets and long timeouts. Pick this when you're \
                actively driving the agent through a hard task and don't \
@@ -227,6 +215,17 @@ pub fn runtime_preset(preset_name: &str) -> Option<&'static RuntimePreset> {
     RUNTIME_PRESETS
         .iter()
         .find(|p| p.preset_name == preset_name)
+}
+
+/// Resolve an optional provider recommendation against the canonical preset table.
+/// Unknown or absent recommendations fall back to `unbounded`, then to the first
+/// available preset so consumers never duplicate fallback policy.
+#[must_use]
+pub fn recommended_runtime_preset(recommendation: Option<&str>) -> Option<&'static RuntimePreset> {
+    recommendation
+        .and_then(runtime_preset)
+        .or_else(|| runtime_preset(DEFAULT_RUNTIME_PRESET_NAME))
+        .or_else(|| RUNTIME_PRESETS.first())
 }
 
 fn tight_runtime() -> RuntimeProfileConfig {
@@ -253,6 +252,32 @@ fn tight_runtime() -> RuntimeProfileConfig {
     }
 }
 
+fn local_small_runtime() -> RuntimeProfileConfig {
+    RuntimeProfileConfig {
+        agentic: true,
+        max_tool_iterations: 4,
+        max_actions_per_hour: 10,
+        max_cost_per_day_cents: 100,
+        shell_timeout_secs: 30,
+        max_delegation_depth: 1,
+        delegation_timeout_secs: Some(60),
+        agentic_timeout_secs: Some(120),
+        max_history_messages: Some(20),
+        max_context_tokens: Some(8_000),
+        compact_context: Some(true),
+        parallel_tools: Some(false),
+        tool_dispatcher: None,
+        tool_call_dedup_exempt: vec![],
+        max_system_prompt_chars: Some(8_000),
+        max_tool_result_chars: Some(4_000),
+        keep_tool_context_turns: Some(1),
+        memory_recall_limit: Some(3),
+        prompt_injection_mode: Some(SkillsPromptInjectionMode::Compact),
+        strict_tool_parsing: true,
+        ..RuntimeProfileConfig::default()
+    }
+}
+
 fn balanced_runtime() -> RuntimeProfileConfig {
     // Schema default is already the Balanced shape. Use it directly so
     // the preset can't drift from the schema default.
@@ -263,11 +288,6 @@ fn unbounded_runtime() -> RuntimeProfileConfig {
     RuntimeProfileConfig {
         agentic: true,
         max_tool_iterations: 100,
-        // `0` is NOT "unlimited" for these budgets — the per-sender rate
-        // tracker treats a max of 0 as *exhausted* (see
-        // `PerSenderTracker::is_exhausted` / `rate_limit_zero_blocks_everything`),
-        // so an `unbounded` agent set to 0 has every action rejected. Use the
-        // type max for an effectively-unlimited budget instead.
         max_actions_per_hour: u32::MAX,
         max_cost_per_day_cents: u32::MAX,
         shell_timeout_secs: 600,
@@ -292,23 +312,9 @@ fn unbounded_runtime() -> RuntimeProfileConfig {
 // BuilderSubmission and dependent choice types
 // ─────────────────────────────────────────────────────────────────────
 
-/// Choice for the Memory step. Re-exports the schema's canonical
-/// `MemoryBackendKind` so Quickstart never re-defines the list of
-/// memory backends — adding a backend to
-/// `zeroclaw_config::multi_agent::MemoryBackendKind` lights up in
-/// every Quickstart surface automatically.
 pub use crate::multi_agent::MemoryBackendKind as MemoryChoice;
 
-/// Model provider widget submission. The Quickstart UI surfaces only
-/// the "greatest hits" fields an agent literally cannot start
-/// without; everything else (retry policy, rate limits, custom
-/// headers) lives in the post-Quickstart config editor.
-///
-/// `provider_type` is the type key written to
-/// `providers.models.<provider_type>.<alias>`. The exact set of
-/// recognised type strings tracks the existing
-/// `providers::ProviderKind`; Quickstart validates the chosen value
-/// at apply time via the runtime entry point.
+/// Model provider selection submitted by the Quickstart builder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ModelProviderChoice {
@@ -330,13 +336,7 @@ pub struct ModelProviderChoice {
     pub fields: std::collections::HashMap<String, String>,
 }
 
-/// Single-channel entry submitted by the Channels widget. The
-/// Channels selector renders a `Vec<ChannelQuickStart>`; Quickstart
-/// writes one `channels.<channel_type>.<alias>` block per entry.
-///
-/// Channels are optional: an empty `Vec` is a valid Quickstart
-/// submission (the agent will only be reachable via
-/// `zeroclaw agent <alias>` from the CLI).
+/// One channel selection submitted by the Quickstart builder.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ChannelQuickStart {
@@ -347,9 +347,12 @@ pub struct ChannelQuickStart {
     /// `channel_type` in the UI; users override when stacking
     /// multiple aliases of the same channel type.
     pub alias: String,
-    /// Bot token / shared secret if the channel needs one
-    /// (Telegram, Discord). `None` for channels that don't.
-    pub token: Option<String>,
+    /// Round-trip of every field the daemon described in
+    /// `quickstart/fields`. Surfaces echo back exactly what was
+    /// emitted; the daemon writes each entry under `<prefix>.<key>`
+    /// using its own schema knowledge.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub fields: std::collections::HashMap<String, String>,
 }
 
 /// Agent identity payload from the Agent step. Personality file
@@ -390,16 +393,7 @@ pub struct QuickstartPersonalityFile {
     pub content: String,
 }
 
-/// The complete Quickstart submission both surfaces hand to
-/// `zeroclaw-runtime::quickstart::apply` (and pre-validate via
-/// `validate_only`). Single source of truth; assembling config
-/// outside this type is a layering bug.
-///
-/// Every field's `*_preset` / choice value is the user's resolved
-/// selection — the runtime translates preset keys into struct
-/// values via [`risk_preset`] / [`runtime_preset`] and looks up
-/// existing aliases against the live config when the UI submitted
-/// "use existing" rather than a fresh choice.
+/// Complete builder submission consumed by the shared Quickstart apply path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct BuilderSubmission {
@@ -450,11 +444,7 @@ pub struct QuickstartPeerGroup {
     pub ignore: Vec<String>,
 }
 
-/// Dual-mode selector outcome. Every Quickstart selector lets the
-/// user either pick an existing configured alias or create a fresh
-/// one; this enum carries which path was taken so the runtime apply
-/// path can branch on `Existing` (record an alias ref only, no
-/// writes to that section) vs `Fresh` (write a new entry).
+/// Selects either an existing configured value or a fresh builder value.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case", tag = "mode", content = "value")]
@@ -471,9 +461,6 @@ pub enum SelectorChoice<T> {
 mod tests {
     use super::*;
 
-    /// Every preset's `preset_name` must be unique within its table —
-    /// the alias is also the lookup key, so duplicates would shadow
-    /// each other silently.
     #[test]
     fn risk_preset_names_are_unique() {
         let mut seen = std::collections::BTreeSet::new();
@@ -498,8 +485,6 @@ mod tests {
         }
     }
 
-    /// `risk_preset` / `runtime_preset` lookup round-trip — picking
-    /// by `preset_name` must find the same row that's in the slice.
     #[test]
     fn risk_preset_lookup_round_trips() {
         for p in RISK_PRESETS {
@@ -520,7 +505,6 @@ mod tests {
         assert!(runtime_preset("not-a-real-preset").is_none());
     }
 
-    /// No preset is allowed to use `default` as its alias.
     #[test]
     fn no_preset_uses_default_alias() {
         for p in RISK_PRESETS {
@@ -620,12 +604,84 @@ mod tests {
         assert_eq!(format!("{preset_values:?}"), format!("{schema_default:?}"),);
     }
 
-    /// Regression: the `unbounded` preset must NOT zero out the action
-    /// budget. A `max_actions_per_hour` of 0 is a hard zero budget (the
-    /// per-sender tracker treats 0 as always exhausted), so an agent on
-    /// the `unbounded` profile previously had every tool call rejected
-    /// with "max 0 actions per hour". Assert the budget is non-zero and
-    /// that a policy carrying it actually permits an action.
+    #[test]
+    fn local_small_runtime_matches_documented_small_model_shape() {
+        let preset = runtime_preset("local_small").expect("local_small preset");
+        let values = (preset.values)();
+
+        assert!(values.agentic);
+        assert_eq!(values.max_tool_iterations, 4);
+        assert_eq!(values.max_actions_per_hour, 10);
+        assert_eq!(values.max_cost_per_day_cents, 100);
+        assert_eq!(values.shell_timeout_secs, 30);
+        assert_eq!(values.max_delegation_depth, 1);
+        assert_eq!(values.delegation_timeout_secs, Some(60));
+        assert_eq!(values.agentic_timeout_secs, Some(120));
+        assert_eq!(values.max_history_messages, Some(20));
+        assert_eq!(values.max_context_tokens, Some(8_000));
+        assert_eq!(values.compact_context, Some(true));
+        assert_eq!(values.parallel_tools, Some(false));
+        assert_eq!(values.max_system_prompt_chars, Some(8_000));
+        assert_eq!(values.max_tool_result_chars, Some(4_000));
+        assert_eq!(values.keep_tool_context_turns, Some(1));
+        assert_eq!(values.memory_recall_limit, Some(3));
+        assert_eq!(
+            values.prompt_injection_mode,
+            Some(SkillsPromptInjectionMode::Compact)
+        );
+        assert!(values.strict_tool_parsing);
+    }
+
+    #[test]
+    fn runtime_recommendation_resolution_uses_canonical_fallback() {
+        assert_eq!(
+            recommended_runtime_preset(Some(LOCAL_SMALL_RUNTIME_PRESET_NAME))
+                .map(|preset| preset.preset_name),
+            Some(LOCAL_SMALL_RUNTIME_PRESET_NAME),
+        );
+        for recommendation in [None, Some("unknown-runtime-profile")] {
+            assert_eq!(
+                recommended_runtime_preset(recommendation).map(|preset| preset.preset_name),
+                Some(DEFAULT_RUNTIME_PRESET_NAME),
+            );
+        }
+    }
+
+    #[test]
+    fn local_small_runtime_resolves_to_strict_compact_agent_policy() {
+        let preset = runtime_preset("local_small").expect("local_small preset");
+        let mut config = crate::schema::Config::default();
+        config
+            .runtime_profiles
+            .insert("local_small".into(), (preset.values)());
+        config.agents.insert(
+            "local_agent".into(),
+            crate::schema::AliasedAgentConfig {
+                runtime_profile: crate::providers::RuntimeProfileRef::new("local_small"),
+                ..crate::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        let resolved = config
+            .resolved_agent_config("local_agent")
+            .expect("agent should resolve");
+
+        assert!(resolved.resolved.strict_tool_parsing);
+        assert_eq!(resolved.resolved.max_tool_iterations, 4);
+        assert_eq!(resolved.resolved.max_history_messages, 20);
+        assert_eq!(resolved.resolved.max_context_tokens, Some(8_000));
+        assert!(resolved.resolved.compact_context);
+        assert!(!resolved.resolved.parallel_tools);
+        assert_eq!(resolved.resolved.max_system_prompt_chars, 8_000);
+        assert_eq!(resolved.resolved.max_tool_result_chars, 4_000);
+        assert_eq!(resolved.resolved.keep_tool_context_turns, 1);
+        assert_eq!(
+            resolved.resolved.prompt_injection_mode,
+            SkillsPromptInjectionMode::Compact
+        );
+        assert_eq!(config.effective_memory_recall_limit("local_agent"), 3);
+    }
+
     #[test]
     fn unbounded_runtime_does_not_block_all_actions() {
         let preset = runtime_preset("unbounded").unwrap();
@@ -644,13 +700,6 @@ mod tests {
         );
     }
 
-    /// Regression: the `yolo` risk preset must actually permit shell
-    /// commands. `allowed_commands` is deny-by-default — an empty list
-    /// matches nothing, so a `yolo` agent (whose whole point is "no
-    /// command denylist, full autonomy") previously had every shell
-    /// command rejected with "Command not allowed by security policy".
-    /// The preset must carry the `*` wildcard so unrestricted execution
-    /// is actually granted.
     #[test]
     fn yolo_risk_allows_shell_commands() {
         let preset = risk_preset("yolo").unwrap();
@@ -669,9 +718,41 @@ mod tests {
         }
     }
 
-    /// `BuilderSubmission` and its dependent types must round-trip
-    /// through serde — both surfaces serialize the same shape, and
-    /// the drift test in commit 4 will rely on this.
+    #[test]
+    fn yolo_risk_auto_approves_everything_with_no_forbidden_paths() {
+        let preset = risk_preset("yolo").unwrap();
+        let values = (preset.values)();
+        assert_eq!(
+            values.auto_approve,
+            vec!["*".to_string()],
+            "yolo must auto-approve every tool via the `*` wildcard",
+        );
+        assert!(
+            values.forbidden_paths.is_empty(),
+            "yolo must have no forbidden paths",
+        );
+        assert!(
+            values.always_ask.is_empty(),
+            "yolo must never force an approval prompt",
+        );
+        assert!(
+            values.delegation_policy.permits(),
+            "yolo must permit delegation",
+        );
+    }
+
+    #[test]
+    fn yolo_and_balanced_permit_delegation() {
+        for name in ["yolo", "balanced"] {
+            let preset = risk_preset(name).unwrap();
+            let values = (preset.values)();
+            assert!(
+                values.delegation_policy.permits(),
+                "{name} must permit delegation",
+            );
+        }
+    }
+
     #[test]
     fn builder_submission_round_trips_through_json() {
         let submission = BuilderSubmission {
@@ -690,7 +771,7 @@ mod tests {
             channels: vec![SelectorChoice::Fresh(ChannelQuickStart {
                 channel_type: "cli".into(),
                 alias: "cli".into(),
-                token: None,
+                fields: std::collections::HashMap::new(),
             })],
             peer_groups: vec![],
             agent: AgentIdentity {
@@ -703,5 +784,36 @@ mod tests {
         let json = serde_json::to_string(&submission).expect("serialize");
         let parsed: BuilderSubmission = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, submission);
+    }
+
+    #[test]
+    fn channel_quickstart_round_trips_schema_fields() {
+        let channel = ChannelQuickStart {
+            channel_type: "telegram".into(),
+            alias: "ops".into(),
+            fields: std::collections::HashMap::from([(
+                "bot_token".to_string(),
+                "123:ABC".to_string(),
+            )]),
+        };
+
+        let value = serde_json::to_value(&channel).expect("serialize channel");
+        assert_eq!(value["fields"]["bot_token"], "123:ABC");
+        assert!(value.get("token").is_none());
+        assert_eq!(
+            serde_json::from_value::<ChannelQuickStart>(value).expect("deserialize channel"),
+            channel
+        );
+    }
+
+    #[test]
+    fn channel_quickstart_defaults_missing_fields_to_empty() {
+        let channel: ChannelQuickStart = serde_json::from_value(serde_json::json!({
+            "channel_type": "cli",
+            "alias": "cli"
+        }))
+        .expect("deserialize legacy channel without fields");
+
+        assert!(channel.fields.is_empty());
     }
 }

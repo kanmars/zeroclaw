@@ -1,13 +1,4 @@
 //! Performance benchmarks for ZeroClaw hot paths.
-//!
-//! Benchmarks cover:
-//!   - Tool dispatch (XML parsing, native parsing)
-//!   - Memory store/recall cycles (SQLite backend)
-//!   - Agent turn cycle (full orchestration loop)
-//!
-//! Run: `cargo bench`
-//!
-//! Ref: <https://github.com/zeroclaw-labs/zeroclaw/issues/618> (item 7)
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
@@ -20,7 +11,7 @@ use zeroclaw::memory;
 use zeroclaw::memory::{Memory, MemoryCategory};
 use zeroclaw::observability::{NoopObserver, Observer};
 use zeroclaw::providers::{ChatRequest, ChatResponse, ModelProvider, ToolCall};
-use zeroclaw::tools::{Tool, ToolResult};
+use zeroclaw::tools::{Tool, ToolOutput, ToolResult};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -132,7 +123,7 @@ impl Tool for NoopTool {
     async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
         Ok(ToolResult {
             success: true,
-            output: String::new(),
+            output: ToolOutput::default(),
             error: None,
         })
     }
@@ -306,7 +297,11 @@ fn bench_agent_turn(c: &mut Criterion) {
                 let model_provider = Box::new(BenchModelProvider::text_only("benchmark response"));
                 let mut agent = Agent::builder()
                     .model_provider(model_provider)
-                    .tools(vec![Box::new(NoopTool) as Box<dyn Tool>])
+                    .tools(
+                        zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                            Box::new(NoopTool) as Box<dyn Tool>,
+                        ]),
+                    )
                     .memory(make_memory())
                     .observer(make_observer())
                     .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -324,7 +319,11 @@ fn bench_agent_turn(c: &mut Criterion) {
                 let model_provider = Box::new(BenchModelProvider::with_tool_then_text());
                 let mut agent = Agent::builder()
                     .model_provider(model_provider)
-                    .tools(vec![Box::new(NoopTool) as Box<dyn Tool>])
+                    .tools(
+                        zeroclaw::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                            Box::new(NoopTool) as Box<dyn Tool>,
+                        ]),
+                    )
                     .memory(make_memory())
                     .observer(make_observer())
                     .tool_dispatcher(Box::new(NativeToolDispatcher))

@@ -1,24 +1,29 @@
-//! `cargo generate installers` - render install surfaces (setup.bat,
-//! Containerfile, Dockerfiles, packaging, ...) from the canonical spec.
-//! install.sh@HEAD is the behavioral reference. The spec is the single source
-//! of truth; surfaces are derived and drift-checked. Surfaces are registered in
-//! one table so adding one is data, not control flow.
+//! Maintainer surface generation. `cargo generate installers` renders install
+//! surfaces from canonical route semantics; `cargo generate review-docs`
+//! materializes repeated PR-review policy. Typed specs own policy, renderers
+//! own generated content, and text outside generated zones stays hand-authored.
 
 pub mod container;
 pub mod container_base;
 pub mod docker_tags;
+pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
+pub mod review_docs;
+pub mod runtime_locales;
 pub mod setup_bat;
+pub mod sop_syntax;
 pub mod spec;
+pub mod tools_ftl;
+pub mod zerocode_themes;
 
 use container::ContainerSurface;
 use spec::Selection as Sel;
 use std::path::{Path, PathBuf};
 
 /// A render: given the workspace root and the file's current content, produce
-/// the regenerated content (splicing only sentinel zones).
+/// either a whole-file rendering or a rendering with sentinel zones spliced.
 type Render = fn(&Path, &str) -> anyhow::Result<String>;
 
 /// One registered surface: a canonical name and the file it owns + how to
@@ -43,6 +48,46 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| setup_bat::render_file(root, cur),
         },
         Surface {
+            name: "install-docs",
+            file: "docs/book/src/_snippets/install.md",
+            render: docs::render_file,
+        },
+        Surface {
+            name: "runtime-locales",
+            file: "crates/zeroclaw-runtime/src/generated_locales.rs",
+            render: runtime_locales::render_file,
+        },
+        Surface {
+            name: "tools-en-ftl",
+            file: "crates/zeroclaw-tools/locales/en/tools.ftl",
+            render: tools_ftl::render_file,
+        },
+        Surface {
+            name: "readme-unix-fast",
+            file: "README.md",
+            render: docs::render_readme_unix_fast_zone,
+        },
+        Surface {
+            name: "linux-unix-fast",
+            file: "docs/book/src/setup/linux.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "macos-unix-fast",
+            file: "docs/book/src/setup/macos.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "hardware-unix-fast",
+            file: "docs/book/src/hardware/subsystem.md",
+            render: docs::render_unix_fast_command_zone,
+        },
+        Surface {
+            name: "windows-prebuilt-guide",
+            file: "docs/book/src/setup/windows.md",
+            render: docs::render_windows_guide,
+        },
+        Surface {
             name: "containerfile",
             file: "Containerfile",
             render: |root, cur| containerfile_surface().render(root, cur),
@@ -58,9 +103,27 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| render_docker_arg(root, cur),
         },
         Surface {
+            name: "dockerfile-alpine",
+            file: "Dockerfile.alpine",
+            render: |root, cur| render_docker_arg(root, cur),
+        },
+        // Base-image pins only: the relay builds `-p zerorelay` with no feature
+        // selection, so it carries no `docker-features-arg` zone and must not go
+        // through `render_docker_arg`.
+        Surface {
+            name: "dockerfile-zerorelay",
+            file: "apps/zerorelay/Dockerfile",
+            render: |root, cur| container_base::splice_zones(root, cur),
+        },
+        Surface {
             name: "pkgbuild",
             file: "dist/aur/PKGBUILD",
             render: |root, cur| packaging::render_pkgbuild(root, cur),
+        },
+        Surface {
+            name: "aur-srcinfo",
+            file: "dist/aur/.SRCINFO",
+            render: |root, cur| packaging::render_srcinfo(root, cur),
         },
         Surface {
             name: "scoop",
@@ -77,19 +140,24 @@ fn registry() -> Vec<Surface> {
             file: "dev/ci/docker-tags.toml",
             render: |root, cur| docker_tags::render_file(root, cur),
         },
+        Surface {
+            name: "zerocode-themes",
+            file: "apps/zerocode/src/generated_themes.rs",
+            render: zerocode_themes::render_file,
+        },
     ]
 }
 
-/// Dockerfile-family ARG default: ships Dist by default (all channels, no
-/// heavyweight), build-time overridable via --build-arg.
+/// Dockerfile-family ARG default: ships the lean standard Dist selection,
+/// build-time overridable via --build-arg.
 fn render_docker_arg(root: &Path, current: &str) -> anyhow::Result<String> {
     let body = container::render_features_arg(root, &Sel::Dist)?;
     let spliced = container::splice(current, "docker-features-arg", &body)?;
     container_base::splice_zones(root, &spliced)
 }
 
-/// Containerfile surface: standard image ships Dist (all channels, no
-/// heavyweight); fat image ships All (kitchen sink). Selections, not literals.
+/// Containerfile surface: standard image ships lean Dist; fat image ships All
+/// (kitchen sink). Selections, not literals.
 fn containerfile_surface() -> ContainerSurface {
     ContainerSurface {
         file: "Containerfile",
@@ -105,6 +173,29 @@ fn workspace_root() -> PathBuf {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub fn features(
+    selection_id: &str,
+    target: Option<&str>,
+    excluded: &[String],
+) -> anyhow::Result<()> {
+    let selection = Sel::from_id(selection_id).ok_or_else(|| {
+        anyhow::Error::msg(format!(
+            "unknown selection `{selection_id}` (known: {})",
+            Sel::named()
+                .iter()
+                .map(Sel::id)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    })?;
+    let list = spec::exclude_features(
+        spec::resolve_feature_list_for_target(&workspace_root(), &selection, target)?,
+        excluded,
+    )?;
+    println!("{}", list.join(","));
+    Ok(())
 }
 
 pub fn run(targets: &[String], check: bool) -> anyhow::Result<()> {

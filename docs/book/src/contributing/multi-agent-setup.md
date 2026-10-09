@@ -34,6 +34,28 @@ POSIX device files (`/dev/null`, `/dev/zero`, `/dev/random`, `/dev/urandom`) are
 
 Same-backend only. To let `researcher` recall memories that `primary` wrote, both agents must use the same memory backend (e.g. both `sqlite`). The schema validator rejects entries that point at a sibling on a different backend; the runtime never sees a cross-backend allowlist by the time it builds the per-agent memory wrapper.
 
+The legacy string form grants every category:
+
+```toml
+read_memory_from = ["primary"]
+```
+
+For least-privilege sharing, use one typed grant per source agent and list the
+exact category names that may be recalled:
+
+```toml
+read_memory_from = [
+  { agent = "primary", categories = ["core", "family"] },
+]
+```
+
+An omitted `categories` field is unrestricted. An explicitly empty category
+list is rejected, and unknown category names match nothing. Grants are
+non-transitive: a sibling's own grants do not broaden the caller's view.
+Category-scoped grants require a backend that preserves per-row categories;
+the Markdown backend rejects them during validation and again at memory
+factory construction.
+
 The bound agent always sees its own rows; the allowlist is purely additive. There is no way to *hide* an agent's own rows from itself.
 
 ## Peer group on a shared channel
@@ -47,6 +69,8 @@ The schema validator at config load enforces:
 1. Every member's `channels` list includes the group's `channel` (an agent that doesn't listen there can't peer there).
 2. Every member is a configured agent (no dangling references).
 3. `read_memory_from` does not point at the agent itself.
+4. Each source agent appears at most once in `read_memory_from`; combine all
+   categories into that one grant.
 
 ## Inspect the install
 
@@ -54,19 +78,48 @@ Every configured agent lives under an `agents.<alias>` entry with its risk profi
 
 {{#config-where agents}}
 
-## Delete an agent
+> The `zeroclaw agents` lifecycle commands perform the full owned-state cascade only in builds with `gateway` and `agent-runtime` enabled, including the standard distributed binary. A reduced-feature CLI still changes config but prints that owned state was not cascaded. Use the gateway dashboard or a binary with both features enabled for the operations below when owned state exists.
 
-1. Remove the `agents.<alias>` entry (and any nested `workspace` / `memory` tables) through the gateway, zerocode, or `zeroclaw config set`.
-2. Strip the alias from every `[peer_groups.<name>]` block's `agents` list.
-3. Remove the workspace dir: `rm -rf <install>/agents/<alias>/workspace/`.
-4. Optional cleanup of the agent's memory rows (they retain `agent_id = <alias-uuid>` attribution but no live agent maps to that UUID anymore):
+## Rename an agent
 
-```sql
-DELETE FROM memories WHERE agent_id = (SELECT id FROM agents WHERE alias = 'researcher');
-DELETE FROM agents WHERE alias = 'researcher';
+Use the rename control for the agent under **Config > Agents** in the gateway dashboard, or run:
+
+```sh
+zeroclaw agents rename researcher analyst
 ```
 
-The schema validator will refuse to load if a `[peer_groups.<name>]` still lists the deleted alias, so step 2 is required before the daemon will start cleanly.
+Both surfaces rewrite references to the alias, persist the config, move the default per-alias workspace, and re-point owned memory, cron, ACP, and session state. Custom workspace paths do not move because they are not derived from the alias. The reserved `default` alias cannot be renamed from or to.
+
+Read any warnings in the response. The config rename commits before workspace and owned-state migration, so warnings identify a side effect that still needs attention. The same gateway API rename request can be reissued to retry residue left under the old alias.
+
+## Delete an agent
+
+Use the delete control under **Config > Agents**, or preview and apply the CLI operation:
+
+```sh
+zeroclaw agents delete researcher --dry-run
+zeroclaw agents delete researcher --yes
+```
+
+1. Review the impact preview and clear every blocker it reports. Common config blockers are an enabled heartbeat owned by the agent and an enabled channel binding that no other enabled agent owns. The preview also lists soft references that the cascade will remove automatically.
+2. End any live ACP sessions. The dashboard includes them in its preview; the CLI verifies them when `--yes` executes, after the config-only `--dry-run` preview.
+3. Confirm the dashboard deletion or run the CLI command with `--yes`. The operation removes the agent and soft references from config first, then runs the owned-state cascade.
+4. Inspect `<data_dir>/agents/_deleted/<alias>-<timestamp>/` and the gateway logs before relying on the archive or cleanup result.
+
+The owned-state cascade attempts to:
+
+- move the configured workspace into the deletion archive;
+- write exported memory, cron, and ACP data under `cascade/`;
+- purge the agent's memory rows and cron jobs;
+- remove its non-live ACP sessions;
+- clear agent attribution from retained conversation sessions; and
+- write `manifest.json` with counts and surfaced warnings.
+
+These side effects are best-effort. An export or archive-file write can fail while later cleanup continues. Verify the applicable `workspace/`, `cascade/*.json`, and `manifest.json` entries instead of assuming the archive is complete. The CLI prints surfaced cascade warnings. The delete API also returns them, but the dashboard does not currently display them; dashboard operators must check the gateway logs as well.
+
+> Do not replace this flow with direct TOML edits, `zeroclaw config set`, manual workspace deletion, or SQL deletion. Those paths do not run the gateway's reference and owned-state cascade.
+
+There is no automated restore command. Keep the deletion archive until you no longer need it for inspection or manual recovery.
 
 ## Verify
 

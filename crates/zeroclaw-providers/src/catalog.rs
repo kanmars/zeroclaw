@@ -1,14 +1,4 @@
 //! Per-family catalog source table.
-//!
-//! Reaches the model catalog for any provider family without constructing
-//! a live `ModelProvider` (which would require typed runtime context like
-//! Azure's `resource`/`deployment` or Bedrock's `region`). Used by the
-//! gateway's `/api/config/catalog/models` endpoint and the TUI's
-//! config flow when the operator hasn't supplied a credential yet.
-//!
-//! Each family maps to a tuple `(models_dev_key, openrouter_vendor_prefix)`;
-//! `list_models_for_family` walks them in that order, returning the first
-//! non-empty list.
 
 use std::time::Duration;
 
@@ -16,6 +6,7 @@ use anyhow::Result;
 use serde::Deserialize;
 
 const NEARAI_CATALOG_URL: &str = "https://cloud-api.near.ai/v1/model/list";
+const ATLASCLOUD_CATALOG_URL: &str = "https://api.atlascloud.ai/v1/models";
 const FETCH_TIMEOUT_SECS: u64 = 10;
 
 /// `(models.dev key, openrouter.ai vendor prefix)` for a family name.
@@ -32,12 +23,16 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "bedrock" => (Some("amazon-bedrock"), None),
         "gemini" => (Some("google"), Some("google")),
         "gemini_cli" => (Some("google"), Some("google")),
+        "grok_cli" => (Some("xai"), Some("x-ai")),
         "openrouter" => (Some("openrouter"), Some("openrouter")),
         "copilot" => (Some("github-copilot"), None),
         "minimax" => (Some("minimax"), Some("minimax")),
         "lmstudio" => (Some("lmstudio"), None),
         "kilocli" => (Some("kilo"), None),
         "kilo" => (Some("kilo"), None),
+        // Self-hosted gateway: prices come live from its own /v1/models
+        // (PUBLIC_MODEL_LISTING), never from models.dev or OpenRouter.
+        "zerorouter" => (None, None),
         "ovh" => (Some("ovhcloud"), None),
         // Compat families — mirrors the consts in CompatFamilySpec impls.
         "moonshot" => (Some("moonshotai"), Some("moonshotai")),
@@ -74,18 +69,24 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "nvidia" => (Some("nvidia"), Some("nvidia")),
         "vercel" => (Some("vercel"), None),
         "cloudflare" => (Some("cloudflare-ai-gateway"), None),
+        // Atlas Cloud exposes a no-auth OpenAI-compatible `/models` endpoint.
+        // `list_models_for_family` handles that path before using this tuple.
+        "atlascloud" => (None, None),
         "synthetic" => (Some("synthetic"), None),
         "opencode" => (Some("opencode"), None),
         "atomic_chat" => (Some("atomic-chat"), None),
         "telnyx" => (None, None),
+        "crusoe" => (None, None),
         // Families with no public catalog: local-only servers (no public
         // /models index without a running server) or credential-required
         // APIs with no published catalog. Operator pastes a credential and
         // the provider's `/models` endpoint serves the list directly.
         "sambanova" | "hyperbolic" | "anyscale" | "nscale" | "lepton" | "yi" | "baichuan"
         | "avian" | "deepmyst" | "astrai" | "sglang" | "vllm" | "osaurus" | "litellm"
-        | "llamacpp" | "ollama" | "manifest" | "morph" | "github_models" | "upstage"
-        | "featherless" | "arcee" | "lambda_ai" | "inception" | "custom" => (None, None),
+        | "llamacpp" | "ollama" | "hailo_ollama" | "manifest" | "morph" | "github_models"
+        | "upstage" | "featherless" | "arcee" | "lambda_ai" | "inception" | "custom" => {
+            (None, None)
+        }
         _ => return None,
     };
     Some(pair)
@@ -115,6 +116,30 @@ struct NearaiModelMetadata {
 struct NearaiArchitecture {
     #[serde(default, rename = "outputModalities")]
     output_modalities: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelsCatalog {
+    #[serde(default)]
+    data: Vec<OpenAiModelEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiModelEntry {
+    id: String,
+}
+
+pub(crate) fn parse_openai_models_catalog(bytes: &[u8]) -> Result<Vec<String>> {
+    let catalog: OpenAiModelsCatalog = serde_json::from_slice(bytes)?;
+    let mut ids: Vec<String> = catalog
+        .data
+        .into_iter()
+        .map(|model| model.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
 }
 
 fn is_nearai_chat_model(model: &NearaiModel) -> bool {
@@ -159,12 +184,28 @@ async fn list_nearai_models() -> Result<Vec<String>> {
     parse_nearai_catalog(&bytes)
 }
 
+async fn list_atlascloud_models() -> Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+        .build()?;
+    let response = client
+        .get(ATLASCLOUD_CATALOG_URL)
+        .send()
+        .await?
+        .error_for_status()?;
+    let bytes = response.bytes().await?;
+    parse_openai_models_catalog(&bytes)
+}
+
 /// Probe the catalog for `family` without constructing a live provider.
 /// Returns the union of every known public catalog source. Errors if
 /// `family` is unknown or has no public catalog source set.
 pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
     if family == "nearai" {
         return list_nearai_models().await;
+    }
+    if family == "atlascloud" {
+        return list_atlascloud_models().await;
     }
 
     let Some((md_key, or_prefix)) = catalog_source_for(family) else {
@@ -182,11 +223,6 @@ pub async fn list_models_for_family(family: &str) -> Result<Vec<String>> {
     anyhow::bail!("no public catalog for family {family:?}")
 }
 
-/// Sort a raw public model catalog for first-run chat/code setup.
-///
-/// This is a provisional catalog-level heuristic until per-model capabilities
-/// become explicit catalog data. Keeping it with the catalog source prevents
-/// every UI/client surface from growing its own model-name classifier.
 #[must_use]
 pub fn sort_model_catalog_for_chat(provider: &str, models: Vec<String>) -> Option<Vec<String>> {
     let provider_l = provider.to_ascii_lowercase();
@@ -260,15 +296,141 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+/// Resolve a live or static model catalog while preserving configured-profile errors.
+pub async fn model_catalog_with_config_result(
+    config: Option<&zeroclaw_config::schema::Config>,
+    model_provider: &str,
+) -> anyhow::Result<(
+    Vec<String>,
+    Option<std::collections::HashMap<String, zeroclaw_api::model_provider::ModelPricing>>,
+    bool,
+)> {
+    let resolved = config.and_then(|cfg| cfg.providers.models.find_by_name(model_provider));
+    let api_key = resolved
+        .as_ref()
+        .and_then(|(_family, _alias, base)| base.api_key.clone());
+    // Honor a configured custom endpoint so proxied / self-hosted OpenAI-compatible
+    // deployments list from their own `/models` rather than the family default.
+    let api_url = resolved.as_ref().and_then(|(_family, _alias, base)| {
+        base.uri
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(ToString::to_string)
+    });
+    // `create_model_provider` and the chat-catalog ranker expect a bare family
+    // name, not a dotted ref. Prefer the family `find_by_name` resolved; when it
+    // could not (no config / unknown alias) strip any `<family>.<alias>` suffix
+    // ourselves so a dotted selector still constructs.
+    let family: &str = resolved
+        .as_ref()
+        .map(|(family, _alias, _base)| *family)
+        .unwrap_or_else(|| {
+            model_provider
+                .split_once('.')
+                .map_or(model_provider, |(f, _)| f)
+        });
+
+    let configured_profile = resolved.is_some();
+    let has_dotted_profile_shape = model_provider
+        .split_once('.')
+        .is_some_and(|(family, _)| !family.contains(':'));
+    if has_dotted_profile_shape && !configured_profile {
+        anyhow::bail!(
+            "configured provider profile `{model_provider}` does not exist; expected `<type>.<alias>` from providers.models"
+        );
+    }
+
+    // A configured alias is the canonical source for provider construction:
+    // it owns its endpoint, credential, headers, and typed runtime options.
+    // Bare-family requests retain the public-catalog fallback below.
+    let handle = match (config, resolved.as_ref()) {
+        (Some(config), Some((resolved_family, resolved_alias, _))) => {
+            let canonical_ref = format!("{resolved_family}.{resolved_alias}");
+            crate::create_model_provider_from_ref(config, &canonical_ref)
+        }
+        _ => crate::create_model_provider_with_url(family, api_key.as_deref(), api_url.as_deref()),
+    };
+
+    let live_models = match handle {
+        Ok(handle) => match crate::ProviderDispatch::from_ref(&*handle)
+            .list_models_with_pricing()
+            .await
+        {
+            Ok(models) => Some(models),
+            Err(error) if configured_profile && model_listing_is_unsupported(&error) => None,
+            Err(error) if configured_profile => {
+                let error = crate::sanitize_api_error(&error.to_string());
+                return Err(anyhow::Error::msg(format!(
+                    "configured provider profile `{model_provider}` catalog failed: {error}"
+                )));
+            }
+            Err(_) => None,
+        },
+        Err(error) if configured_profile => {
+            let error = crate::sanitize_api_error(&error.to_string());
+            return Err(anyhow::Error::msg(format!(
+                "configured provider profile `{model_provider}` could not be constructed: {error}"
+            )));
+        }
+        Err(_) => None,
+    };
+
+    if let Some(models) = live_models {
+        if models.is_empty() && configured_profile {
+            return Ok((Vec::new(), None, true));
+        }
+        if !models.is_empty() {
+            let raw_pricing: std::collections::HashMap<
+                String,
+                zeroclaw_api::model_provider::ModelPricing,
+            > = models
+                .iter()
+                .filter_map(|m| m.pricing.as_ref().map(|p| (m.id.clone(), p.clone())))
+                .collect();
+            let ids = models.into_iter().map(|m| m.id).collect();
+            let Some(ids) = sort_model_catalog_for_chat(family, ids) else {
+                return Ok((Vec::new(), None, false));
+            };
+            let pricing: std::collections::HashMap<
+                String,
+                zeroclaw_api::model_provider::ModelPricing,
+            > = ids
+                .iter()
+                .filter_map(|id| raw_pricing.get(id).map(|p| (id.clone(), p.clone())))
+                .collect();
+            let pricing = if pricing.is_empty() {
+                None
+            } else {
+                Some(pricing)
+            };
+            return Ok((ids, pricing, true));
+        }
+    }
+
+    match list_models_for_family(family).await {
+        Ok(models) if !models.is_empty() => Ok((
+            sort_model_catalog_for_chat(family, models).unwrap_or_default(),
+            None,
+            true,
+        )),
+        _ => Ok((Vec::new(), None, false)),
+    }
+}
+
+#[must_use]
+pub fn model_listing_is_unsupported(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<zeroclaw_api::model_provider::ModelListingUnsupportedError>()
+            .is_some()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `catalog_source_for` must classify every canonical family the
-    /// `for_each_model_provider_slot!` macro emits. Drift catches a new
-    /// slot added to the macro without a matching catalog-table entry —
-    /// `catalog_source_for` would return `None` and the gateway endpoint
-    /// would surface `unknown provider family` for that family.
     #[test]
     fn every_canonical_family_has_a_catalog_table_entry() {
         macro_rules! collect_family_names {
@@ -290,6 +452,16 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn configured_unknown_dotted_profile_fails_before_network() {
+        let config = zeroclaw_config::schema::Config::default();
+        let error = model_catalog_with_config_result(Some(&config), "hailo_ollama.typo")
+            .await
+            .expect_err("unknown dotted profile must fail closed");
+
+        assert!(error.to_string().contains("does not exist"));
+    }
+
     #[test]
     fn unknown_family_returns_none() {
         assert!(catalog_source_for("not_a_real_provider").is_none());
@@ -298,6 +470,13 @@ mod tests {
     #[test]
     fn known_family_with_dual_sources_returns_both() {
         let (md, or) = catalog_source_for("xai").expect("xai is canonical");
+        assert_eq!(md, Some("xai"));
+        assert_eq!(or, Some("x-ai"));
+    }
+
+    #[test]
+    fn grok_cli_family_uses_xai_openrouter_prefix() {
+        let (md, or) = catalog_source_for("grok_cli").expect("grok_cli is registered");
         assert_eq!(md, Some("xai"));
         assert_eq!(or, Some("x-ai"));
     }
@@ -314,6 +493,30 @@ mod tests {
         let (md, or) = catalog_source_for("nearai").expect("nearai is canonical");
         assert_eq!(md, None);
         assert_eq!(or, None);
+    }
+
+    #[test]
+    fn atlascloud_family_uses_provider_catalog_source() {
+        let (md, or) = catalog_source_for("atlascloud").expect("atlascloud is canonical");
+        assert_eq!(md, None);
+        assert_eq!(or, None);
+    }
+
+    #[test]
+    fn parse_openai_models_catalog_trims_filters_sorts_and_dedups() {
+        let raw = r#"{
+            "data": [
+                {"id": " qwen/qwen3.5-flash "},
+                {"id": ""},
+                {"id": "deepseek-ai/deepseek-v4-pro"},
+                {"id": "qwen/qwen3.5-flash"}
+            ]
+        }"#;
+        let ids = parse_openai_models_catalog(raw.as_bytes()).unwrap();
+        assert_eq!(
+            ids,
+            vec!["deepseek-ai/deepseek-v4-pro", "qwen/qwen3.5-flash"]
+        );
     }
 
     #[test]

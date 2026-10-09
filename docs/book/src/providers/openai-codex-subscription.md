@@ -18,7 +18,23 @@ see [Configuration](./configuration.md); for the one-line catalog entry see the
 Codex subscription auth lives on the `openai` slot. Set `wire_api = "responses"`
 to route through `POST /v1/responses` (the Codex backend, not the chat
 completions API) and `requires_openai_auth = true` to pull credentials from
-`~/.codex/auth.json` instead of an `api_key` field:
+ZeroClaw's stored `openai-codex` auth profile instead of an `api_key` field:
+
+```bash
+# Reuse an existing Codex CLI login:
+zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json
+
+# Or start ZeroClaw's own OpenAI Codex login flow:
+zeroclaw auth login --model-provider openai-codex
+```
+
+Quickstart can write the provider entry for you:
+
+```bash
+zeroclaw quickstart --model-provider openai-codex --model gpt-5.4
+```
+
+Manual config uses the same canonical OpenAI slot:
 
 ```toml
 [providers.models.openai.coding]
@@ -35,6 +51,32 @@ requires_openai_auth = true
 There is no `api_key` field; `requires_openai_auth = true` is the switch that
 reads the stored Codex login rather than a key on the entry. See
 [Configuration → OAuth and subscription auth](./configuration.md#oauth-and-subscription-auth).
+
+### Astra on the Codex subscription backend
+
+Treat Astra availability here as a separate backend/account check. The public
+API serves `gpt-6-astra`, but that does not prove that the Codex subscription
+catalog serves the same ID, or any Astra ID, to this account. Query the live
+Codex catalog as described below, then use the exact returned string:
+
+```toml
+[providers.models.openai.astra_subscription]
+model                = "<exact-astra-id-from-codex-catalog>"
+wire_api             = "responses"
+requires_openai_auth = true
+```
+
+Keep `api_key` and `temperature` unset. `requires_openai_auth = true` selects
+the stored Codex login; it is not an alternative spelling for API-key auth.
+Use a reasoning level shared by the current ZeroClaw validator and the selected
+backend, such as `low`, `medium`, `high`, or `xhigh`, and verify it with a real
+request. Follow the [Astra configuration checklist](./configuration.md#openai-astra-setup)
+for the distinct context, output, history, iteration, image-input, and pending
+capability boundaries.
+
+Record this route as verified only after `zeroclaw auth status` succeeds, the
+live catalog contains the configured ID, and an agent request returns output.
+API-key verification and Codex-subscription verification are independent.
 
 The alias half (`coding`, `review`) is operator-chosen; pick whatever fits.
 Reference it from an agent with `model_provider = "openai.coding"`.

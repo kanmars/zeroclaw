@@ -74,12 +74,19 @@ impl NostrChannel {
             .into_iter()
             .map(|p| {
                 if p == "*" {
-                    p
-                } else {
-                    // Best-effort normalize: bech32 npub -> hex. Invalid
-                    // entries fall through as-is and simply won't match.
-                    PublicKey::parse(&p).map_or(p, |pk| pk.to_hex())
+                    return p;
                 }
+                // A deny entry carries its marker through normalization;
+                // stripping it here would turn the deny into a grant, and
+                // leaving the npub unparsed would make it match nothing.
+                let (prefix, key) = match p.strip_prefix(crate::allowlist::DENY_PREFIX) {
+                    Some(key) => ("!", key.to_string()),
+                    None => ("", p.clone()),
+                };
+                // Best-effort normalize: bech32 npub -> hex. Invalid
+                // entries fall through as-is and simply won't match.
+                let key = PublicKey::parse(&key).map_or(key, |pk| pk.to_hex());
+                format!("{prefix}{key}")
             })
             .collect();
         crate::allowlist::is_user_allowed(
@@ -318,6 +325,8 @@ impl Channel for NostrChannel {
                             interruption_scope_id: None,
                             attachments: vec![],
                             subject: None,
+
+                            ..Default::default()
                         };
                         if tx.send(msg).await.is_err() {
                             ::zeroclaw_log::record!(
@@ -354,6 +363,15 @@ impl Channel for NostrChannel {
             .values()
             .any(|r| r.is_connected())
     }
+
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // No typing-indicator concept in any published NIP.
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -373,6 +391,26 @@ mod tests {
         .unwrap();
         let pk = Keys::generate().public_key();
         assert!(!ch.is_pubkey_allowed(&pk));
+    }
+
+    #[tokio::test]
+    async fn deny_written_as_npub_survives_hex_normalization() {
+        // Entries are normalized from bech32 to hex before matching. A deny
+        // marker has to be normalized too, or it never matches the sender's
+        // hex key and the wildcard admits an ignored account.
+        let keys = Keys::generate();
+        let denied = Keys::generate().public_key();
+        let denied_npub = denied.to_bech32().unwrap();
+        let ch = NostrChannel::new(
+            &keys.secret_key().to_secret_hex(),
+            vec![],
+            "nostr_test_alias",
+            Arc::new(move || vec!["*".into(), format!("!{denied_npub}")]),
+        )
+        .await
+        .unwrap();
+        assert!(!ch.is_pubkey_allowed(&denied));
+        assert!(ch.is_pubkey_allowed(&Keys::generate().public_key()));
     }
 
     #[tokio::test]

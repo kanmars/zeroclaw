@@ -3,6 +3,7 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry, is_recent_recall_query}
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,7 +12,6 @@ use uuid::Uuid;
 use zeroclaw_api::session_keys::sanitize_session_key;
 
 /// Qdrant vector database memory backend.
-///
 /// Uses Qdrant's REST API for vector storage and semantic search.
 /// Requires an embedding model_provider for converting text to vectors.
 pub struct QdrantMemory {
@@ -20,19 +20,15 @@ pub struct QdrantMemory {
     base_url: String,
     collection: String,
     api_key: Option<String>,
-    embedder: Arc<dyn EmbeddingProvider>,
+    // Behind an `RwLock` so `config/set` can hot-swap the embedder on a
+    // long-lived handle after a provider-profile change Reads snapshot
+    // the `Arc` and drop the guard before any `.await`.
+    embedder: RwLock<Arc<dyn EmbeddingProvider>>,
     /// Tracks whether collection has been initialized (lazy init for sync factory).
     initialized: OnceCell<()>,
 }
 
 impl QdrantMemory {
-    /// Create a new Qdrant memory backend.
-    ///
-    /// # Arguments
-    /// * `url` - Qdrant server URL (e.g., `"http://localhost:6333"`)
-    /// * `collection` - Collection name for storing memories
-    /// * `api_key` - Optional API key for Qdrant Cloud
-    /// * `embedder` - Embedding model_provider for vector conversion
     pub async fn new(
         alias: &str,
         url: &str,
@@ -44,7 +40,7 @@ impl QdrantMemory {
 
         // Ensure collection exists with correct schema
         mem.ensure_collection().await?;
-        if mem.embedder.dimensions() > 0 {
+        if mem.embedder.read().dimensions() > 0 {
             mem.migrate_session_ids_to_sanitized().await?;
             zeroclaw_config::schema::v2::migrate_qdrant_collection_to_v3(
                 &mem.client,
@@ -60,7 +56,6 @@ impl QdrantMemory {
     }
 
     /// Create a Qdrant memory backend with lazy initialization.
-    ///
     /// Collection will be created on first operation. Use this when calling
     /// from a synchronous context (e.g., the memory factory).
     pub fn new_lazy(
@@ -79,9 +74,23 @@ impl QdrantMemory {
             base_url,
             collection: collection.to_string(),
             api_key,
-            embedder,
+            embedder: RwLock::new(embedder),
             initialized: OnceCell::new(),
         }
+    }
+
+    /// Replace the live embedder in place Existing `Arc<dyn Memory>`
+    /// holders observe the new embedder on their next embed without the handle
+    /// being rebuilt. Shared by the `refresh_embedder` hook and tests.
+    pub(crate) fn swap_embedder(&self, embedder: Arc<dyn EmbeddingProvider>) {
+        *self.embedder.write() = embedder;
+    }
+
+    /// Dimensions of the currently-installed embedder (0 = Noop / no vectors).
+    /// Cheap read-only diagnostic; lets callers confirm a live embedder refresh
+    /// took effect after a `config/set` provider-profile change
+    pub fn embedder_dimensions(&self) -> usize {
+        self.embedder.read().dimensions()
     }
 
     /// Ensure the collection is initialized (called lazily on first operation).
@@ -89,7 +98,7 @@ impl QdrantMemory {
         self.initialized
             .get_or_try_init(|| async {
                 self.ensure_collection().await?;
-                if self.embedder.dimensions() > 0 {
+                if self.embedder.read().dimensions() > 0 {
                     self.migrate_session_ids_to_sanitized().await?;
                     zeroclaw_config::schema::v2::migrate_qdrant_collection_to_v3(
                         &self.client,
@@ -116,11 +125,6 @@ impl QdrantMemory {
         req.header("Content-Type", "application/json")
     }
 
-    /// Scroll all points whose payload `agent_id` is on the supplied
-    /// allowlist, optionally filtered by category and session_id.
-    /// Used by `recall_for_agents`'s recent/time-only branch and the
-    /// embedding-empty fallback so the agent_id check happens at the
-    /// query boundary, not after a broader fetch.
     async fn list_for_agents(
         &self,
         allowed_agent_ids: &[&str],
@@ -153,27 +157,11 @@ impl QdrantMemory {
             "filter": { "must": must_conditions }
         });
 
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/collections/{}/points/scroll", self.collection),
-            )
-            .json(&scroll_body)
-            .send()
-            .await
-            .context("failed to scroll Qdrant for allowed agent set")?;
+        let points = self
+            .scroll_all(scroll_body, "failed to scroll Qdrant for allowed agent set")
+            .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Qdrant scroll failed ({status}): {text}");
-        }
-
-        let result: QdrantScrollResult = resp.json().await?;
-
-        let entries = result
-            .result
-            .points
+        let entries = points
             .into_iter()
             .filter_map(|point| {
                 let payload = point.payload?;
@@ -184,6 +172,7 @@ impl QdrantMemory {
                 };
 
                 Some(MemoryEntry {
+                    principal_id: None,
                     id,
                     key: payload.key,
                     content: payload.content,
@@ -194,6 +183,9 @@ impl QdrantMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -203,8 +195,154 @@ impl QdrantMemory {
         Ok(entries)
     }
 
+    async fn scroll_all(
+        &self,
+        mut scroll_body: serde_json::Value,
+        context: &'static str,
+    ) -> Result<Vec<QdrantPoint>> {
+        let mut points = Vec::new();
+
+        loop {
+            let page = self.scroll_page(&scroll_body, context).await?;
+            points.extend(page.result.points);
+
+            match page.result.next_page_offset {
+                Some(offset) if !offset.is_null() => scroll_body["offset"] = offset,
+                _ => break,
+            }
+        }
+
+        Ok(points)
+    }
+
+    async fn scroll_page(
+        &self,
+        scroll_body: &serde_json::Value,
+        context: &'static str,
+    ) -> Result<QdrantScrollResult> {
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/collections/{}/points/scroll", self.collection),
+            )
+            .json(scroll_body)
+            .send()
+            .await
+            .context(context)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant scroll failed ({status}): {text}");
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    async fn list_limited(
+        &self,
+        allowed_agent_ids: Option<&[&str]>,
+        session_id: Option<&str>,
+        limit: usize,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.ensure_initialized().await?;
+
+        let mut must_conditions: Vec<serde_json::Value> = Vec::new();
+        if let Some(sid) = session_id {
+            must_conditions.push(serde_json::json!({
+                "key": "session_id",
+                "match": { "value": sid }
+            }));
+        }
+        if let Some(agent_ids) = allowed_agent_ids {
+            must_conditions.push(serde_json::json!({
+                "key": "agent_id",
+                "match": { "any": agent_ids }
+            }));
+        }
+
+        let page_limit = limit.min(1000);
+        let mut scroll_body = serde_json::json!({
+            "limit": page_limit,
+            "with_payload": true
+        });
+        if !must_conditions.is_empty() {
+            scroll_body["filter"] = serde_json::json!({ "must": must_conditions });
+        }
+
+        let mut entries = Vec::with_capacity(page_limit);
+        loop {
+            let page = self
+                .scroll_page(&scroll_body, "failed to scroll Qdrant for bounded recall")
+                .await?;
+
+            for point in page.result.points {
+                let Some(payload) = point.payload else {
+                    continue;
+                };
+                let id = match point.id {
+                    serde_json::Value::String(id) => id,
+                    serde_json::Value::Number(id) => id.to_string(),
+                    _ => continue,
+                };
+                let timestamp = payload.timestamp.clone();
+                if since.is_some_and(|value| timestamp.as_str() < value)
+                    || until.is_some_and(|value| timestamp.as_str() > value)
+                {
+                    continue;
+                }
+
+                entries.push(MemoryEntry {
+                    id,
+                    key: payload.key,
+                    content: payload.content,
+                    category: Self::parse_category(&payload.category),
+                    timestamp,
+                    session_id: payload.session_id,
+                    score: None,
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
+                    principal_id: None,
+                    agent_alias: payload.agent_id.clone(),
+                    agent_id: payload.agent_id,
+                });
+
+                if entries.len() >= limit {
+                    return Ok(entries);
+                }
+            }
+
+            match page.result.next_page_offset {
+                Some(offset) if !offset.is_null() => scroll_body["offset"] = offset,
+                _ => return Ok(entries),
+            }
+        }
+    }
+
+    async fn list_for_agents_limited(
+        &self,
+        allowed_agent_ids: &[&str],
+        session_id: Option<&str>,
+        limit: usize,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.list_limited(Some(allowed_agent_ids), session_id, limit, since, until)
+            .await
+    }
+
     async fn ensure_collection(&self) -> Result<()> {
-        let dims = self.embedder.dimensions();
+        let dims = self.embedder.read().dimensions();
         if dims == 0 {
             // Noop embedder — skip vector collection setup
             ::zeroclaw_log::record!(
@@ -279,14 +417,6 @@ impl QdrantMemory {
         Ok(())
     }
 
-    /// One-shot, idempotent normalization of `payload.session_id`.
-    ///
-    /// Mirrors the SQLite-backed migration: rewrite rows that were persisted
-    /// before the orchestrator sanitized session keys at the source so the
-    /// new sanitized recall filter still matches them. Iterates the
-    /// collection with a paginated scroll, gathers distinct `session_id`
-    /// values, and issues one `set payload` per (old → new) pair where the
-    /// sanitized form differs from the stored one.
     async fn migrate_session_ids_to_sanitized(&self) -> Result<()> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut next_offset: Option<serde_json::Value> = None;
@@ -447,6 +577,7 @@ impl QdrantMemory {
                 _ => return None,
             };
             Some(MemoryEntry {
+                principal_id: None,
                 id,
                 key: payload.key,
                 content: payload.content,
@@ -457,6 +588,9 @@ impl QdrantMemory {
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                kind: None,
+                pinned: false,
+                tenant_id: None,
                 agent_alias: payload.agent_id.clone(),
                 agent_id: payload.agent_id,
             })
@@ -544,6 +678,27 @@ impl Memory for QdrantMemory {
         "qdrant"
     }
 
+    fn refresh_embedder(
+        &self,
+        model_provider: &str,
+        api_key: Option<&str>,
+        model: &str,
+        dimensions: usize,
+    ) {
+        // Rebuild from the freshly-resolved settings and swap in place. The
+        // Qdrant collection was created for the old vector dimensions; a
+        // dimension change still needs a manual reindex/collection rebuild, but
+        // the live handle no longer embeds against a stale endpoint/key
+        let embedder: Arc<dyn EmbeddingProvider> =
+            Arc::from(super::embeddings::create_embedding_provider(
+                model_provider,
+                api_key,
+                model,
+                dimensions,
+            ));
+        self.swap_embedder(embedder);
+    }
+
     async fn store(
         &self,
         key: &str,
@@ -564,25 +719,22 @@ impl Memory for QdrantMemory {
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         if is_recent_recall_query(query) {
-            let mut entries = self.list(None, session_id).await?;
-            if let Some(s) = since {
-                entries.retain(|e| e.timestamp.as_str() >= s);
-            }
-            if let Some(u) = until {
-                entries.retain(|e| e.timestamp.as_str() <= u);
-            }
-            entries.truncate(limit);
-            return Ok(entries);
+            return self
+                .list_limited(None, session_id, limit, since, until)
+                .await;
         }
 
         self.ensure_initialized().await?;
 
         // Generate embedding for the query
-        let embedding = self.embedder.embed_one(query).await?;
+        let embedder = self.embedder.read().clone();
+        let embedding = embedder.embed_one(query).await?;
 
         if embedding.is_empty() {
             // Fallback to listing if embeddings aren't available
-            return self.list(None, session_id).await;
+            return self
+                .list_limited(None, session_id, limit, since, until)
+                .await;
         }
 
         // Build filter for session_id if provided
@@ -635,6 +787,7 @@ impl Memory for QdrantMemory {
                 };
 
                 Some(MemoryEntry {
+                    principal_id: None,
                     id,
                     key: payload.key,
                     content: payload.content,
@@ -645,6 +798,9 @@ impl Memory for QdrantMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -704,27 +860,11 @@ impl Memory for QdrantMemory {
             scroll_body["filter"] = serde_json::json!({ "must": must_conditions });
         }
 
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/collections/{}/points/scroll", self.collection),
-            )
-            .json(&scroll_body)
-            .send()
-            .await
-            .context("failed to scroll Qdrant")?;
+        let points = self
+            .scroll_all(scroll_body, "failed to scroll Qdrant")
+            .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Qdrant scroll failed ({status}): {text}");
-        }
-
-        let result: QdrantScrollResult = resp.json().await?;
-
-        let entries = result
-            .result
-            .points
+        let entries = points
             .into_iter()
             .filter_map(|point| {
                 let payload = point.payload?;
@@ -735,6 +875,7 @@ impl Memory for QdrantMemory {
                 };
 
                 Some(MemoryEntry {
+                    principal_id: None,
                     id,
                     key: payload.key,
                     content: payload.content,
@@ -745,6 +886,9 @@ impl Memory for QdrantMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -899,7 +1043,8 @@ impl Memory for QdrantMemory {
         self.ensure_initialized().await?;
 
         let combined_text = format!("{}\n{}", key, content);
-        let embedding = self.embedder.embed_one(&combined_text).await?;
+        let embedder = self.embedder.read().clone();
+        let embedding = embedder.embed_one(&combined_text).await?;
         if embedding.is_empty() {
             anyhow::bail!("Qdrant requires non-zero dimensional embeddings");
         }
@@ -907,11 +1052,6 @@ impl Memory for QdrantMemory {
         let id = Uuid::new_v4().to_string();
         let timestamp = Utc::now().to_rfc3339();
 
-        // Attribute un-scoped writes to the synthesized `default`
-        // agent so cross-agent recall's `must agent_id IN (...)` filter
-        // never sees a payload-less point as globally visible. Qdrant
-        // uses alias verbatim as agent_id (no UUID indirection at the
-        // storage layer; see `Memory::ensure_agent_uuid` default impl).
         let resolved_agent_id = agent_id.unwrap_or("default").to_string();
         let payload = MemoryPayload {
             key: key.to_string(),
@@ -922,10 +1062,6 @@ impl Memory for QdrantMemory {
             agent_id: Some(resolved_agent_id.clone()),
         };
 
-        // Pre-upsert cleanup must scope to the writing agent so sibling
-        // points under the same key for other agents survive.
-        // Propagate failures so a cleanup error doesn't leave duplicate
-        // (agent_id, key) points after the upsert lands.
         self.delete_points_matching(&[("key", key), ("agent_id", resolved_agent_id.as_str())])
             .await
             .context("qdrant pre-upsert cleanup failed")?;
@@ -976,37 +1112,23 @@ impl Memory for QdrantMemory {
         // Recent/time-only branch: scroll with a payload `must` filter
         // on `agent_id` so unattributed points never reach the caller.
         if is_recent_recall_query(query) {
-            let mut entries = self
-                .list_for_agents(allowed_agent_ids, None, session_id)
-                .await?;
-            if let Some(s) = since {
-                entries.retain(|e| e.timestamp.as_str() >= s);
-            }
-            if let Some(u) = until {
-                entries.retain(|e| e.timestamp.as_str() <= u);
-            }
-            entries.truncate(limit);
-            return Ok(entries);
+            return self
+                .list_for_agents_limited(allowed_agent_ids, session_id, limit, since, until)
+                .await;
         }
 
         self.ensure_initialized().await?;
 
-        let embedding = self.embedder.embed_one(query).await?;
+        let embedder = self.embedder.read().clone();
+        let embedding = embedder.embed_one(query).await?;
         if embedding.is_empty() {
             // No embedding available: fall back to listing under the
             // allowlist. Same surface as `recall`'s fallback.
             return self
-                .list_for_agents(allowed_agent_ids, None, session_id)
+                .list_for_agents_limited(allowed_agent_ids, session_id, limit, since, until)
                 .await;
         }
 
-        // Build a `must` filter that combines the optional session_id
-        // with the agent_id allowlist. The agent_id filter lives in
-        // the search call, not in a post-fetch scroll: legacy points
-        // whose payload lacks `agent_id` are simply not returned (the
-        // V3 store path attributes everything to `default` if no agent
-        // is in scope, so no payload should be agent_id-less after
-        // upgrade).
         let mut must: Vec<serde_json::Value> = Vec::new();
         if let Some(sid) = session_id {
             must.push(serde_json::json!({
@@ -1056,6 +1178,7 @@ impl Memory for QdrantMemory {
                 };
 
                 Some(MemoryEntry {
+                    principal_id: None,
                     id,
                     key: payload.key,
                     content: payload.content,
@@ -1066,6 +1189,9 @@ impl Memory for QdrantMemory {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: payload.agent_id.clone(),
                     agent_id: payload.agent_id,
                 })
@@ -1094,6 +1220,223 @@ impl ::zeroclaw_api::attribution::Attributable for QdrantMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EmptyVectorEmbedding;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for EmptyVectorEmbedding {
+        fn name(&self) -> &str {
+            "empty"
+        }
+
+        fn dimensions(&self) -> usize {
+            0
+        }
+
+        async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![Vec::new()])
+        }
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(
+                read > 0,
+                "Qdrant fixture closed before the request body arrived"
+            );
+            request.extend_from_slice(&buffer[..read]);
+
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            if request.len() >= header_end + 4 + content_length {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    fn qdrant_fixture_point(id: usize) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "payload": {
+                "key": format!("key-{id}"),
+                "content": format!("content-{id}"),
+                "category": "daily",
+                "timestamp": "2026-08-25T00:00:00Z",
+                "agent_id": "alpha"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn list_operations_follow_qdrant_scroll_continuation() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for request_index in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = request.split_once("\r\n\r\n").unwrap().1;
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+
+                assert_eq!(
+                    body["filter"]["must"].as_array().is_some_and(|must| {
+                        must.iter().any(|condition| condition["key"] == "agent_id")
+                    }),
+                    request_index < 2,
+                    "scoped and unscoped list requests must keep their filters"
+                );
+                let expected_offset = (request_index % 2 == 1).then(|| serde_json::json!(1000));
+                assert_eq!(
+                    body.get("offset"),
+                    expected_offset.as_ref(),
+                    "the second page must carry Qdrant's continuation offset"
+                );
+
+                let points: Vec<_> = if request_index % 2 == 0 {
+                    (0..1000).map(qdrant_fixture_point).collect()
+                } else {
+                    vec![qdrant_fixture_point(1000)]
+                };
+                let next_page_offset = if request_index % 2 == 0 {
+                    serde_json::json!(1000)
+                } else {
+                    serde_json::Value::Null
+                };
+                let response_body = serde_json::json!({
+                    "result": {
+                        "points": points,
+                        "next_page_offset": next_page_offset
+                    }
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+            }
+        });
+
+        let mem = QdrantMemory::new_lazy(
+            "test",
+            &endpoint,
+            "mem",
+            None,
+            Arc::new(super::super::embeddings::NoopEmbedding),
+        );
+        let scoped = mem.list_for_agents(&["alpha"], None, None).await.unwrap();
+        let unscoped = Memory::list(&mem, None, None).await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(scoped.len(), 1001);
+        assert_eq!(unscoped.len(), 1001);
+    }
+
+    #[tokio::test]
+    async fn scoped_recent_and_fallback_recall_do_not_follow_pages_after_limit() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = request.split_once("\r\n\r\n").unwrap().1;
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+
+                assert_eq!(body["limit"], 2);
+                assert!(body["filter"]["must"].as_array().is_some_and(|must| {
+                    must.iter().any(|condition| condition["key"] == "agent_id")
+                }));
+
+                let response_body = serde_json::json!({
+                    "result": {
+                        "points": [qdrant_fixture_point(0), qdrant_fixture_point(1)],
+                        "next_page_offset": 2
+                    }
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+            }
+        });
+
+        let mem = QdrantMemory::new_lazy(
+            "test",
+            &endpoint,
+            "mem",
+            None,
+            Arc::new(EmptyVectorEmbedding),
+        );
+        let recent = Memory::recall_for_agents(&mem, &["alpha"], "", 2, None, None, None)
+            .await
+            .unwrap();
+        let fallback = Memory::recall_for_agents(&mem, &["alpha"], "keyword", 2, None, None, None)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(recent.len(), 2);
+        assert_eq!(fallback.len(), 2);
+    }
+
+    #[test]
+    fn refresh_embedder_swaps_embedder_in_place() {
+        let mem = QdrantMemory::new_lazy(
+            "test",
+            "http://localhost:6333",
+            "mem",
+            None,
+            Arc::new(super::super::embeddings::NoopEmbedding), // dims 0
+        );
+        assert_eq!(mem.embedder_dimensions(), 0);
+
+        Memory::refresh_embedder(
+            &mem,
+            "openai",
+            Some("sk-test"),
+            "text-embedding-3-small",
+            1536,
+        );
+
+        assert_eq!(
+            mem.embedder_dimensions(),
+            1536,
+            "refresh_embedder must install the resolved provider's embedder"
+        );
+    }
 
     #[test]
     fn category_to_str_maps_known_categories() {

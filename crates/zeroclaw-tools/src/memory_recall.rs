@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_memory::Memory;
 
 /// Let the agent search its own memory
@@ -66,7 +66,7 @@ impl Tool for MemoryRecallTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid 'since' date: {s}. Expected RFC 3339 format, e.g. 2025-03-01T00:00:00Z"
                 )),
@@ -77,7 +77,7 @@ impl Tool for MemoryRecallTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Invalid 'until' date: {u}. Expected RFC 3339 format, e.g. 2025-03-01T00:00:00Z"
                 )),
@@ -92,7 +92,7 @@ impl Tool for MemoryRecallTool {
         {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("'since' must be before 'until'".into()),
             });
         }
@@ -123,13 +123,13 @@ impl Tool for MemoryRecallTool {
                 }
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: output.into(),
                     error: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!("Memory recall failed: {e}")),
             }),
         }
@@ -180,6 +180,7 @@ mod tests {
             *self.last_query.lock().unwrap() = Some(query.to_string());
             if is_recent_recall_query(query) {
                 Ok(vec![MemoryEntry {
+                    principal_id: None,
                     id: "recent".into(),
                     key: "recent".into(),
                     content: "recent memory".into(),
@@ -190,6 +191,9 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
                     agent_alias: None,
                     agent_id: None,
                 }])

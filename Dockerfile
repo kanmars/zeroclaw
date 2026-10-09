@@ -1,22 +1,26 @@
 # syntax=docker/dockerfile:1.7-labs
 
 # >>> generated:base-arg-node from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:c2d5ade763cacfb03fe9cb8e8af5d1be5041ff331921fa26a9b231ca3a4f780a
+ARG ZEROCLAW_BASE_NODE=node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e
 # >>> end generated:base-arg-node <<<
 # >>> generated:base-arg-rust-slim from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_RUST_SLIM=rust:1.94-slim@sha256:cf09adf8c3ebaba10779e5c23ff7fe4df4cccdab8a91f199b0c142c53fef3e1a
+ARG ZEROCLAW_BASE_RUST_SLIM=rust:1.98-slim@sha256:17d1ba895198f9934c6314ec5346a0d5115372f3243390c3d731e242f35c2f27
 # >>> end generated:base-arg-rust-slim <<<
 # >>> generated:base-arg-debian from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_DEBIAN=debian:trixie-slim@sha256:4e401d95de7083948053197a9c3913343cd06b706bf15eb6a0c3ccd26f436a0e
+ARG ZEROCLAW_BASE_DEBIAN=debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 # >>> end generated:base-arg-debian <<<
 # >>> generated:base-arg-distroless from dev/ci/container-base-images.toml by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:d3cda6e91129130d7229a1806b6a73d292ef245ab032da7851907798024cefba
+ARG ZEROCLAW_BASE_DISTROLESS=gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0bfe12a01eb546e8df2282f1c8f682b606c
 # >>> end generated:base-arg-distroless <<<
 
 # ── Stage 0: Frontend build ─────────────────────────────────────
-FROM ${ZEROCLAW_BASE_NODE} AS web-node
+# The web dashboard bundle is architecture-independent (JS/WASM), so the
+# frontend tooling stages are pinned to the native build platform. On a
+# multi-platform (`--platform linux/amd64,linux/arm64`) build this keeps node
+# and `cargo web build` running natively instead of under QEMU emulation.
+FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_NODE} AS web-node
 
-FROM ${ZEROCLAW_BASE_RUST_SLIM} AS web-builder
+FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_RUST_SLIM} AS web-builder
 WORKDIR /app
 COPY --from=web-node /usr/local/bin/node /usr/local/bin/node
 COPY --from=web-node /usr/local/lib/node_modules /usr/local/lib/node_modules
@@ -40,29 +44,64 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     cargo web build
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM ${ZEROCLAW_BASE_RUST_SLIM} AS builder
+# Pinned to the native build platform; the Rust toolchain runs on the host arch
+# (amd64 on the GitHub-hosted runners) and cross-compiles to $TARGETARCH so
+# rustc never runs under QEMU. TARGETARCH is injected by BuildKit per target
+# platform (`amd64`/`arm64`).
+FROM --platform=$BUILDPLATFORM ${ZEROCLAW_BASE_RUST_SLIM} AS builder
 
 WORKDIR /app
+ARG TARGETARCH
 # >>> generated:docker-features-arg by `cargo generate installers` - do not edit <<<
-ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-amqp,channel-bluesky,channel-clawdtalk,channel-dingtalk,channel-discord,channel-email,channel-imessage,channel-irc,channel-lark,channel-linq,channel-mattermost,channel-mochat,channel-mqtt,channel-nextcloud,channel-notion,channel-qq,channel-reddit,channel-signal,channel-slack,channel-telegram,channel-twitch,channel-twitter,channel-voice-call,channel-wati,channel-webhook,channel-wecom,channel-wecom-ws,channel-whatsapp-cloud,gateway,observability-prometheus,schema-export"
+ARG ZEROCLAW_CARGO_FLAGS="--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
 # >>> end generated:docker-features-arg <<<
+
+# No `.git` in the build context (`.dockerignore`); the commit is passed in here.
+ARG ZEROCLAW_BUILD_ID=""
+ENV ZEROCLAW_BUILD_ID=${ZEROCLAW_BUILD_ID}
 
 # Install build dependencies. g++ is required by inkjet (zerocode's syntax
 # highlighter) to compile its tree-sitter grammars; the slim base ships cc but
-# not a C++ compiler.
+# not a C++ compiler. For arm64 cross-builds, also install the aarch64 GNU
+# cross toolchain (C and C++, for cc-crate-built C/C++ deps such as inkjet's
+# grammars), the arm64 libc dev files, and the Rust target.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && apt-get install -y \
         pkg-config \
         g++ \
+    && if [ "$TARGETARCH" = "arm64" ]; then \
+        dpkg --add-architecture arm64 && apt-get update && apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+        && rustup target add aarch64-unknown-linux-gnu; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
+# The optional WASM plugin host generates bindings from the repository-owned
+# WIT contract during compilation. Keep this before the dependency prefetch so
+# plugin-enabled builds have the same ABI input in both builder invocations.
+COPY wit/ wit/
 # Copy every workspace-member manifest in one glob — adding or removing a crate
 # no longer requires editing this file.  --parents preserves the
 # crates/<name>/Cargo.toml directory structure.
 COPY --parents crates/*/Cargo.toml ./
+# zeroclaw-macros is a proc-macro crate, compiled for the host even on a cross
+# build. If only a stub lib.rs is present during the pre-fetch, its host-cached
+# artifact is reused in the real build under the target-triple dir, leaving
+# `zeroclaw_macros::Configurable` unresolved. Copy its real source now so the
+# proc-macro is built from the genuine implementation during the pre-fetch.
+COPY --parents crates/zeroclaw-macros/src/ ./
+# Nested workspace members (test fixture crates) are not matched by the
+# single-level crates/*/Cargo.toml glob above, so match them with their own
+# glob to keep workspace manifest parsing intact during the pre-fetch. A glob
+# rather than explicit paths means adding a fixture member does not require
+# editing this file — cargo fails the workspace load if any member manifest is
+# missing, and every such member lives at crates/*/tests/fixtures/*/.
+COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # apps/zerocode: TUI app not shipped in the server image; copy only its manifest
@@ -70,6 +109,9 @@ COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # below. Its real build.rs reads web/src/contexts/themes.json and would panic in
 # this pre-fetch stage, so it is stubbed exactly like apps/tauri.
 COPY apps/zerocode/Cargo.toml apps/zerocode/Cargo.toml
+# apps/zerorelay: workspace member with lib+bin targets; not shipped in the
+# server image, but Cargo must be able to load its manifest during pre-fetch.
+COPY apps/zerorelay/Cargo.toml apps/zerorelay/Cargo.toml
 # tools/fill-translations and xtask are dev/build tools; copy manifests only so
 # Cargo can resolve the workspace, then stub their entry points so the
 # dependency pre-fetch step succeeds without building them into the image.
@@ -79,7 +121,7 @@ COPY xtask/Cargo.toml xtask/Cargo.toml
 # `src/bin/zeroclaw-acp-bridge.rs` is required because the `acp-bridge` feature
 # is in the root crate's default set; cargo selects the bin target during the
 # pre-fetch build even with only the workspace lib stubbed.
-RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-translations/src xtask/src/bin \
+RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src apps/zerorelay/src tools/fill-translations/src xtask/src/bin \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > src/bin/zeroclaw-acp-bridge.rs \
@@ -88,6 +130,8 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && echo "fn main() {}" > apps/tauri/build.rs \
     && echo "fn main() {}" > apps/zerocode/src/main.rs \
     && echo "fn main() {}" > apps/zerocode/build.rs \
+    && echo "fn main() {}" > apps/zerorelay/src/main.rs \
+    && echo "" > apps/zerorelay/src/lib.rs \
     && echo "fn main() {}" > tools/fill-translations/src/main.rs \
     && echo "" > xtask/src/lib.rs \
     && echo "fn main() {}" > xtask/src/bin/mdbook.rs \
@@ -95,14 +139,26 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && echo "fn main() {}" > xtask/src/bin/web.rs \
     && mkdir -p crates/zeroclaw-hardware/examples \
     && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
-    && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done
+    && for d in crates/*/; do [ "$d" = "crates/zeroclaw-macros/" ] && continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
+    && for d in crates/*/tests/fixtures/*/; do [ -f "${d}Cargo.toml" ] || continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
+    && printf 'fn main() {}' > crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      export RUST_TARGET=aarch64-unknown-linux-gnu \
+             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+             CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+             CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+             PKG_CONFIG_ALLOW_CROSS=1 \
+             PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      export RUST_TARGET=x86_64-unknown-linux-gnu; \
+    fi && \
+    if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+    else \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
     fi
 RUN rm -rf src benches crates xtask tools/fill-translations
 
@@ -121,30 +177,47 @@ COPY web/src/ web/src/
 COPY locales.toml .
 COPY *.rs .
 RUN touch src/main.rs apps/zerocode/src/main.rs
+# Bust the stubbed workspace crates so the real sources rebuild. zerocode is
+# purged from BOTH the target tree and the host tree (target/release/): with
+# --target, build scripts compile in the host tree, so its real build.rs (which
+# generates theme_presets.rs into OUT_DIR) must replace the no-op stub compiled
+# during the dependency pre-fetch, otherwise the include! finds no file.
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    rm -rf target/release/.fingerprint/zeroclawlabs-* \
-           target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* \
-           target/release/.fingerprint/zeroclaw-* \
-           target/release/deps/zeroclaw_* \
-           target/release/incremental/zeroclaw_* \
-           target/release/.fingerprint/xtask-* \
-           target/release/deps/xtask-* \
-           target/release/.fingerprint/fill-translations-* \
-           target/release/deps/fill_translations-* \
-           target/release/.fingerprint/zerocode-* \
-           target/release/deps/zerocode-* \
-           target/release/incremental/zerocode-* && \
-    if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      export RUST_TARGET=aarch64-unknown-linux-gnu STRIP=aarch64-linux-gnu-strip \
+             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+             CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+             CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+             PKG_CONFIG_ALLOW_CROSS=1 \
+             PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      export RUST_TARGET=x86_64-unknown-linux-gnu STRIP=strip; \
     fi && \
-    cp target/release/zeroclaw /app/zeroclaw && \
-    cp target/release/zerocode /app/zerocode && \
-    strip /app/zeroclaw /app/zerocode
+    rm -rf target/"$RUST_TARGET"/release/.fingerprint/zeroclaw-* \
+           target/"$RUST_TARGET"/release/deps/zeroclaw-* \
+           target/"$RUST_TARGET"/release/incremental/zeroclaw-* \
+           target/"$RUST_TARGET"/release/deps/zeroclaw_* \
+           target/"$RUST_TARGET"/release/incremental/zeroclaw_* \
+           target/"$RUST_TARGET"/release/.fingerprint/xtask-* \
+           target/"$RUST_TARGET"/release/deps/xtask-* \
+           target/"$RUST_TARGET"/release/.fingerprint/fill-translations-* \
+           target/"$RUST_TARGET"/release/deps/fill_translations-* \
+           target/"$RUST_TARGET"/release/.fingerprint/zerocode-* \
+           target/"$RUST_TARGET"/release/deps/zerocode-* \
+           target/"$RUST_TARGET"/release/incremental/zerocode-* \
+           target/"$RUST_TARGET"/release/build/zerocode-* \
+           target/release/.fingerprint/zerocode-* \
+           target/release/build/zerocode-* && \
+    if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+    else \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
+    fi && \
+    cp target/"$RUST_TARGET"/release/zeroclaw /app/zeroclaw && \
+    cp target/"$RUST_TARGET"/release/zerocode /app/zerocode && \
+    "$STRIP" /app/zeroclaw /app/zerocode
 RUN for b in zeroclaw zerocode; do \
       size=$(stat -c%s "/app/$b") && \
       if [ "$size" -lt 1000000 ]; then echo "ERROR: $b too small (${size} bytes), likely dummy build artifact" && exit 1; fi; \

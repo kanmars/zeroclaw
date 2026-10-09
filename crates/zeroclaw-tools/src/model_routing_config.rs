@@ -4,9 +4,9 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
-use zeroclaw_config::schema::{ClassificationRule, Config, ModelRouteConfig};
+use zeroclaw_config::schema::{ClassificationRule, Config, DelegateTargetConfig, ModelRouteConfig};
 use zeroclaw_providers::ProviderDispatch;
 
 const DEFAULT_AGENT_MAX_DEPTH: u32 = 3;
@@ -59,6 +59,9 @@ impl ModelRoutingConfigTool {
             })?;
         parsed.config_path = self.config.config_path.clone();
         parsed.data_dir = self.config.data_dir.clone();
+        // This value was parsed from the file at `config_path`; it holds
+        // save-over provenance for the guard in `Config::save`.
+        parsed.loaded_from = Some(parsed.config_path.clone());
         Ok(parsed)
     }
 
@@ -66,7 +69,7 @@ impl ModelRoutingConfigTool {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: autonomy is read-only".into()),
             });
         }
@@ -74,7 +77,7 @@ impl ModelRoutingConfigTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Action blocked: rate limit exceeded".into()),
             });
         }
@@ -116,6 +119,56 @@ impl ModelRoutingConfigTool {
         anyhow::bail!("'{field}' must be a string or string[]")
     }
 
+    fn parse_delegate_targets(
+        raw: &Value,
+        field: &str,
+    ) -> anyhow::Result<Vec<DelegateTargetConfig>> {
+        // Keep the config-editing tool as permissive as the schema loader:
+        // operators may pass a comma-separated legacy string, a string array,
+        // or object entries with explicit mode. The stored config still uses
+        // `DelegateTargetConfig`, so mode semantics are not reimplemented here.
+        if let Some(raw_string) = raw.as_str() {
+            return Ok(raw_string
+                .split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(DelegateTargetConfig::bounded)
+                .collect());
+        }
+
+        if let Some(array) = raw.as_array() {
+            let mut out = Vec::new();
+            for item in array {
+                let mut target: DelegateTargetConfig =
+                    serde_json::from_value(item.clone()).map_err(|error| {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "field": field,
+                                "error": format!("{}", error),
+                            })),
+                            "model_routing_config: delegate target element has invalid shape"
+                        );
+                        anyhow::Error::msg(format!(
+                            "'{field}' array must contain strings or objects with agent/mode: {error}"
+                        ))
+                    })?;
+                target.agent = target.agent.trim().to_string();
+                if !target.agent.is_empty() {
+                    out.push(target);
+                }
+            }
+            return Ok(out);
+        }
+
+        anyhow::bail!("'{field}' must be a string, string[], or delegate target object[]")
+    }
+
     fn parse_non_empty_string(args: &Value, field: &str) -> anyhow::Result<String> {
         let value = args
             .get(field)
@@ -137,6 +190,20 @@ impl ModelRoutingConfigTool {
         }
 
         Ok(value.to_string())
+    }
+
+    fn reject_unknown_model_provider_family(family: &str, name: &str) -> anyhow::Result<()> {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "model_provider_family": family,
+                    "name": name,
+                })),
+            "model_routing_config: unknown model_provider family"
+        );
+        anyhow::bail!("unknown model_provider type `{family}`. no typed slot in ModelProviders")
     }
 
     fn parse_optional_string_update(args: &Value, field: &str) -> anyhow::Result<MaybeSet<String>> {
@@ -375,6 +442,7 @@ impl ModelRoutingConfigTool {
                     "max_delegation_depth": runtime.map(|r| r.max_delegation_depth),
                     "agentic": runtime.map(|r| r.agentic),
                     "allowed_tools": risk.map(|r| &r.allowed_tools),
+                    "deny_all_tools": risk.map(|r| r.deny_all_tools),
                     "max_tool_iterations": runtime.map(|r| r.max_tool_iterations),
                     "delegate_same_risk_profile": agent.delegate_same_risk_profile,
                     "delegates": agent.delegates,
@@ -424,7 +492,7 @@ impl ModelRoutingConfigTool {
         let cfg = self.load_config_without_env()?;
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?,
+            output: serde_json::to_string_pretty(&Self::snapshot(&cfg))?.into(),
             error: None,
         })
     }
@@ -469,7 +537,8 @@ impl ModelRoutingConfigTool {
                         "priority": 50
                     }
                 }
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -569,11 +638,6 @@ impl ModelRoutingConfigTool {
                     .unwrap_or("(none)")
                     .to_string();
 
-                // Rollback: restore the previous entry's baseline fields for
-                // this type.alias slot. Family-specific extras on the typed
-                // family config are NOT touched — they survive the modify+
-                // restore cycle because we only ever mutated baseline fields
-                // (model, temperature, api_key) above.
                 if let Some(prev_entry) = previous_provider_entry
                     && let Some(slot) = cfg.providers.models.ensure(&type_k, &alias_k)
                 {
@@ -585,7 +649,7 @@ impl ModelRoutingConfigTool {
                     success: false,
                     output: format!(
                         "Model '{model_name}' is not available: {probe_err}. Reverted to '{reverted_model}'.",
-                    ),
+                    ).into(),
                     error: None,
                 });
             }
@@ -599,7 +663,8 @@ impl ModelRoutingConfigTool {
             output: serde_json::to_string_pretty(&json!({
                 "message": "Default model_provider/model settings updated",
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -771,7 +836,8 @@ impl ModelRoutingConfigTool {
                 "message": "Scenario route upserted",
                 "hint": hint,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -816,7 +882,8 @@ impl ModelRoutingConfigTool {
                 "routes_removed": routes_removed,
                 "classification_rules_removed": rules_removed,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -824,67 +891,123 @@ impl ModelRoutingConfigTool {
     async fn handle_upsert_agent(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let name = Self::parse_non_empty_string(args, "name")?;
         let model_provider = Self::parse_non_empty_string(args, "model_provider")?;
-        let model = Self::parse_non_empty_string(args, "model")?;
-
-        let api_key_update = Self::parse_optional_string_update(args, "api_key")?;
-        let temperature_update = Self::parse_optional_f64_update(args, "temperature")?;
+        let provider_ref_parts = model_provider.split_once('.');
+        let model = if provider_ref_parts.is_some() {
+            if args.get("model").is_some() {
+                anyhow::bail!(
+                    "'model' cannot be supplied when reusing a configured model provider ref"
+                );
+            }
+            None
+        } else {
+            Some(Self::parse_non_empty_string(args, "model")?)
+        };
+        let api_key_update = if provider_ref_parts.is_some() {
+            if args.get("api_key").is_some() {
+                anyhow::bail!(
+                    "'api_key' cannot be supplied when reusing a configured model provider ref"
+                );
+            }
+            MaybeSet::Unset
+        } else {
+            Self::parse_optional_string_update(args, "api_key")?
+        };
+        let temperature_update = if provider_ref_parts.is_some() {
+            if args.get("temperature").is_some() {
+                anyhow::bail!(
+                    "'temperature' cannot be supplied when reusing a configured model provider ref"
+                );
+            }
+            MaybeSet::Unset
+        } else {
+            Self::parse_optional_f64_update(args, "temperature")?
+        };
         let max_depth_update = Self::parse_optional_u32_update(args, "max_depth")?;
         let max_iterations_update = Self::parse_optional_usize_update(args, "max_iterations")?;
         let agentic_update = Self::parse_optional_bool(args, "agentic")?;
 
-        let allowed_tools_update = if let Some(raw) = args.get("allowed_tools") {
-            Some(Self::parse_string_list(raw, "allowed_tools")?)
-        } else {
-            None
+        let allowed_tools_update = match args.get("allowed_tools") {
+            None => MaybeSet::Unset,
+            Some(raw) if raw.is_null() => MaybeSet::Null,
+            Some(raw) => MaybeSet::Set(Self::parse_string_list(raw, "allowed_tools")?),
         };
+
+        let deny_all_tools_update = Self::parse_optional_bool(args, "deny_all_tools")?;
+        if deny_all_tools_update == Some(true)
+            && let MaybeSet::Set(tools) = &allowed_tools_update
+            && !tools.is_empty()
+        {
+            anyhow::bail!(
+                "'deny_all_tools' cannot be combined with a non-empty 'allowed_tools' list: deny_all_tools denies every tool, while allowed_tools = [] alone means unrestricted"
+            );
+        }
 
         let delegate_same_risk_profile_update =
             Self::parse_optional_bool(args, "delegate_same_risk_profile")?;
         let delegates_update = if let Some(raw) = args.get("delegates") {
-            Some(Self::parse_string_list(raw, "delegates")?)
+            Some(Self::parse_delegate_targets(raw, "delegates")?)
         } else {
             None
         };
 
         let mut cfg = self.load_config_without_env()?;
 
-        // synthesize providers.models[model_provider_family][name] from inline brain params.
-        // The arg is the family name (e.g. "openai"); the agent's `model_provider`
-        // reference becomes the dotted form (e.g. "openai.coder").
-        let model_provider_family = model_provider;
-        let agent_model_provider_ref = format!("{model_provider_family}.{name}");
+        // Validate the provider route before mutating any provider, profile, or agent state.
+        let agent_model_provider_ref = if let Some((family, alias)) = provider_ref_parts {
+            if !zeroclaw_config::providers::ModelProviders::slot_names().contains(&family) {
+                Self::reject_unknown_model_provider_family(family, &name)?;
+            }
+            if cfg.providers.models.find(family, alias).is_none() {
+                anyhow::bail!(
+                    "model_provider ref `{model_provider}` is not configured in ModelProviders"
+                );
+            }
+            model_provider.clone()
+        } else {
+            if !zeroclaw_config::providers::ModelProviders::slot_names()
+                .contains(&model_provider.as_str())
+            {
+                Self::reject_unknown_model_provider_family(&model_provider, &name)?;
+            }
+            format!("{model_provider}.{name}")
+        };
+
+        // Validate all bounded updates before mutating the loaded config.
+        if let MaybeSet::Set(value) = temperature_update
+            && !(0.0..=2.0).contains(&value)
         {
-            let provider_entry =
-                cfg.providers.models
-                    .ensure(&model_provider_family, &name)
-                    .ok_or_else(|| {
-                        ::zeroclaw_log::record!(
-                            ERROR,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "model_provider_family": &model_provider_family,
-                                    "name": &name,
-                                })),
-                            "model_routing_config: unknown model_provider family"
-                        );
-                        anyhow::Error::msg(format!(
-                            "unknown model_provider type `{model_provider_family}`. no typed slot in ModelProviders"
-                        ))
-                    })?;
-            provider_entry.model = Some(model.clone());
+            anyhow::bail!("'temperature' must be between 0.0 and 2.0");
+        }
+        if let MaybeSet::Set(iters) = max_iterations_update
+            && iters == 0
+        {
+            anyhow::bail!("'max_iterations' must be greater than 0");
+        }
+        if let MaybeSet::Set(depth) = max_depth_update
+            && depth == 0
+        {
+            anyhow::bail!("'max_depth' must be greater than 0");
+        }
+
+        // Bare families synthesize providers.models[family][agent] from inline params.
+        if let Some(model) = model {
+            let provider_entry = cfg
+                .providers
+                .models
+                .ensure(&model_provider, &name)
+                .ok_or_else(|| {
+                    anyhow::Error::msg(format!(
+                        "unknown model_provider type `{model_provider}`. no typed slot in ModelProviders"
+                    ))
+                })?;
+            provider_entry.model = Some(model);
             match api_key_update {
                 MaybeSet::Set(ref v) => provider_entry.api_key = Some(v.clone()),
                 MaybeSet::Null => provider_entry.api_key = None,
                 MaybeSet::Unset => {}
             }
             match temperature_update {
-                MaybeSet::Set(value) => {
-                    if !(0.0..=2.0).contains(&value) {
-                        anyhow::bail!("'temperature' must be between 0.0 and 2.0");
-                    }
-                    provider_entry.temperature = Some(value);
-                }
+                MaybeSet::Set(value) => provider_entry.temperature = Some(value),
                 MaybeSet::Null => provider_entry.temperature = None,
                 MaybeSet::Unset => {}
             }
@@ -893,8 +1016,25 @@ impl ModelRoutingConfigTool {
         // synthesize risk_profiles[name] from allowed_tools (authorization).
         {
             let risk = cfg.risk_profiles.entry(name.clone()).or_default();
-            if let Some(tools) = allowed_tools_update {
-                risk.allowed_tools = tools;
+            match &allowed_tools_update {
+                // `null` and `[]` are both the legacy unrestricted state; a
+                // non-empty list is the explicit allowlist and clears the
+                // deny-all flag (the combination is rejected above).
+                MaybeSet::Set(tools) => {
+                    risk.allowed_tools = tools.clone();
+                    risk.deny_all_tools = false;
+                }
+                MaybeSet::Null => {
+                    risk.allowed_tools = Vec::new();
+                    risk.deny_all_tools = false;
+                }
+                MaybeSet::Unset => {}
+            }
+            if let Some(deny_all) = deny_all_tools_update {
+                risk.deny_all_tools = deny_all;
+                if deny_all {
+                    risk.allowed_tools = Vec::new();
+                }
             }
         }
 
@@ -905,17 +1045,11 @@ impl ModelRoutingConfigTool {
                 runtime.agentic = agentic;
             }
             if let MaybeSet::Set(iters) = max_iterations_update {
-                if iters == 0 {
-                    anyhow::bail!("'max_iterations' must be greater than 0");
-                }
                 runtime.max_tool_iterations = iters;
             } else if runtime.max_tool_iterations == 0 {
                 runtime.max_tool_iterations = DEFAULT_AGENT_MAX_ITERATIONS;
             }
             if let MaybeSet::Set(depth) = max_depth_update {
-                if depth == 0 {
-                    anyhow::bail!("'max_depth' must be greater than 0");
-                }
                 runtime.max_delegation_depth = depth;
             } else if runtime.max_delegation_depth == 0 {
                 runtime.max_delegation_depth = DEFAULT_AGENT_MAX_DEPTH;
@@ -942,7 +1076,8 @@ impl ModelRoutingConfigTool {
                 "message": "Delegate agent upserted",
                 "name": name,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -963,7 +1098,8 @@ impl ModelRoutingConfigTool {
                 "message": "Aliased agent removed",
                 "name": name,
                 "config": Self::snapshot(&cfg),
-            }))?,
+            }))?
+            .into(),
             error: None,
         })
     }
@@ -980,6 +1116,33 @@ impl Tool for ModelRoutingConfigTool {
     }
 
     fn parameters_schema(&self) -> Value {
+        let delegates_schema = json!({
+            "description": "Explicit delegate roster. Accepts a comma-separated string, string array, or objects with {agent, mode}; mode is bounded or independent.",
+            "oneOf": [
+                {"type": "string"},
+                {
+                    "type": "array",
+                    "items": {
+                        "oneOf": [
+                            {"type": "string"},
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["agent"],
+                                "properties": {
+                                    "agent": {"type": "string", "minLength": 1},
+                                    "mode": {
+                                        "type": "string",
+                                        "enum": ["bounded", "independent"],
+                                        "default": "bounded"
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
         json!({
             "type": "object",
             "properties": {
@@ -1006,7 +1169,7 @@ impl Tool for ModelRoutingConfigTool {
                 },
                 "model": {
                     "type": "string",
-                    "description": "Model for set_default/upsert_scenario/upsert_agent"
+                    "description": "Model for set_default/upsert_scenario or bare-family upsert_agent; omitted when upsert_agent reuses an existing dotted provider ref"
                 },
                 "temperature": {
                     "type": ["number", "null"],
@@ -1066,11 +1229,16 @@ impl Tool for ModelRoutingConfigTool {
                     "description": "Enable tool-call loop mode for aliased agent"
                 },
                 "allowed_tools": {
-                    "description": "Allowed tools for agentic delegate mode (string or string array)",
+                    "description": "Risk-profile tool allowlist. Omit to leave the current value unchanged; null or [] clears to unrestricted; a nonempty array is the explicit allowlist. Use deny_all_tools for an explicit deny-all.",
                     "oneOf": [
+                        {"type": "null"},
                         {"type": "string"},
                         {"type": "array", "items": {"type": "string"}}
                     ]
+                },
+                "deny_all_tools": {
+                    "type": "boolean",
+                    "description": "Explicit deny-all for the agent's risk profile: no tool may be called. Cannot be combined with a nonempty allowed_tools."
                 },
                 "max_iterations": {
                     "type": ["integer", "null"],
@@ -1081,13 +1249,7 @@ impl Tool for ModelRoutingConfigTool {
                     "type": "boolean",
                     "description": "Auto-allow delegation to same-risk-profile peers (default true). Set false to restrict reach to the explicit delegates list."
                 },
-                "delegates": {
-                    "description": "Explicit delegate roster: additional agent aliases this agent may delegate to, beyond same-profile peers (string or string array)",
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}}
-                    ]
-                }
+                "delegates": delegates_schema
             },
             "additionalProperties": false
         })
@@ -1115,7 +1277,9 @@ impl Tool for ModelRoutingConfigTool {
                     "remove_scenario" => Box::pin(self.handle_remove_scenario(&args)).await,
                     "upsert_agent" => Box::pin(self.handle_upsert_agent(&args)).await,
                     "remove_agent" => Box::pin(self.handle_remove_agent(&args)).await,
-                    _ => unreachable!("validated above"),
+                    _ => Err(anyhow::Error::msg(format!(
+                        "Unknown model-routing action after validation: {action}"
+                    ))),
                 }
             }
             _ => anyhow::bail!(
@@ -1127,7 +1291,7 @@ impl Tool for ModelRoutingConfigTool {
             Ok(outcome) => Ok(outcome),
             Err(error) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(error.to_string()),
             }),
         }
@@ -1312,6 +1476,305 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upsert_agent_reuses_configured_dotted_provider_ref() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let provision = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "truefoundry",
+                "model_provider": "custom",
+                "model": "provider-model",
+                "temperature": 0.4
+            }))
+            .await
+            .unwrap();
+        assert!(provision.success, "{:?}", provision.error);
+
+        let provider_before = serde_json::to_value(
+            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                .expect("bare family upsert must create custom.truefoundry"),
+        )
+        .unwrap();
+
+        let reuse = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.truefoundry",
+                "allowed_tools": ["file_read"]
+            }))
+            .await
+            .unwrap();
+        assert!(reuse.success, "{:?}", reuse.error);
+
+        let provider_after = serde_json::to_value(
+            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                .expect("reused provider must remain configured"),
+        )
+        .unwrap();
+        assert_eq!(provider_after, provider_before);
+
+        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+        let output: Value = serde_json::from_str(&get_result.output).unwrap();
+        assert_eq!(
+            output["agents"]["coder"]["model_provider"],
+            json!("custom.truefoundry")
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_rejects_invalid_provider_requests_without_mutation() {
+        let cases = [
+            ("unknown family", json!("unknown"), true),
+            ("unknown dotted family", json!("unknown.alias"), false),
+            ("missing dotted alias", json!("custom.missing"), false),
+            ("bare family without model", json!("custom"), false),
+        ];
+
+        for (case, model_provider, has_model) in cases {
+            let tmp = TempDir::new().unwrap();
+            let cfg_path = tmp.path().join("config.toml");
+            let tool =
+                ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+            let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+            let mut args = json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": model_provider
+            });
+            if has_model {
+                args["model"] = json!("model");
+            }
+
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success, "{case} unexpectedly succeeded");
+            assert_eq!(
+                std::fs::read_to_string(&cfg_path).unwrap(),
+                before,
+                "{case}"
+            );
+
+            let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
+            let output: Value = serde_json::from_str(&get_result.output).unwrap();
+            assert!(output["agents"].as_object().unwrap().is_empty(), "{case}");
+            assert!(
+                read_saved_provider_entry(&cfg_path, "custom", "missing").is_none(),
+                "{case} must not create a provider alias"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_rejects_provider_mutations_on_reused_ref() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        for (name, model_provider) in [("truefoundry", "custom"), ("coder", "openai")] {
+            let result = tool
+                .execute(json!({
+                    "action": "upsert_agent",
+                    "name": name,
+                    "model_provider": model_provider,
+                    "model": "original-model"
+                }))
+                .await
+                .unwrap();
+            assert!(result.success, "{:?}", result.error);
+        }
+
+        let before = std::fs::read_to_string(&cfg_path).unwrap();
+        let provider_before = serde_json::to_value(
+            read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                .expect("provider setup must create custom.truefoundry"),
+        )
+        .unwrap();
+
+        for (field, value) in [
+            ("model", json!("replacement-model")),
+            ("api_key", json!("replacement-key")),
+            ("temperature", json!(1.2)),
+        ] {
+            let mut args = json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "custom.truefoundry"
+            });
+            args[field] = value;
+
+            let result = tool.execute(args).await.unwrap();
+            assert!(!result.success, "{field} unexpectedly accepted");
+            assert_eq!(
+                std::fs::read_to_string(&cfg_path).unwrap(),
+                before,
+                "{field}"
+            );
+            let provider_after = serde_json::to_value(
+                read_saved_provider_entry(&cfg_path, "custom", "truefoundry")
+                    .expect("reused provider must remain configured"),
+            )
+            .unwrap();
+            assert_eq!(provider_after, provider_before, "{field}");
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_allowed_tools_null_and_empty_clear_to_unrestricted() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let upsert = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": ["shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(upsert.success, "{:?}", upsert.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.risk_profiles.get("coder").unwrap().allowed_tools,
+            vec!["shell".to_string()]
+        );
+        assert!(!cfg.risk_profiles.get("coder").unwrap().deny_all_tools);
+
+        let clear = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": null
+            }))
+            .await
+            .unwrap();
+        assert!(clear.success, "{:?}", clear.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg.risk_profiles
+                .get("coder")
+                .unwrap()
+                .allowed_tools
+                .is_empty(),
+            "null must restore unrestricted"
+        );
+        assert!(!cfg.risk_profiles.get("coder").unwrap().deny_all_tools);
+
+        let legacy_empty = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": []
+            }))
+            .await
+            .unwrap();
+        assert!(legacy_empty.success, "{:?}", legacy_empty.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            cfg.risk_profiles
+                .get("coder")
+                .unwrap()
+                .allowed_tools
+                .is_empty(),
+            "[] is the legacy unrestricted state, not deny-all"
+        );
+        assert!(!cfg.risk_profiles.get("coder").unwrap().deny_all_tools);
+    }
+
+    #[tokio::test]
+    async fn upsert_agent_deny_all_tools_flag_and_contradiction_check() {
+        let tmp = TempDir::new().unwrap();
+        let cfg_path = tmp.path().join("config.toml");
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let deny = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "deny_all_tools": true
+            }))
+            .await
+            .unwrap();
+        assert!(deny.success, "{:?}", deny.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        let risk = cfg.risk_profiles.get("coder").unwrap();
+        assert!(risk.deny_all_tools, "deny_all_tools must be stored");
+        assert!(
+            risk.allowed_tools.is_empty(),
+            "deny_all_tools must not leave a stray allowlist behind"
+        );
+
+        // Re-allowing via a nonempty list clears the flag.
+        let allow = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "allowed_tools": ["shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(allow.success, "{:?}", allow.error);
+
+        let cfg = zeroclaw_config::migration::migrate_to_current(
+            &std::fs::read_to_string(&cfg_path).unwrap(),
+        )
+        .unwrap();
+        let risk = cfg.risk_profiles.get("coder").unwrap();
+        assert!(!risk.deny_all_tools);
+        assert_eq!(risk.allowed_tools, vec!["shell".to_string()]);
+
+        // The contradictory combination fails loudly instead of one side
+        // silently winning.
+        let contradiction = tool
+            .execute(json!({
+                "action": "upsert_agent",
+                "name": "coder",
+                "model_provider": "openai",
+                "model": "gpt-5.3-codex",
+                "deny_all_tools": true,
+                "allowed_tools": ["shell"]
+            }))
+            .await
+            .unwrap();
+        assert!(!contradiction.success, "must be rejected");
+        let err = contradiction.error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("deny_all_tools"),
+            "error must name deny_all_tools, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn upsert_agent_writes_delegate_roster_fields() {
         let tmp = TempDir::new().unwrap();
         let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
@@ -1335,7 +1798,7 @@ mod tests {
                 "model_provider": "openai",
                 "model": "gpt-5.3",
                 "delegate_same_risk_profile": false,
-                "delegates": ["aaalore"]
+                "delegates": [{"agent": "aaalore", "mode": "independent"}]
             }))
             .await
             .unwrap();
@@ -1347,7 +1810,10 @@ mod tests {
             output["agents"]["aaa"]["delegate_same_risk_profile"],
             json!(false)
         );
-        assert_eq!(output["agents"]["aaa"]["delegates"], json!(["aaalore"]));
+        assert_eq!(
+            output["agents"]["aaa"]["delegates"],
+            json!([{"agent": "aaalore", "mode": "independent"}])
+        );
     }
 
     #[tokio::test]

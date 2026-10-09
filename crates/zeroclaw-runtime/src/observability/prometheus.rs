@@ -15,6 +15,7 @@ pub struct PrometheusObserver {
     tokens_output_total: IntCounterVec,
     tool_calls: IntCounterVec,
     channel_messages: IntCounterVec,
+    memory_audits: IntCounterVec,
     heartbeat_ticks: prometheus::IntCounter,
     errors: IntCounterVec,
     cache_hits: IntCounterVec,
@@ -24,21 +25,13 @@ pub struct PrometheusObserver {
     // Histograms
     agent_duration: HistogramVec,
     tool_duration: HistogramVec,
+    memory_audit_duration: HistogramVec,
     request_latency: Histogram,
 
     // Gauges
     tokens_used: prometheus::IntGauge,
     active_sessions: GaugeVec,
     queue_depth: GaugeVec,
-
-    // DORA
-    deployments_total: IntCounterVec,
-    deployment_lead_time: Histogram,
-    deployment_failure_rate: prometheus::Gauge,
-    recovery_time: Histogram,
-    mttr: prometheus::Gauge,
-    deploy_success_count: std::sync::atomic::AtomicU64,
-    deploy_failure_count: std::sync::atomic::AtomicU64,
 }
 
 impl Default for PrometheusObserver {
@@ -93,6 +86,15 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
 
+        let memory_audits = IntCounterVec::new(
+            prometheus::Opts::new(
+                "zeroclaw_memory_audit_total",
+                "Total memory audit trail actions",
+            ),
+            &["backend", "action", "success"],
+        )
+        .expect("valid metric");
+
         let heartbeat_ticks =
             prometheus::IntCounter::new("zeroclaw_heartbeat_ticks_total", "Total heartbeat ticks")
                 .expect("valid metric");
@@ -144,6 +146,16 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
 
+        let memory_audit_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "zeroclaw_memory_audit_duration_seconds",
+                "Memory audit trail action duration in seconds",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0]),
+            &["backend", "action", "success"],
+        )
+        .expect("valid metric");
+
         let request_latency = Histogram::with_opts(
             HistogramOpts::new(
                 "zeroclaw_request_latency_seconds",
@@ -171,44 +183,6 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
 
-        let deployments_total = IntCounterVec::new(
-            prometheus::Opts::new("zeroclaw_deployments_total", "Total deployments by status"),
-            &["status"],
-        )
-        .expect("valid metric");
-
-        let deployment_lead_time = Histogram::with_opts(
-            HistogramOpts::new(
-                "zeroclaw_deployment_lead_time_seconds",
-                "Deployment lead time from commit to deploy in seconds",
-            )
-            .buckets(vec![
-                60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0, 14400.0, 43200.0, 86400.0,
-            ]),
-        )
-        .expect("valid metric");
-
-        let deployment_failure_rate = prometheus::Gauge::new(
-            "zeroclaw_deployment_failure_rate",
-            "Ratio of failed deployments to total deployments",
-        )
-        .expect("valid metric");
-
-        let recovery_time = Histogram::with_opts(
-            HistogramOpts::new(
-                "zeroclaw_recovery_time_seconds",
-                "Time to recover from a failed deployment in seconds",
-            )
-            .buckets(vec![
-                60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0, 14400.0, 43200.0, 86400.0,
-            ]),
-        )
-        .expect("valid metric");
-
-        let mttr =
-            prometheus::Gauge::new("zeroclaw_mttr_seconds", "Mean time to recovery in seconds")
-                .expect("valid metric");
-
         // Register all metrics
         registry.register(Box::new(agent_starts.clone())).ok();
         registry.register(Box::new(llm_requests.clone())).ok();
@@ -218,6 +192,7 @@ impl PrometheusObserver {
             .ok();
         registry.register(Box::new(tool_calls.clone())).ok();
         registry.register(Box::new(channel_messages.clone())).ok();
+        registry.register(Box::new(memory_audits.clone())).ok();
         registry.register(Box::new(heartbeat_ticks.clone())).ok();
         registry.register(Box::new(errors.clone())).ok();
         registry.register(Box::new(cache_hits.clone())).ok();
@@ -225,19 +200,13 @@ impl PrometheusObserver {
         registry.register(Box::new(cache_tokens_saved.clone())).ok();
         registry.register(Box::new(agent_duration.clone())).ok();
         registry.register(Box::new(tool_duration.clone())).ok();
+        registry
+            .register(Box::new(memory_audit_duration.clone()))
+            .ok();
         registry.register(Box::new(request_latency.clone())).ok();
         registry.register(Box::new(tokens_used.clone())).ok();
         registry.register(Box::new(active_sessions.clone())).ok();
         registry.register(Box::new(queue_depth.clone())).ok();
-        registry.register(Box::new(deployments_total.clone())).ok();
-        registry
-            .register(Box::new(deployment_lead_time.clone()))
-            .ok();
-        registry
-            .register(Box::new(deployment_failure_rate.clone()))
-            .ok();
-        registry.register(Box::new(recovery_time.clone())).ok();
-        registry.register(Box::new(mttr.clone())).ok();
 
         Self {
             registry,
@@ -247,6 +216,7 @@ impl PrometheusObserver {
             tokens_output_total,
             tool_calls,
             channel_messages,
+            memory_audits,
             heartbeat_ticks,
             errors,
             cache_hits,
@@ -254,17 +224,11 @@ impl PrometheusObserver {
             cache_tokens_saved,
             agent_duration,
             tool_duration,
+            memory_audit_duration,
             request_latency,
             tokens_used,
             active_sessions,
             queue_depth,
-            deployments_total,
-            deployment_lead_time,
-            deployment_failure_rate,
-            recovery_time,
-            mttr,
-            deploy_success_count: std::sync::atomic::AtomicU64::new(0),
-            deploy_failure_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -277,14 +241,6 @@ impl PrometheusObserver {
         String::from_utf8(buf).unwrap_or_default()
     }
 
-    /// Process-wide singleton handle. All call sites that obtain a Prometheus
-    /// observer through this function share the same `Registry` and the same
-    /// underlying counters, so events recorded by the channel orchestrator and
-    /// events recorded by the gateway accumulate into the same time series and
-    /// are visible on a single `/metrics` scrape.
-    ///
-    /// `PrometheusObserver::new()` still returns a fresh, isolated instance —
-    /// kept for tests so parallel test cases don't see each other's counts.
     pub fn shared() -> Arc<Self> {
         static SINGLETON: OnceLock<Arc<PrometheusObserver>> = OnceLock::new();
         SINGLETON.get_or_init(|| Arc::new(Self::new())).clone()
@@ -352,11 +308,23 @@ impl Observer for PrometheusObserver {
             ObserverEvent::ToolCallStart { .. }
             | ObserverEvent::TurnComplete
             | ObserverEvent::LlmRequest { .. }
-            | ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::RecoveryCompleted { .. }
             | ObserverEvent::MemoryRecall { .. }
             | ObserverEvent::MemoryStore { .. }
             | ObserverEvent::RagRetrieve { .. } => {}
+            ObserverEvent::MemoryAudit {
+                action,
+                backend,
+                duration,
+                success,
+            } => {
+                let success_str = if *success { "true" } else { "false" };
+                self.memory_audits
+                    .with_label_values(&[backend.as_str(), action.as_str(), success_str])
+                    .inc();
+                self.memory_audit_duration
+                    .with_label_values(&[backend.as_str(), action.as_str(), success_str])
+                    .observe(duration.as_secs_f64());
+            }
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -397,34 +365,6 @@ impl Observer for PrometheusObserver {
             } => {
                 self.errors.with_label_values(&[component]).inc();
             }
-            ObserverEvent::DeploymentCompleted { .. } => {
-                self.deployments_total.with_label_values(&["success"]).inc();
-                let s = self
-                    .deploy_success_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                let f = self
-                    .deploy_failure_count
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let total = s + f;
-                if total > 0 {
-                    self.deployment_failure_rate.set(f as f64 / total as f64);
-                }
-            }
-            ObserverEvent::DeploymentFailed { .. } => {
-                self.deployments_total.with_label_values(&["failure"]).inc();
-                let f = self
-                    .deploy_failure_count
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
-                let s = self
-                    .deploy_success_count
-                    .load(std::sync::atomic::Ordering::Relaxed);
-                let total = s + f;
-                if total > 0 {
-                    self.deployment_failure_rate.set(f as f64 / total as f64);
-                }
-            }
             // `ObserverEvent` is `#[non_exhaustive]` — silently ignore any
             // future variant added by upstream `zeroclaw-api`.
             _ => {}
@@ -448,13 +388,6 @@ impl Observer for PrometheusObserver {
                 self.queue_depth
                     .with_label_values(&[] as &[&str])
                     .set(*d as f64);
-            }
-            ObserverMetric::DeploymentLeadTime(d) => {
-                self.deployment_lead_time.observe(d.as_secs_f64());
-            }
-            ObserverMetric::RecoveryTime(d) => {
-                self.recovery_time.observe(d.as_secs_f64());
-                self.mttr.set(d.as_secs_f64());
             }
         }
     }
@@ -512,6 +445,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -523,6 +457,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "file_read".into(),
             tool_call_id: None,
             duration: Duration::from_millis(5),
@@ -541,6 +476,12 @@ mod tests {
         obs.record_event(&ObserverEvent::Error {
             component: "model_provider".into(),
             message: "timeout".into(),
+        });
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "store".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(20),
+            success: true,
         });
     }
 
@@ -565,6 +506,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(100),
@@ -577,12 +519,22 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_metric(&ObserverMetric::RequestLatency(Duration::from_millis(250)));
+        obs.record_event(&ObserverEvent::MemoryAudit {
+            action: "purge".into(),
+            backend: "sqlite".into(),
+            duration: Duration::from_millis(4),
+            success: true,
+        });
 
         let output = obs.encode();
         assert!(output.contains("zeroclaw_agent_starts_total"));
         assert!(output.contains("zeroclaw_tool_calls_total"));
         assert!(output.contains("zeroclaw_heartbeat_ticks_total"));
         assert!(output.contains("zeroclaw_request_latency_seconds"));
+        assert!(output.contains(
+            r#"zeroclaw_memory_audit_total{action="purge",backend="sqlite",success="true"} 1"#
+        ));
+        assert!(output.contains("zeroclaw_memory_audit_duration_seconds"));
     }
 
     #[test]
@@ -602,6 +554,7 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -613,6 +566,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -624,6 +578,7 @@ mod tests {
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
+            parent_agent_alias: None,
             tool: "shell".into(),
             tool_call_id: None,
             duration: Duration::from_millis(10),
@@ -676,6 +631,7 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(200),
@@ -683,11 +639,13 @@ mod tests {
             error_message: None,
             input_tokens: Some(100),
             output_tokens: Some(50),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
         });
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "openrouter".into(),
             model: "claude-sonnet".into(),
             duration: Duration::from_millis(300),
@@ -695,6 +653,7 @@ mod tests {
             error_message: None,
             input_tokens: Some(200),
             output_tokens: Some(80),
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
@@ -717,6 +676,7 @@ mod tests {
         let obs = PrometheusObserver::new();
 
         obs.record_event(&ObserverEvent::LlmResponse {
+            parent_agent_alias: None,
             model_provider: "ollama".into(),
             model: "llama3".into(),
             duration: Duration::from_millis(100),
@@ -724,6 +684,7 @@ mod tests {
             error_message: Some("timeout".into()),
             input_tokens: None,
             output_tokens: None,
+            messages: None,
             channel: None,
             agent_alias: None,
             turn_id: None,
@@ -736,73 +697,6 @@ mod tests {
         // Token counters should not appear (no data recorded)
         assert!(!output.contains("zeroclaw_tokens_input_total{"));
         assert!(!output.contains("zeroclaw_tokens_output_total{"));
-    }
-
-    #[test]
-    fn dora_deployment_events_track_counters() {
-        let obs = PrometheusObserver::new();
-
-        obs.record_event(&ObserverEvent::DeploymentCompleted {
-            deploy_id: "d1".into(),
-            commit_sha: "abc123".into(),
-        });
-        obs.record_event(&ObserverEvent::DeploymentCompleted {
-            deploy_id: "d2".into(),
-            commit_sha: "def456".into(),
-        });
-        obs.record_event(&ObserverEvent::DeploymentFailed {
-            deploy_id: "d3".into(),
-            reason: "timeout".into(),
-        });
-
-        let output = obs.encode();
-        assert!(output.contains(r#"zeroclaw_deployments_total{status="success"} 2"#));
-        assert!(output.contains(r#"zeroclaw_deployments_total{status="failure"} 1"#));
-    }
-
-    #[test]
-    fn dora_failure_rate_gauge_updates() {
-        let obs = PrometheusObserver::new();
-
-        obs.record_event(&ObserverEvent::DeploymentCompleted {
-            deploy_id: "d1".into(),
-            commit_sha: "abc".into(),
-        });
-        obs.record_event(&ObserverEvent::DeploymentFailed {
-            deploy_id: "d2".into(),
-            reason: "error".into(),
-        });
-
-        let output = obs.encode();
-        // 1 failure out of 2 total = 0.5
-        assert!(output.contains("zeroclaw_deployment_failure_rate 0.5"));
-    }
-
-    #[test]
-    fn dora_lead_time_and_recovery_metrics() {
-        let obs = PrometheusObserver::new();
-
-        obs.record_metric(&ObserverMetric::DeploymentLeadTime(Duration::from_secs(
-            3600,
-        )));
-        obs.record_metric(&ObserverMetric::RecoveryTime(Duration::from_secs(600)));
-
-        let output = obs.encode();
-        assert!(output.contains("zeroclaw_deployment_lead_time_seconds"));
-        assert!(output.contains("zeroclaw_recovery_time_seconds"));
-        assert!(output.contains("zeroclaw_mttr_seconds 600"));
-    }
-
-    #[test]
-    fn dora_started_and_recovery_events_no_panic() {
-        let obs = PrometheusObserver::new();
-
-        obs.record_event(&ObserverEvent::DeploymentStarted {
-            deploy_id: "d1".into(),
-        });
-        obs.record_event(&ObserverEvent::RecoveryCompleted {
-            deploy_id: "d1".into(),
-        });
     }
 
     #[test]

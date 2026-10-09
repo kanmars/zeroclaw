@@ -5,29 +5,31 @@ use zeroclaw_macros::Configurable;
 use super::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
     AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
-    AtomicChatModelProviderConfig, AvianModelProviderConfig, AzureModelProviderConfig,
-    BaichuanModelProviderConfig, BasetenModelProviderConfig, BedrockModelProviderConfig,
-    CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
-    CopilotModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
-    DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
-    FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
-    GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
-    GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
-    MistralModelProviderConfig, ModelProviderConfig, MoonshotModelProviderConfig,
-    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AvianModelProviderConfig,
+    AzureModelProviderConfig, BaichuanModelProviderConfig, BasetenModelProviderConfig,
+    BedrockModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
+    CohereModelProviderConfig, CopilotModelProviderConfig, CrusoeModelProviderConfig,
+    CustomModelProviderConfig, DeepinfraModelProviderConfig, DeepmystModelProviderConfig,
+    DeepseekModelProviderConfig, DoubaoModelProviderConfig, FeatherlessModelProviderConfig,
+    FireworksModelProviderConfig, FriendliModelProviderConfig, GeminiCliModelProviderConfig,
+    GeminiModelProviderConfig, GithubModelsModelProviderConfig, GlmModelProviderConfig,
+    GrokCliModelProviderConfig, GroqModelProviderConfig, HailoOllamaModelProviderConfig,
+    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
+    InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
+    LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
+    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, ModelProviderConfig,
+    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZerorouterModelProviderConfig,
 };
 use super::schema::{
     AssemblyAiTranscriptionProviderConfig, DeepgramTranscriptionProviderConfig,
@@ -39,30 +41,10 @@ use super::schema::{
     OpenAITtsProviderConfig, PiperTtsProviderConfig, TtsProviderConfig as TtsBaseConfig,
 };
 
-// ── Per-category typed alias-ref newtypes ────────────────────────────────
-//
-// Every per-agent provider field is a reference into a specific configured
-// `[providers.<category>.<type>.<alias>]` (or `[channels.<type>.<alias>]`)
-// entry. The newtype carries the category at the type level — readers know
-// `agent.tts_provider: TtsProviderRef` is a TTS-provider reference, not a
-// free string, just by looking at the field declaration.
-//
-// `#[serde(transparent)]` keeps the on-disk TOML shape identical to the
-// previous `String` field. `Deref<Target = str>` and `AsRef<str>` keep
-// every `.is_empty()` / `.split_once('.')` / `.eq_ignore_ascii_case` /
-// `&value[..]` consumer working unchanged. Assignment from a string literal
-// goes through `.into()` (`From<&str>` / `From<String>`).
-//
-// Validation that each non-empty ref resolves to a configured alias lives
-// in `Config::validate()` (see `agent.tts_provider` / `agent.transcription_provider`
-// blocks in schema.rs); the newtype's job is to encode the *category* in
-// the type, not the existence — both layers reinforce each other.
-
 #[macro_export]
 macro_rules! define_provider_ref {
     ($name:ident, $category_doc:literal) => {
         #[doc = concat!("Reference to a configured `[", $category_doc, ".<type>.<alias>]` entry.")]
-        ///
         /// Empty value means "no preference" (opt-out). Non-empty values must
         /// resolve to a configured alias; `Config::validate()` enforces this.
         #[derive(
@@ -158,28 +140,8 @@ define_provider_ref!(ChannelRef, "channels");
 define_provider_ref!(RiskProfileRef, "risk_profiles");
 define_provider_ref!(RuntimeProfileRef, "runtime_profiles");
 
-/// Hard ceiling on `providers.models.<alias>.fallback` chain depth. The cycle
-/// guard only bounds chains that loop; a long acyclic chain would otherwise
-/// recurse one stack frame per alias at config-load and build time, turning a
-/// pathological config into a startup stack overflow. Both the validation walk
-/// and the runtime build walk stop descending past this depth and prune the
-/// rest of the branch.
 pub const MAX_FALLBACK_DEPTH: usize = 3;
 
-/// Macro that expands to a single source of truth for the per-provider-type
-/// slot list on `ModelProviders`. Every helper that needs to walk every slot
-/// (`find`, `iter_entries`, `is_empty`, etc.) goes through this
-/// macro so adding a new model_provider type is a one-line addition here, not a
-/// shotgun edit across multiple helpers.
-///
-/// Each row is `(field_ident, provider_type_str, FamilyConfigType)`. The
-/// `provider_type_str` is the canonical TOML outer key, identical to the
-/// field name with hyphens forbidden (the schema uses underscores).
-///
-/// Exported so that downstream crates (notably `zeroclaw-providers`) can
-/// drive their own dispatch from the same single source of truth — adding
-/// a family is one row here and one trait impl in providers; missing the
-/// impl fails to compile when downstream macro consumers expand.
 #[macro_export]
 macro_rules! for_each_model_provider_slot {
     ($mac:ident) => {
@@ -197,8 +159,10 @@ macro_rules! for_each_model_provider_slot {
             (baichuan, "baichuan", BaichuanModelProviderConfig),
             (openrouter, "openrouter", OpenRouterModelProviderConfig),
             (ollama, "ollama", OllamaModelProviderConfig),
+            (hailo_ollama, "hailo_ollama", HailoOllamaModelProviderConfig),
             (gemini, "gemini", GeminiModelProviderConfig),
             (gemini_cli, "gemini_cli", GeminiCliModelProviderConfig),
+            (grok_cli, "grok_cli", GrokCliModelProviderConfig),
             (bedrock, "bedrock", BedrockModelProviderConfig),
             (telnyx, "telnyx", TelnyxModelProviderConfig),
             (together, "together", TogetherModelProviderConfig),
@@ -211,6 +175,7 @@ macro_rules! for_each_model_provider_slot {
             (perplexity, "perplexity", PerplexityModelProviderConfig),
             (xai, "xai", XaiModelProviderConfig),
             (cerebras, "cerebras", CerebrasModelProviderConfig),
+            (crusoe, "crusoe", CrusoeModelProviderConfig),
             (sambanova, "sambanova", SambanovaModelProviderConfig),
             (hyperbolic, "hyperbolic", HyperbolicModelProviderConfig),
             (deepinfra, "deepinfra", DeepinfraModelProviderConfig),
@@ -234,6 +199,7 @@ macro_rules! for_each_model_provider_slot {
             (nvidia, "nvidia", NvidiaModelProviderConfig),
             (vercel, "vercel", VercelModelProviderConfig),
             (cloudflare, "cloudflare", CloudflareModelProviderConfig),
+            (atlascloud, "atlascloud", AtlasCloudModelProviderConfig),
             (ovh, "ovh", OvhModelProviderConfig),
             (copilot, "copilot", CopilotModelProviderConfig),
             (lmstudio, "lmstudio", LmstudioModelProviderConfig),
@@ -255,6 +221,7 @@ macro_rules! for_each_model_provider_slot {
             (opencode, "opencode", OpencodeModelProviderConfig),
             (kilocli, "kilocli", KiloCliModelProviderConfig),
             (kilo, "kilo", KiloModelProviderConfig),
+            (zerorouter, "zerorouter", ZerorouterModelProviderConfig),
             (custom, "custom", CustomModelProviderConfig),
         }
     };
@@ -262,19 +229,7 @@ macro_rules! for_each_model_provider_slot {
 
 macro_rules! emit_model_providers_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
-        /// Typed model provider container — one slot per canonical model_provider type.
-        ///
-        /// Replaces the `HashMap<String, HashMap<String, ModelProviderConfig>>`
-        /// with a typed struct so each family's per-alias map carries its own
-        /// typed config (with the family's `*Endpoint` enum and family-specific
-        /// extras visible at the type level).
-        ///
-        /// TOML shape is preserved byte-identical: each named field deserializes
-        /// from the same `[providers.models.<type>.<alias>]` block as before.
-        ///
-        /// Adding a new model_provider family means: define the typed config in
-        /// `schema.rs`, then add one row to `for_each_model_provider_slot!`,
-        /// and every helper picks up the new slot automatically.
+        /// Typed model provider container with one alias map per provider family.
         #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
         #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
         #[prefix = "providers.models"]
@@ -290,24 +245,24 @@ macro_rules! emit_model_providers_struct {
 for_each_model_provider_slot!(emit_model_providers_struct);
 
 impl ModelProviders {
-    /// Iterate every entry across every typed slot, yielding
-    /// `(provider_type, alias, &base)` triples. Use this when consumer code
-    /// needs to walk every model model_provider entry without caring about family.
-    ///
-    /// Materializes through a `Vec` rather than chaining iterators directly:
-    /// with ~60 typed slots the deeply-nested `Chain<Chain<...>>` type blows
-    /// up rustc's `Freeze` trait-resolution recursion limit. The collection
-    /// cost is negligible (entries are sparse — most slots are empty in any
-    /// real config). Returned as `impl Iterator` so call sites can chain
-    /// `.next()`, `.filter_map()`, etc. without changes.
+    /// Iterate every entry across every typed slot in a deterministic
+    /// order: slot order (as declared by `for_each_model_provider_slot!`)
+    /// first, then alias order within each slot. The alias maps are
+    /// `HashMap`s whose iteration order is seeded per process, so the
+    /// sort is what keeps "first entry" consumers — the gateway boot
+    /// default provider/model, first-run agent defaults, the
+    /// ACP-advertised default model — stable across restarts.
     pub fn iter_entries(&self) -> impl Iterator<Item = (&'static str, &str, &ModelProviderConfig)> {
         let mut out: Vec<(&'static str, &str, &ModelProviderConfig)> = Vec::new();
         macro_rules! emit_iter {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
                 $(
-                    for (alias, cfg) in &self.$field {
-                        out.push(($type_str, alias.as_str(), &cfg.base));
-                    }
+                    let mut slot: Vec<(&String, &$cfg_ty)> = self.$field.iter().collect();
+                    slot.sort_by(|a, b| a.0.cmp(b.0));
+                    out.extend(
+                        slot.into_iter()
+                            .map(|(alias, cfg)| ($type_str, alias.as_str(), &cfg.base)),
+                    );
                 )+
             };
         }
@@ -315,7 +270,8 @@ impl ModelProviders {
         out.into_iter()
     }
 
-    /// Iterate every entry mutably across every typed slot.
+    /// Iterate every entry mutably across every typed slot, in the same
+    /// deterministic order as [`ModelProviders::iter_entries`].
     pub fn iter_entries_mut(
         &mut self,
     ) -> impl Iterator<Item = (&'static str, &str, &mut ModelProviderConfig)> {
@@ -323,14 +279,32 @@ impl ModelProviders {
         macro_rules! emit_iter_mut {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
                 $(
-                    for (alias, cfg) in self.$field.iter_mut() {
-                        out.push(($type_str, alias.as_str(), &mut cfg.base));
-                    }
+                    let mut slot: Vec<(&String, &mut $cfg_ty)> = self.$field.iter_mut().collect();
+                    slot.sort_by(|a, b| a.0.cmp(b.0));
+                    out.extend(
+                        slot.into_iter()
+                            .map(|(alias, cfg)| ($type_str, alias.as_str(), &mut cfg.base)),
+                    );
                 )+
             };
         }
         for_each_model_provider_slot!(emit_iter_mut);
         out.into_iter()
+    }
+
+    /// First entry across every typed slot that declares a non-empty `model`,
+    /// in the existing `iter_entries` order. An entry without a `model`
+    /// cannot serve as an install-wide default — there is no model string to
+    /// pair with the provider — so entries without one are skipped instead of
+    /// seeding a provider/model mismatch at the consumer.
+    #[must_use]
+    pub fn first_entry_with_model(&self) -> Option<(&'static str, &str, &ModelProviderConfig)> {
+        self.iter_entries().find(|(_, _, base)| {
+            base.model
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|model| !model.is_empty())
+        })
     }
 
     /// Resolve the family-default endpoint URI for `<family>.<alias>`. Returns
@@ -365,11 +339,6 @@ impl ModelProviders {
         for_each_model_provider_slot!(emit_get)
     }
 
-    /// Resolve a name that is either a bare `<alias>` or a `<kind>.<alias>` pair
-    /// to its `(kind, alias, &config)`. A bare alias is matched across every
-    /// family; ambiguity (same alias under multiple kinds) returns `None` so the
-    /// caller can ask the user to qualify it. Registry-driven via
-    /// `for_each_model_provider_slot!`.
     pub fn find_by_name(&self, name: &str) -> Option<(&'static str, String, &ModelProviderConfig)> {
         if let Some((kind, alias)) = name.split_once('.') {
             macro_rules! emit_dotted {
@@ -399,11 +368,6 @@ impl ModelProviders {
         hit
     }
 
-    /// Get-or-create the shared base config for a `<provider_type>.<alias>`
-    /// pair, returning a mutable reference. Used by tools that mutate
-    /// generic baseline fields (model, temperature, api_key) without caring
-    /// about the family's specific extras. Returns `None` for unknown
-    /// model_provider types.
     pub fn ensure(&mut self, family: &str, alias: &str) -> Option<&mut ModelProviderConfig> {
         macro_rules! emit_ensure {
             ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
@@ -729,6 +693,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_iter_entries_sorts_aliases_within_each_slot() {
+        let mut providers = ModelProviders::default();
+        // Insert in non-sorted order: the alias maps are HashMaps whose
+        // iteration order is seeded per process, so only iter_entries' own
+        // sort can give first-entry consumers a stable pick across restarts.
+        for alias in ["zeta", "alpha", "mid"] {
+            providers
+                .custom
+                .insert(alias.to_string(), CustomModelProviderConfig::default());
+        }
+
+        let entries: Vec<(&str, &str)> = providers
+            .iter_entries()
+            .map(|(family, alias, _)| (family, alias))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("custom", "alpha"), ("custom", "mid"), ("custom", "zeta")]
+        );
+
+        // The mutable walk yields the same deterministic order. Collect
+        // owned copies so the immutable borrow above can end before
+        // iter_entries_mut takes the mutable one.
+        let mut_entries: Vec<(String, String)> = providers
+            .iter_entries_mut()
+            .map(|(family, alias, _)| (family.to_string(), alias.to_string()))
+            .collect();
+        assert_eq!(
+            mut_entries,
+            vec![
+                ("custom".into(), "alpha".into()),
+                ("custom".into(), "mid".into()),
+                ("custom".into(), "zeta".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_entry_with_model_skips_model_less_entries() {
+        let mut providers = ModelProviders::default();
+        providers
+            .openai
+            .insert("alpha".to_string(), OpenAIModelProviderConfig::default());
+        providers.openai.insert(
+            "beta".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("beta-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        providers.ollama.insert(
+            "gamma".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gamma-model".to_string()),
+                    ..Default::default()
+                },
+                ..OllamaModelProviderConfig::default()
+            },
+        );
+
+        // Openai precedes ollama in slot order. Within openai, only "beta"
+        // has a model, so it is selected regardless of alias iteration order.
+        let first = providers
+            .first_entry_with_model()
+            .expect("an entry with a model must be found");
+        assert_eq!(
+            (first.0, first.1, first.2.model.as_deref()),
+            ("openai", "beta", Some("beta-model"))
+        );
+
+        // A whitespace-only model counts as unset, so the pick moves on to
+        // the next entry with a real model.
+        providers.openai.get_mut("beta").unwrap().base.model = Some("   ".to_string());
+        let first = providers
+            .first_entry_with_model()
+            .expect("a later entry with a model must be found");
+        assert_eq!((first.0, first.1), ("ollama", "gamma"));
+    }
+
+    #[test]
     fn transcription_iter_entries_walks_every_typed_slot() {
         let mut providers = TranscriptionProviders::default();
         providers
@@ -784,23 +831,7 @@ mod tests {
     }
 }
 
-/// Top-level wrapper for every provider category. TOML root sees a
-/// single `[providers]` table with one sub-key per category:
-///
-/// ```toml
-/// [providers.models.anthropic.default]
-/// api_key = "..."
-///
-/// [providers.tts.openai.default]
-/// api_key = "..."
-///
-/// [providers.transcription.groq.default]
-/// api_key = "..."
-/// ```
-///
-/// Each category keeps its own typed-slot internals (so per-family
-/// endpoints and extras stay validated at the type level); this
-/// wrapper just gives them a shared top-level home.
+/// Top-level wrapper for every configured provider category.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "providers"]
@@ -820,23 +851,6 @@ pub struct Providers {
     #[nested]
     pub transcription: TranscriptionProviders,
 }
-
-// ── Cost-rate wrappers ──────────────────────────────────────────────────────
-//
-// Same per-provider-type slot layout as the typed-provider wrappers above,
-// but the value type is the per-resource rate struct instead of the
-// per-alias provider config. Each subsection's TOML path mirrors its
-// `[providers.*]` counterpart with the trailing `<alias>` segment replaced
-// by the resource the rate prices (model id, voice id, etc.).
-//
-// DRY:
-//   - `ModelCostRatesByProvider` consumes the same `for_each_model_provider_slot!`
-//     macro as `ModelProviders`, so adding a new provider type updates
-//     both structs from a single edit.
-//   - `TtsCostRatesByProvider` and `TranscriptionCostRatesByProvider`
-//     mirror their `TtsProviders` / `TranscriptionProviders` slot lists
-//     by hand (those wrappers are themselves hand-rolled because the
-//     closed family lists were small enough to not warrant a macro).
 
 macro_rules! emit_model_cost_rates_struct {
     ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {

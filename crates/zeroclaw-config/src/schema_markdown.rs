@@ -2,15 +2,6 @@ use std::fmt::Write as _;
 
 use serde_json::{Map, Value};
 
-/// Build the channel streaming-capability table by walking the `channels`
-/// section of the `Config` schema. Capability is derived from each channel
-/// struct's fields, never hand-listed:
-///   - has `stream_mode` (the off/partial/multi_message enum) -> draft updates
-///     and multi-message streaming are both supported.
-///   - has `stream_drafts` (a partial-only boolean) -> draft updates only.
-///   - neither -> no streaming.
-///
-/// Returns a Markdown table sorted by channel key.
 pub fn channel_streaming_matrix(root: &Value) -> String {
     let empty = Map::new();
     let defs = root
@@ -63,36 +54,6 @@ pub fn channel_streaming_matrix(root: &Value) -> String {
     out
 }
 
-/// Navigate the full `Config` schema (`schema_for!(Config)`) to the section at
-/// `path` (dotted, e.g. `channels.matrix`, `providers.models`, `acp`) and
-/// render that section's fields via [`field_table`]. Map nodes (Rust
-/// `HashMap<String, T>`, rendered by schemars with `additionalProperties`) are
-/// transparently descended into their value type, and an `<alias>` placeholder
-/// is inserted into the displayed config prefix at each crossing so the
-/// per-field deep-links and `config set` commands carry the right path
-/// (`channels.matrix` -> `channels.matrix.<alias>`).
-///
-/// Returns an error string (as a visible HTML comment) when the path does not
-/// resolve, so a typo in a directive fails loudly in the rendered page rather
-/// than silently emitting nothing.
-/// Navigate the full `Config` schema (`schema_for!(Config)`) to the section at
-/// `path` (dotted, e.g. `channels.matrix`, `providers.models`, `acp`) and
-/// render that section's fields via [`field_table`]. Map nodes (Rust
-/// `HashMap<String, T>`, rendered by schemars with `additionalProperties`) are
-/// transparently descended into their value type, and an `<alias>` placeholder
-/// is inserted into the displayed config prefix at each crossing so the
-/// per-field deep-links and `config set` commands carry the right path
-/// (`channels.matrix` -> `channels.matrix.<alias>`).
-///
-/// `defaults` is the serialized `Default::default()` of the section struct that
-/// `path` resolves to (for a map section, the map's *value* type). It lets a
-/// field's real default (`false`, `[]`, `{}`, `null`) surface even when
-/// schemars omits the schema `default` key for `skip_serializing_if` fields.
-/// Pass `None` to fall back to schema-only defaults.
-///
-/// Returns an error string when the path does not resolve, so a typo in a
-/// directive fails loudly in the rendered page rather than silently emitting
-/// nothing.
 pub fn field_table_for_path(
     root: &Value,
     path: &str,
@@ -146,10 +107,6 @@ pub fn field_table_for_path(
     Ok(field_table(node, include_enabled, Some(&prefix), defaults))
 }
 
-/// The set of field names a section path resolves to (after descending any map
-/// to its value type). Used to compute the shared base field set across many
-/// sibling sections (e.g. every model-provider slot) so a directive can render
-/// the common fields once and only the per-section extras per entry.
 pub fn section_field_names(root: &Value, path: &str) -> std::collections::BTreeSet<String> {
     let empty = Map::new();
     let defs = root
@@ -183,11 +140,6 @@ pub fn section_field_names(root: &Value, path: &str) -> std::collections::BTreeS
         .unwrap_or_default()
 }
 
-/// Like [`field_table_for_path`] but omits every field whose name is in
-/// `exclude`. Lets a directive render a shared base table once and then only
-/// the per-section extras, instead of repeating the common fields for every
-/// sibling section. Returns an empty string (not an error) when nothing remains
-/// after exclusion, so callers can render a "no extra fields" note.
 pub fn field_table_for_path_excluding(
     root: &Value,
     path: &str,
@@ -251,20 +203,6 @@ pub fn field_table_for_path_excluding(
     Ok(field_table(&node, include_enabled, Some(&prefix), defaults))
 }
 
-/// Renders a single struct's fields as an interactive config table from that
-/// struct's `schema_for!` JSON value. Top-level `enabled` is skipped by default
-/// since channel pages document it separately; pass `include_enabled = true` to
-/// keep it. `$ref` types resolve against the schema's own `$defs`. This is the
-/// same type/default/description extraction used by [`generate`], so a
-/// per-channel field table can never drift from the global config reference.
-///
-/// When `prefix` is `Some` (the struct's dotted config path, e.g.
-/// `channels.mattermost.<alias>`), the table is emitted as raw HTML with each
-/// field name as an accordion trigger: clicking a field expands a detail row
-/// directly beneath it carrying the per-field gateway-dashboard deep-link,
-/// zerocode location, and `zeroclaw config set` command. The
-/// `pc-enhance.js` `installConfigFieldRows` handler wires the toggle. When
-/// `prefix` is `None`, a plain Markdown table is emitted (no accordion).
 pub fn field_table(
     root: &Value,
     include_enabled: bool,
@@ -288,11 +226,6 @@ pub fn field_table(
     let Some(prefix) = prefix else {
         return plain_field_table(props, &required, defs, include_enabled);
     };
-    // Dashboard deep-link path. The web dashboard routes `/config/<section>/
-    // <type>` where `<type>` is the map key and `<section>` is the dot-joined
-    // prefix before it. `channels.mattermost.<alias>` -> `channels/mattermost`;
-    // `providers.models.venice.<alias>` -> `providers.models/venice`; a bare
-    // `acp` section (no `<alias>`) stays `acp`.
     let section_owned = {
         let segs: Vec<&str> = prefix.split('.').collect();
         if let Some(alias_idx) = segs.iter().position(|s| *s == "<alias>") {
@@ -340,18 +273,8 @@ pub fn field_table(
         // `crate::env_overrides`, so the rendered example and the value the
         // runtime accepts cannot disagree.
         let env_var = format!("ZEROCLAW_{}", full_path.replace('.', "__"));
-        let full_desc = resolved
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let full_desc = description(resolved).unwrap_or_default();
 
-        // Detail is a `<div>` wrapping Markdown, not raw HTML table cells, so
-        // mdbook-i18n-helpers extracts the prose (field description and the
-        // tab guidance) for translation. Everything that must stay verbatim
-        // (field name, dotted path, `config set` command, env-var name) is in
-        // inline `code` spans or fenced blocks, which i18n-helpers leaves
-        // untouched. The `os-tabs-src` widget is the same one used elsewhere;
-        // `pc-enhance.js` turns it into the tab strip client-side.
         let _ = write!(
             rows,
             concat!(
@@ -383,7 +306,7 @@ pub fn field_table(
             full_path = full_path,
             set_cmd = set_cmd,
             env_var = env_var,
-            full_desc = markdown_prose(full_desc),
+            full_desc = markdown_prose(&full_desc),
         );
     }
 
@@ -413,8 +336,7 @@ fn plain_field_table(
             type_label(resolved, defs)
         };
         let default = fmt_default(resolved);
-        let desc =
-            first_line(resolved.get("description").and_then(Value::as_str)).replace('|', "\\|");
+        let desc = first_line(description(resolved).as_deref()).replace('|', "\\|");
         let req = if required.contains(&key.as_str()) {
             "\\*"
         } else {
@@ -440,6 +362,105 @@ fn html_escape(s: &str) -> String {
 /// translation while leaving the code spans untouched.
 fn markdown_prose(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Read a schema node's `description` as book-ready Markdown.
+///
+/// Every description in this reference is a Rust doc comment, so it is written
+/// for rustdoc first and may carry intra-doc links such as
+/// ``[`PairingGuard`](crate::pairing::PairingGuard)``. rustdoc resolves those;
+/// mdBook cannot. It renders `crate::pairing::PairingGuard` as a relative URL,
+/// the page does not exist, and the book's internal link check fails the whole
+/// docs build. Reduce those links to their text here, at the single point where
+/// a doc comment becomes book prose, so authors keep writing ordinary rustdoc.
+fn description(schema: &Value) -> Option<String> {
+    schema
+        .get("description")
+        .and_then(Value::as_str)
+        .map(strip_intra_doc_links)
+}
+
+/// Replace `[text](rust::path)` with `text`, leaving every other link alone.
+///
+/// A target is a Rust path when it contains `::` without a `://` scheme, which
+/// covers rustdoc's disambiguator forms (`struct@crate::Foo`, `crate::f()`,
+/// `crate::m!`) too. Real URLs, relative page links and in-page anchors carry
+/// no `::` and pass through untouched. Code spans are copied verbatim, so a doc
+/// comment that shows this syntax as an example keeps it.
+fn strip_intra_doc_links(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // Copy a code span verbatim, matching its opening backtick run.
+            b'`' => {
+                let run = bytes[i..].iter().take_while(|b| **b == b'`').count();
+                let fence = &s[i..i + run];
+                let rest = &s[i + run..];
+                let end = rest.find(fence).map(|e| i + run + e + run);
+                let stop = end.unwrap_or(bytes.len());
+                out.push_str(&s[i..stop]);
+                i = stop;
+            }
+            b'[' => {
+                let Some((text, target, next)) = split_link(s, i) else {
+                    out.push('[');
+                    i += 1;
+                    continue;
+                };
+                if target.contains("::") && !target.contains("://") {
+                    out.push_str(text);
+                } else {
+                    out.push_str(&s[i..next]);
+                }
+                i = next;
+            }
+            _ => {
+                let ch = s[i..].chars().next().unwrap_or('\u{fffd}');
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
+/// Split `[text](target)` starting at `open`, returning the text, the target,
+/// and the index just past the closing `)`. `None` when the bytes at `open` are
+/// not a complete inline link.
+///
+/// Both halves are matched on balance, not on the first closing delimiter, so
+/// rustdoc's call form `[f](crate::m::f())` yields the whole `crate::m::f()`
+/// target instead of stopping inside it and stranding a `)`.
+fn split_link(s: &str, open: usize) -> Option<(&str, &str, usize)> {
+    let close = matching(s, open, b'[', b']')?;
+    if !s[close + 1..].starts_with('(') {
+        return None;
+    }
+    let end = matching(s, close + 1, b'(', b')')?;
+    Some((&s[open + 1..close], &s[close + 2..end], end + 1))
+}
+
+/// Index of the delimiter closing the `open`/`close` pair that starts at
+/// `start`, or `None` when it is never closed.
+fn matching(s: &str, start: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(start) != Some(&open) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (offset, byte) in bytes[start..].iter().enumerate() {
+        if *byte == open {
+            depth += 1;
+        } else if *byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + offset);
+            }
+        }
+    }
+    None
 }
 
 /// Render a `fmt_default`-style value (which may be wrapped in backticks) as
@@ -480,7 +501,7 @@ pub fn generate(root: &Value) -> String {
     out.push_str("|---------|-------------|\n");
     for (key, schema) in props {
         let resolved = resolve(schema, defs);
-        let desc = first_line(resolved.get("description").and_then(Value::as_str));
+        let desc = first_line(description(resolved).as_deref());
         let _ = writeln!(out, "| [`{key}`](#{key}) | {desc} |");
     }
     out.push('\n');
@@ -499,8 +520,8 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
     let path_str = path.join(".");
     let _ = writeln!(out, "{hashes} `{path_str}`\n");
 
-    if let Some(desc) = schema.get("description").and_then(Value::as_str) {
-        out.push_str(desc);
+    if let Some(desc) = description(schema) {
+        out.push_str(&desc);
         out.push_str("\n\n");
     }
 
@@ -509,22 +530,38 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
         .get("properties")
         .and_then(Value::as_object)
         .unwrap_or(&empty);
+
+    // For HashMap sections (e.g. `cron`, `risk_profiles`), there are no
+    // `properties` — the value type lives under `additionalProperties`.
+    // Descend into it and render the per-alias fields.
     if props.is_empty() {
+        if let Some(add) = schema.get("additionalProperties")
+            && add.is_object()
+        {
+            let value_schema = resolve(add, defs);
+            if value_schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some()
+            {
+                // Insert `<alias>` into the displayed path so the table header
+                // reads `[cron.<alias>]`, `[risk_profiles.<alias>]`, etc.
+                let mut map_path: Vec<String> = path.iter().map(|s| (*s).to_owned()).collect();
+                map_path.push("<alias>".to_string());
+                let map_path_str = map_path.join(".");
+                let _ = writeln!(out, "## `{map_path_str}`\n");
+                if let Some(desc) = description(value_schema) {
+                    out.push_str(&desc);
+                    out.push_str("\n\n");
+                }
+                let map_path_refs: Vec<&str> = map_path.iter().map(String::as_str).collect();
+                write_section_fields(out, value_schema, defs, &map_path_str, &map_path_refs);
+                return;
+            }
+        }
         return;
     }
 
-    let required: Vec<&str> = schema
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-
-    // Family-map container (e.g. `providers.models`, `channels`): every field
-    // is a `HashMap<String, T>` slot. Listing all slots here, each an empty
-    // `map | —` row, then recursing into every one, duplicates the per-slot
-    // detail that already lives on the dedicated section page. Collapse to a
-    // single note instead. Detected structurally (all fields are maps), not by
-    // a hardcoded path, so it can never drift.
     let all_maps = !props.is_empty()
         && props.values().all(|v| {
             resolve(v, defs)
@@ -543,6 +580,31 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
         return;
     }
 
+    write_section_fields(out, schema, defs, &path_str, path);
+}
+
+/// Render a struct's fields as a markdown table and recurse into sub-sections.
+/// Shared by `write_section` and the HashMap-value-type path for sections like
+/// `cron` where the schema has `additionalProperties` instead of `properties`.
+fn write_section_fields(
+    out: &mut String,
+    schema: &Value,
+    defs: &Map<String, Value>,
+    _path_str: &str,
+    path: &[&str],
+) {
+    let empty = Map::new();
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .unwrap_or(&empty);
+
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
     out.push_str("| Key | Type | Default | Description |\n");
     out.push_str("|-----|------|---------|-------------|\n");
 
@@ -552,8 +614,7 @@ fn write_section(out: &mut String, path: &[&str], schema: &Value, defs: &Map<Str
         let resolved = resolve(prop_schema, defs);
         let ty = type_label(resolved, defs);
         let default = fmt_default(resolved);
-        let desc =
-            first_line(resolved.get("description").and_then(Value::as_str)).replace('|', "\\|");
+        let desc = first_line(description(resolved).as_deref()).replace('|', "\\|");
         let req = if required.contains(&key.as_str()) {
             "\\*"
         } else {
@@ -739,6 +800,7 @@ fn first_line(s: Option<&str>) -> String {
 #[cfg(all(test, feature = "schema-export"))]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn index_links_each_section_to_its_anchor() {
@@ -788,6 +850,209 @@ mod tests {
             assert!(
                 table.contains(&format!("<code>{field}</code>")),
                 "mcp.servers field table missing `{field}`"
+            );
+        }
+    }
+
+    #[test]
+    fn html_escape_replaces_all_markup_characters() {
+        assert_eq!(html_escape("a<b>c"), "a&lt;b&gt;c");
+        assert_eq!(html_escape("\"quoted\""), "&quot;quoted&quot;");
+        assert_eq!(html_escape("plain text"), "plain text");
+        assert_eq!(html_escape(""), "");
+    }
+
+    #[test]
+    fn html_escape_encodes_ampersand_first_to_avoid_double_escaping() {
+        // The `&` replacement must run before the others, otherwise the `&`
+        // introduced by `&lt;` / `&gt;` / `&quot;` would itself be re-escaped.
+        assert_eq!(html_escape("<&>"), "&lt;&amp;&gt;");
+        assert_eq!(html_escape("a & b"), "a &amp; b");
+        assert_eq!(html_escape("&amp;"), "&amp;amp;");
+    }
+
+    #[test]
+    fn strip_intra_doc_links_keeps_the_text_and_drops_the_rust_path() {
+        // The shape that breaks the docs deploy: rustdoc resolves these,
+        // mdBook renders them as dead relative links.
+        assert_eq!(
+            strip_intra_doc_links(
+                "issues codes through the same [`PairingGuard`](crate::pairing::PairingGuard) as startup pairing"
+            ),
+            "issues codes through the same `PairingGuard` as startup pairing"
+        );
+        // rustdoc disambiguators and call/macro suffixes are Rust paths too.
+        assert_eq!(
+            strip_intra_doc_links(
+                "see [it](struct@crate::pairing::PairingGuard) and [f](crate::m::f())"
+            ),
+            "see it and f"
+        );
+        assert_eq!(
+            strip_intra_doc_links(
+                "[`ModelProviders::first_entry_with_model`](crate::providers::ModelProviders::first_entry_with_model)"
+            ),
+            "`ModelProviders::first_entry_with_model`"
+        );
+    }
+
+    #[test]
+    fn strip_intra_doc_links_leaves_real_links_untouched() {
+        let url = "open [the dashboard](http://127.0.0.1:42617/config/gateway) now";
+        assert_eq!(strip_intra_doc_links(url), url);
+        let page = "see [the guide](../ops/observability.md#logs)";
+        assert_eq!(strip_intra_doc_links(page), page);
+        // An IPv6 literal contains `::` but is still a URL.
+        let ipv6 = "bind [here](http://[::1]:42617/config)";
+        assert_eq!(strip_intra_doc_links(ipv6), ipv6);
+        // Not a link: a bare bracket pair, and the shortcut form rustdoc also
+        // accepts (no target to strip, so it passes through unchanged).
+        assert_eq!(strip_intra_doc_links("a [b] c"), "a [b] c");
+        assert_eq!(
+            strip_intra_doc_links("see [`Config::foo`]"),
+            "see [`Config::foo`]"
+        );
+        // Unbalanced delimiters are left exactly as written rather than eaten.
+        assert_eq!(strip_intra_doc_links("[text](crate::x"), "[text](crate::x");
+        assert_eq!(strip_intra_doc_links("[text"), "[text");
+    }
+
+    #[test]
+    fn strip_intra_doc_links_copies_code_spans_verbatim() {
+        // A doc comment demonstrating the syntax keeps it inside code.
+        assert_eq!(
+            strip_intra_doc_links("write ``[`X`](crate::X)`` in rustdoc"),
+            "write ``[`X`](crate::X)`` in rustdoc"
+        );
+        assert_eq!(
+            strip_intra_doc_links("`a::b` then [`c`](crate::c)"),
+            "`a::b` then `c`"
+        );
+        // An unterminated code span must not swallow the rest as a panic.
+        assert_eq!(strip_intra_doc_links("`unclosed"), "`unclosed");
+        // Multi-byte text is preserved byte-for-byte.
+        assert_eq!(
+            strip_intra_doc_links("clé 🔑 [`x`](crate::x)"),
+            "clé 🔑 `x`"
+        );
+    }
+
+    #[test]
+    fn description_strips_links_before_the_text_reaches_the_book() {
+        let schema = json!({
+            "description": "Uses [`PairingGuard`](crate::pairing::PairingGuard) today."
+        });
+        assert_eq!(
+            description(&schema).as_deref(),
+            Some("Uses `PairingGuard` today.")
+        );
+        assert_eq!(description(&json!({})), None);
+    }
+
+    #[test]
+    fn generated_reference_has_no_rust_path_link_targets() {
+        // Whole-document guard: whatever doc comments the schema carries, the
+        // rendered reference must never ship a `crate::`-style link target,
+        // because the book's internal link check fails the docs deploy on it.
+        let out = generate(&schemars::schema_for!(crate::schema::Config).to_value());
+        for (n, line) in out.lines().enumerate() {
+            let mut rest = line;
+            while let Some(at) = rest.find("](") {
+                let target = &rest[at + 2..];
+                let end = target.find(')').unwrap_or(target.len());
+                let target = &target[..end];
+                let is_rust_path = target.contains("::") && !target.contains("://");
+                assert!(
+                    !is_rust_path,
+                    "line {} ships a Rust path as a link target: {target}",
+                    n + 1
+                );
+                rest = &rest[at + 2..];
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_prose_collapses_whitespace_to_single_spaces() {
+        assert_eq!(markdown_prose("  a\n  b\t c  "), "a b c");
+        assert_eq!(markdown_prose("single"), "single");
+        assert_eq!(markdown_prose("   "), "");
+        assert_eq!(markdown_prose(""), "");
+        // Inline code spans are just whitespace-delimited tokens here.
+        assert_eq!(markdown_prose("use `foo`  now"), "use `foo` now");
+    }
+
+    #[test]
+    fn inline_code_html_wraps_backticked_values_and_escapes_inner_text() {
+        assert_eq!(inline_code_html("`true`"), "<code>true</code>");
+        assert_eq!(inline_code_html("  `42`  "), "<code>42</code>");
+        // Inner markup is HTML-escaped inside the <code> wrapper.
+        assert_eq!(inline_code_html("`<x>`"), "<code>&lt;x&gt;</code>");
+    }
+
+    #[test]
+    fn inline_code_html_escapes_unwrapped_or_unbalanced_input() {
+        assert_eq!(inline_code_html("plain"), "plain");
+        assert_eq!(inline_code_html("a<b>"), "a&lt;b&gt;");
+        // A single leading backtick is not a balanced wrap, so it is escaped as-is.
+        assert_eq!(inline_code_html("`open"), "`open");
+        assert_eq!(inline_code_html("`"), "`");
+    }
+
+    #[test]
+    fn first_line_returns_first_line_or_empty() {
+        assert_eq!(first_line(Some("first\nsecond")), "first");
+        assert_eq!(first_line(Some("only")), "only");
+        assert_eq!(first_line(Some("first\r\nsecond")), "first");
+        assert_eq!(first_line(Some("")), "");
+        assert_eq!(first_line(None), "");
+    }
+
+    #[test]
+    fn docker_workspace_root_contract_appears_in_generated_reference() {
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let md = generate(&schema.to_value());
+        let row = md
+            .lines()
+            .find(|line| line.contains("`allowed_workspace_roots`"))
+            .expect("generated config reference should include Docker workspace roots");
+
+        assert!(row.contains("fail-closed"));
+        assert!(row.contains("workspace must exist and canonicalize"));
+        assert!(row.contains("every configured root must also exist and canonicalize"));
+        assert!(row.contains("one invalid entry rejects the command"));
+        assert!(row.contains("empty list permits any canonical workspace"));
+    }
+
+    #[test]
+    fn cron_section_exposes_uses_memory_field() {
+        // Regression test: the generated config reference must expose
+        // per-cron-job fields (including `uses_memory`) instead of only the
+        // top-level `[cron]` summary. `cron` is a `HashMap<String, CronJobDecl>`
+        // — the generator must descend into `additionalProperties` to render
+        // the CronJobDecl fields.
+        let schema = schemars::schema_for!(crate::schema::Config);
+        let md = generate(&schema.to_value());
+
+        // The cron section heading with <alias> must exist.
+        assert!(
+            md.contains("## `cron.<alias>`"),
+            "cron section should have a `cron.<alias>` subheading"
+        );
+
+        // `uses_memory` must appear as a field in the cron section.
+        assert!(
+            md.contains("uses_memory"),
+            "cron section should expose the `uses_memory` field"
+        );
+
+        // Other CronJobDecl fields should also be present.
+        for field in [
+            "name", "job_type", "schedule", "enabled", "prompt", "command",
+        ] {
+            assert!(
+                md.contains(field),
+                "cron section should expose the `{field}` field"
             );
         }
     }

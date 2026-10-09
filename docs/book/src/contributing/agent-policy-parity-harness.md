@@ -27,10 +27,20 @@ runtime knobs) are assembled at several distinct sites:
 | Gateway | the gateway server |
 | `loop_::run` | non-interactive runs: cron jobs, the daemon heartbeat, sub-agent spawning |
 | Delegate | sub-agent delegation |
+| SOP live nested step | `drive_live_sop_actions`: a step delegating to a different agent re-assembles that agent's engine input in-flight |
 
 Each path must hand the engine the same policy for the same agent config. The
 parity harness asserts exactly that: a setting enforced on one path is enforced
-on every path.
+on every path. The SOP live nested-step path is a sub-turn inside an already-running
+turn: when a step names a different agent, its complete execution contract is
+re-assembled through the same seam rather than inherited from the parent turn --
+gated tools, security policy, MCP scope, provider binding and temperature, resolved
+runtime controls, and an approval manager carrying the step agent's risk profile
+under the parent surface's interactivity mode. The step runs on an explicit child
+transcript (its own system prompt plus the step context; the parent conversation
+never reaches the step agent's provider), and its records stamp the step agent as
+the acting identity with the delegating agent as parent correlation. A path that
+cannot re-assemble fails the cross-agent step closed.
 
 ## The parity matrix
 
@@ -60,21 +70,88 @@ into it and seal the inputs. With that resolution and sealing in place:
 - a newtype with a private field (for example a scoped tool registry that only the
   resolver can mint) makes handing the engine an unresolved policy a compile error.
 
-The end state is that the divergence is uncompilable rather than merely tested
-against. Current/future boundary: `ResolvedAgentExecution`, its `resolve()`
-constructor, and the `ResolvedIo` / `ResolvedRuntimeKnobs` input layers all exist on
-`master` and every production path constructs through them; absorbing each surface's
-per-field resolution into `resolve()`, and sealing the bundle's fields behind it, are
-the work later surface PRs do.
+The end state is that the divergence is uncompilable rather than merely tested against. Current/future boundary: `ResolvedAgentExecution`, its `resolve()` constructor, and the `ResolvedIo` / `ResolvedRuntimeKnobs` input layers all exist on `master` and every production path constructs through them. The tool surface has its gated constructor and sealed registry type (`ScopedToolRegistry::assemble`, below). Absorbing the remaining surfaces' per-field resolution into `resolve()`, and sealing the bundle's other fields behind it, remain work for later surface PRs.
+
+## The tool-assembly seam (Epic A, the first surface)
+
+The per-agent tool registry is the first surface with a single gated constructor:
+`ScopedToolRegistry::assemble` (`crates/zeroclaw-runtime/src/tools/scoped.rs`). The
+registry has historically been assembled by hand at six construction sites - the
+reason the built-in filter and MCP scoping had to be patched per-site (#7064,
+\#6960, #8120). `assemble` applies, in order: the agent's `config.peripherals`
+(when connected - see the knob below), the built-in `allowed_tools`/
+`excluded_tools` filter, the ACP memory strip, MCP server scoping per `mcp_bundles`
+plus per-tool gating (eager or deferred; omission is not a grant) with the MCP
+capability tools and pinned-resources prompt section, and skill registration under
+the same `SecurityPolicy` (a site with no skills passes an empty slice - the
+gateway does, until the Epic F loader unification).
+
+Per-site variation is expressed as data, never as a skipped security step. The
+`ScopedAssembly` knobs only narrow or withhold - none can widen what the policy
+grants:
+
+- `caller_allowed` - a per-run allowlist (the `run()` path); intersects with, never
+  overrides, the policy filter and the MCP tool-access policy.
+- `connect_mcp` - `false` on the ACP fast-boot path: MCP servers are neither
+  resolved nor connected, so nothing is granted.
+- `connect_peripherals` - `false` on listing-only surfaces: loading peripherals
+  physically connects hardware (exclusive serial holds), which a registry no turn
+  runs against must never do.
+- `exclude_memory` - the ACP memory-tool strip.
+
+Cut-over status (the strangle, one site per PR): the **gateway** (#8640),
+`loop_::run` (#8700), and `process_message` (#8701) all construct through
+`assemble` today. The gateway cut-over - both its registry builders, the
+dashboard-agent seed and the per-agent `/api/tools` listings - closed the
+gateway's filter gap by construction: its listings previously showed
+unfiltered built-ins the agent's policy denies (live gateway chat resolves
+through `process_message`, which already filtered), plus a `tool_search` stub
+even when policy denied every deferred MCP tool. One scoping note keeps the
+listings claim honest: peripherals are excluded from listings by design
+(`connect_peripherals: false` - enumerating them without connecting hardware
+is a future refinement). The `process_message` cut-over closed a second,
+independent divergence: it previously filtered built-ins through
+`filter_channel_builtin_tools`, a variant that admitted the canonical
+read-only defaults past `allowed_tools` at non-Full autonomy, while every
+other path applied the plain `apply_policy_tool_filter`. #8701 retired that
+variant, so every path now applies the same plain filter (ledger A4, backed
+by an in-file positive parity test rather than a divergence characterization).
+
+The remaining construction sites have also migrated: the channels orchestrator (`start_channels`), `Agent::from_config`, and the delegate independent-target builder (`independent_agentic_tools_for_target`). The seal landed in #9319. Every production tool-assembly path now mints through `ScopedToolRegistry::assemble`. `ScopedToolRegistry` is a private-field newtype in `crates/zeroclaw-runtime/src/tools/scoped.rs`; the turn-engine carriers (`ResolvedAgentExecution` and `ResolvedIo`), `Agent`, and `ChannelRuntimeContext` carry that sealed type. Handing those carriers a raw tool vector instead is a compile error. The registry exposes immutable slice access; `retain` only narrows an already sealed registry, and `into_inner` consumes it for non-turn consumers such as listings.
+
+The fixture escape hatch remains: `ScopedToolRegistry::from_raw_for_test` is gated by `cfg(any(test, feature = "test-util"))`. The `test-util` feature supports cross-crate test fixtures and is enabled through development dependencies, not production dependency edges. The seal therefore enforces the production construction boundary without preventing tests from supplying raw fixtures.
+
+Parity row 1 is `Tested`. `parity_l2_builtin_filter_semantic_parity` in `crates/zeroclaw-runtime/src/agent/parity.rs` compares assembly with the shared built-in filter; `tools::scoped::tests::assemble_applies_the_builtin_filter_uniformly` verifies allowed and excluded tools at the assembly seam. These tests establish filter behavior. The private field and sealed carrier types establish the construction boundary; the tests do not independently execute every production entry path. `parity_matrix_rows_are_owned_tracked_and_evidenced` checks row bookkeeping only, not whether a named test exists or proves the claim. This closes the tool-construction divergence, not the remaining policy surfaces.
 
 ## The harness
 
-The parity harness does not exist on `master` yet: today the runtime has
-`agent/safety_net.rs` and `agent/turn/execution.rs`, not `agent/parity.rs`. The
-harness will live in `crates/zeroclaw-runtime/src/agent/parity.rs`, a `#[cfg(test)]`
-sibling of the `#7415` `safety_net.rs` turn-engine oracle - that is the intended
-location if it remains the chosen shape. A future surface PR creates it; thereafter
-it grows one surface at a time and asserts only what no other test covers:
+The parity harness lives at `crates/zeroclaw-runtime/src/agent/parity.rs`, a
+`#[cfg(test)]` sibling of the `#7415` `safety_net.rs` turn-engine oracle, reusing
+its fixtures. It carries an INDEX of parity rows - each naming its owner epic, a
+public tracking reference, and the test (or tracked-divergence record) that backs
+it - plus two layers of tests. The index deliberately encodes no per-path verdict
+grid: a static grid of hand-written cells would itself be data that goes stale
+when another PR changes a path, with no test noticing - the very failure this
+program exists to end. So the enforceable claims live only in the tests; a
+meta-test enforces the index's bookkeeping (owner, tracking, and evidence
+present), nothing more. The human-readable (setting x path) grid lives in this
+page. The two test layers:
+
+- **L1 engine locks**: when a setting reaches `run_tool_call_loop`, the engine
+  honors it (e.g. an `excluded_tools` entry never executes, even if the model
+  calls it).
+- **L2 path-parity** is what asserts a setting resolves the same on every
+  construction path. Where a surface already resolves through one seam, its L2
+  test is a positive parity assertion. Where a confirmed divergence has no single
+  seam yet, it ships as an always-running characterization test that pins the
+  divergence as it exists (asserting the two paths currently differ) - so when the
+  owning epic unifies the semantic, that assertion fails in the same PR and must be
+  rewritten into the positive parity assertion. The divergence can change only
+  loudly, never silently. There are no `#[ignore]`d specs: a known-failing ignored
+  test never runs in CI and protects nothing, so the goal is carried as a live
+  assertion of the current state.
+
+It grows one surface at a time and asserts only what no other test covers:
 
 - A surface (tools, approval, runtime budgets, context and history, memory,
   skills) is strangled into `resolve` one PR at a time.
@@ -85,8 +162,9 @@ it grows one surface at a time and asserts only what no other test covers:
   cross-path parity assertion, which is the property no per-primitive test makes.
 
 Until a surface has a single resolution seam, there is nothing to assert parity
-against, so its row stays in the divergence record as documentation rather than as
-a premature test.
+against, so its row stays in the divergence record as an always-running
+divergence characterization rather than as a premature green test - never as an
+`#[ignore]`d spec, consistent with the no-ignored-specs rule above.
 
 ## Adding a surface (the workflow each future surface PR follows)
 

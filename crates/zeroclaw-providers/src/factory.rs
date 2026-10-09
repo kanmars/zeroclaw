@@ -4,14 +4,14 @@
 //! `zeroclaw-config::providers::ModelProviders` declares its own construction
 //! via one of two traits:
 //!
-//! - [`CompatFamilySpec`] for OpenAI-compatible families. Declare
+//! - `CompatFamilySpec` for OpenAI-compatible families. Declare
 //!   `DISPLAY` / `DEFAULT_URL` / `AUTH`; the blanket
 //!   `impl<T: CompatFamilySpec> FamilyProviderFactory for T` produces the
 //!   provider. Families with minor modifiers (`.without_native_tools()`,
-//!   `.with_models_dev_key(...)`, multi-endpoint URI fallback) override
+//!   `.models_dev_key(...)`, multi-endpoint URI fallback) override
 //!   `build_compat` — still one place per family, no flat dispatch arm.
 //!
-//! - [`FamilyProviderFactory`] directly for bespoke families that wrap a
+//! - `FamilyProviderFactory` directly for bespoke families that wrap a
 //!   non-compat runtime provider (`azure`, `gemini`, `openrouter`,
 //!   `bedrock`, `anthropic`, …).
 //!
@@ -27,14 +27,71 @@ use crate::compatible::{AuthStyle, OpenAiCompatibleModelProvider};
 use crate::traits::ModelProvider;
 use anyhow::Result;
 
-/// Per-family construction trait. Implemented (directly or via the
-/// `CompatFamilySpec` blanket) by every typed `<Family>ModelProviderConfig`.
-///
-/// `&self` IS the typed alias config — implementations read their own
-/// per-alias fields directly instead of through a flat options dumping
-/// ground. `api_url` is the resolved endpoint URL (operator override or
-/// pre-resolved family default); `key` is the resolved API credential.
-pub trait FamilyProviderFactory {
+const XAI_DEFAULT_URL: &str = "https://api.x.ai/v1";
+const OLLAMA_COMPAT_DEFAULT_URL: &str = "http://localhost:11434/v1";
+const GROQ_DEFAULT_URL: &str = "https://api.groq.com/openai/v1";
+const LMSTUDIO_DEFAULT_URL: &str = "http://localhost:1234/v1";
+const LLAMACPP_DEFAULT_URL: &str = "http://localhost:8080/v1";
+const OSAURUS_DEFAULT_URL: &str = "http://localhost:1337/v1";
+const OVH_DEFAULT_URL: &str = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1";
+
+/// Family-level endpoint behavior when no operator alias is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderEndpoint {
+    /// The family has one stable default endpoint.
+    Fixed(&'static str),
+    /// The endpoint depends on region, credentials, discovery, or runtime state.
+    Dynamic,
+    /// The operator must configure an endpoint before construction.
+    OperatorRequired,
+    /// The family invokes a CLI rather than an HTTP model endpoint.
+    CliBacked,
+}
+
+impl ProviderEndpoint {
+    #[must_use]
+    /// Return the stable URL only for [`ProviderEndpoint::Fixed`].
+    pub const fn fixed_url(self) -> Option<&'static str> {
+        match self {
+            Self::Fixed(url) => Some(url),
+            Self::Dynamic | Self::OperatorRequired | Self::CliBacked => None,
+        }
+    }
+}
+
+pub(crate) trait FamilyProviderFactory {
+    const ENDPOINT: ProviderEndpoint;
+
+    /// How a context-window discovery probe must authenticate to this
+    /// family's model catalog, or `None` when the family is not eligible for
+    /// generic catalog discovery at all.
+    ///
+    /// Eligibility and authentication are deliberately *one* fact rather than
+    /// two. A family cannot be declared probeable without also declaring how
+    /// its stored credential becomes an outbound header, so the generic
+    /// reader can never be handed a raw credential it does not know how to
+    /// transform. [`crate::fetch_context_window`] resolves this and applies it
+    /// through the compatible module's `apply_auth_to_request` — the same
+    /// function the family's chat requests use. (Plain text rather than an
+    /// intra-doc link: that helper is crate-private, and a public item may not
+    /// link to it.)
+    ///
+    /// The default is `None`: a family is probed only when it has been
+    /// verified to serve `GET {base}/models` returning `data[].id` with a
+    /// per-model `context_length` (or the sibling `context_window` spelling).
+    /// Speaking the OpenAI-compatible *chat* wire is not that proof — a family
+    /// can be chat-compatible and publish its catalog at another path, in
+    /// another shape, or not at all. Opting in without that evidence buys a
+    /// doomed request per alias on every `doctor` run and an implied catalog
+    /// that does not exist.
+    ///
+    /// Declared per family rather than in a hand-maintained list elsewhere,
+    /// because the list was the original bug: a provider added without also
+    /// being written into it silently kept the unconfigured 32,000-token
+    /// fallback ([`zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK`]),
+    /// and nothing failed to compile to say so.
+    const MODEL_CONTEXT_CATALOG_AUTH: Option<AuthStyle> = None;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -48,27 +105,49 @@ pub trait FamilyProviderFactory {
     }
 }
 
+fn fixed_family_endpoint<T: FamilyProviderFactory>() -> &'static str {
+    // INVARIANT: this helper is called only by factory implementations whose
+    // associated endpoint is declared `Fixed`; registry tests enumerate the
+    // canonical families and enforce that classification.
+    T::ENDPOINT
+        .fixed_url()
+        .expect("fixed endpoint helper requires a fixed provider family")
+}
+
 /// Spec trait for OpenAI-compatible families. Implementing this gives a
 /// `FamilyProviderFactory` impl for free via the blanket below.
 ///
 /// Override [`CompatFamilySpec::build_compat`] when the family needs minor
 /// modifiers (e.g. `.without_native_tools()`); otherwise the default
-/// `OpenAiCompatibleModelProvider::new` constructor is used.
-pub trait CompatFamilySpec {
+/// `OpenAiCompatibleModelProvider::builder` entry point is used.
+pub(crate) trait CompatFamilySpec {
     const DISPLAY: &'static str;
     const DEFAULT_URL: &'static str;
     const AUTH: AuthStyle;
+    const ENDPOINT_IS_DYNAMIC: bool = false;
     const FALLBACK_ALLOWS_MISSING_API_KEY: bool = false;
 
-    /// `models.dev` catalog key for this provider, when present in the
-    /// public catalog. Lets `list_models()` pre-populate the model
-    /// picker without a credential — the gateway and TUI both surface
-    /// the cataloged IDs even before the operator pastes their API key.
-    /// Set to `None` for providers that don't have a `models.dev`
-    /// entry; their picker stays empty until a credential unlocks the
-    /// live `/models` endpoint, which the dashboard already falls back
-    /// to a free-text input for.
     const MODELS_DEV_KEY: Option<&'static str> = None;
+
+    /// Whether this family is verified to serve `GET {DEFAULT_URL}/models`
+    /// returning `data[].id` with a per-model `context_length` (or the
+    /// sibling `context_window` spelling), so context-window discovery can
+    /// read it.
+    ///
+    /// Default `false`. Being an OpenAI-compatible *chat* family is not
+    /// evidence for this: `CompatFamilySpec` proves the chat wire, not the
+    /// catalog endpoint or its shape. NEAR AI is the standing counter-example
+    /// — it is a compat chat family whose catalog lives at `/v1/model/list`
+    /// in a `models[].modelId` shape with no context field at all (see
+    /// [`crate::catalog`]).
+    ///
+    /// Opt in only with evidence, and only for a family whose
+    /// [`FamilyProviderFactory::ENDPOINT`] is [`ProviderEndpoint::Fixed`] — a
+    /// probeable family with no resolvable default endpoint would silently
+    /// answer `None` for every operator who did not set `uri` by hand.
+    /// `every_probeable_family_resolves_a_default_catalog_url` holds that pair
+    /// together.
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = false;
 
     /// OpenRouter vendor prefix used by `list_models` as a last-resort
     /// fallback when this family has no `models.dev` entry and no live
@@ -76,24 +155,10 @@ pub trait CompatFamilySpec {
     /// (e.g. Sambanova, Hyperbolic — no public catalog at all without a key).
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = None;
 
-    /// Wire protocol selector for this entry, when the family reads it from
-    /// per-alias config. Defaults to `None` so families that only speak
-    /// chat_completions need no override.
-    ///
-    /// A family whose endpoint can serve the responses wire MUST override this
-    /// to return `self.base.wire_api`; otherwise a user's
-    /// `wire_api = "responses"` is silently ignored and routed through
-    /// chat_completions. The blanket `create_provider` consults this before
-    /// building the compat client.
     fn wire_api(&self) -> Option<zeroclaw_config::schema::WireApi> {
         None
     }
 
-    /// Whether this provider's `/models` endpoint is accessible without an
-    /// API key. When `true`, `list_models()` and `list_models_with_pricing()`
-    /// will query the live endpoint even when no credential is configured.
-    /// Defaults to `false`; set to `true` for providers like Kilo Gateway
-    /// whose model catalog is public.
     const PUBLIC_MODEL_LISTING: bool = false;
 
     /// Build the base compat provider with both catalog consts applied. Use
@@ -104,40 +169,59 @@ pub trait CompatFamilySpec {
         alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
-    ) -> OpenAiCompatibleModelProvider {
-        let mut p = OpenAiCompatibleModelProvider::new(
-            alias,
-            Self::DISPLAY,
-            api_url.unwrap_or(Self::DEFAULT_URL),
-            key,
-            Self::AUTH,
-        );
+    ) -> crate::compatible::OpenAiCompatibleBuilder {
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name(Self::DISPLAY)
+            .base_url(api_url.unwrap_or(Self::DEFAULT_URL))
+            .credential(key)
+            .auth_style(Self::AUTH);
+        if !Self::ENDPOINT_IS_DYNAMIC {
+            b = b.canonical_base_url(Self::DEFAULT_URL);
+        }
         if let Some(catalog_key) = Self::MODELS_DEV_KEY {
-            p = p.with_models_dev_key(catalog_key);
+            b = b.models_dev_key(catalog_key);
         }
         if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
-            p = p.with_openrouter_vendor_prefix(prefix);
+            b = b.openrouter_vendor_prefix(prefix);
         }
         if Self::PUBLIC_MODEL_LISTING {
-            p = p.with_public_model_listing();
+            b = b.public_model_listing();
         }
-        p
+        b
     }
 
-    /// Build the underlying compat provider. Default just returns the base
-    /// from `build_compat_base`; override to chain family-specific
-    /// modifiers (e.g. `.without_native_tools()`, `.with_merge_system_into_user()`).
+    /// Build the underlying compat provider builder. Default just returns the
+    /// base from `build_compat_base`; override to chain family-specific
+    /// modifiers (e.g. `.without_native_tools()`, `.merge_system_into_user_preserving_native()`).
     fn build_compat(
         &self,
         alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
-    ) -> OpenAiCompatibleModelProvider {
+    ) -> crate::compatible::OpenAiCompatibleBuilder {
         self.build_compat_base(alias, key, api_url)
     }
 }
 
 impl<T: CompatFamilySpec> FamilyProviderFactory for T {
+    const ENDPOINT: ProviderEndpoint = if T::ENDPOINT_IS_DYNAMIC {
+        ProviderEndpoint::Dynamic
+    } else {
+        ProviderEndpoint::Fixed(T::DEFAULT_URL)
+    };
+
+    /// Derived, never restated: a family that opted into catalog discovery
+    /// probes it with exactly the [`CompatFamilySpec::AUTH`] its own chat
+    /// requests use. There is no second place to declare the auth style, so
+    /// discovery cannot drift away from the request path — which is what
+    /// would put a `ZhipuJwt` family's long-lived `id.secret` on the wire
+    /// behind a plain `Bearer`.
+    const MODEL_CONTEXT_CATALOG_AUTH: Option<AuthStyle> = if T::SERVES_MODEL_CONTEXT_CATALOG {
+        Some(T::AUTH)
+    } else {
+        None
+    };
+
     fn create_provider(
         &self,
         alias: &str,
@@ -173,59 +257,132 @@ fn has_non_empty_value(value: Option<&str>) -> bool {
     value.map(str::trim).is_some_and(|value| !value.is_empty())
 }
 
-/// Apply cross-cutting compat post-processing (timeout, headers, api_path,
-/// max_tokens, reasoning effort) to a freshly-constructed compat provider
-/// and box it for trait-object dispatch. Single source of the post-process
-/// chain — every compat impl funnels through here.
+/// Merge the config-driven request-body extras into a single object that the
+/// compat builder flattens onto the top level of every request.
+///
+/// - `provider_extra` supplies arbitrary top-level keys. Only object-shaped
+///   JSON is threaded through; other shapes are dropped here (and warned about
+///   by the caller).
+/// - `chat_template_kwargs` is nested under its own `chat_template_kwargs` key,
+///   matching what chat-template-aware backends (vLLM, SGLang, llama.cpp)
+///   expect. Only object-shaped JSON is threaded through, mirroring
+///   `provider_extra`; other shapes are dropped here (and warned about by the
+///   caller).
+///
+/// Returns `None` when neither source contributes anything, so the caller can
+/// skip setting `extra_body` entirely.
+fn merge_extra_body(
+    provider_extra: Option<&serde_json::Value>,
+    chat_template_kwargs: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let mut merged = serde_json::Map::new();
+    if let Some(obj) = provider_extra.and_then(serde_json::Value::as_object) {
+        merged.extend(obj.clone());
+    }
+    if let Some(kwargs) = chat_template_kwargs.filter(|v| v.is_object()) {
+        merged.insert("chat_template_kwargs".to_string(), kwargs.clone());
+    }
+    (!merged.is_empty()).then_some(serde_json::Value::Object(merged))
+}
+
+/// Apply cross-cutting compat overrides (timeout, headers, api_path,
+/// max_tokens, reasoning effort, TLS CA, `provider_extra`,
+/// `chat_template_kwargs`) to a compat builder before calling `.build()` and
+/// boxing the trait object. Single source of the override chain — every compat
+/// impl funnels through here.
 pub fn apply_compat_options(
-    mut p: OpenAiCompatibleModelProvider,
+    mut b: crate::compatible::OpenAiCompatibleBuilder,
     opts: &ModelProviderRuntimeOptions,
 ) -> Box<dyn ModelProvider> {
     if let Some(t) = opts.provider_timeout_secs {
-        p = p.with_timeout_secs(t);
+        b = b.timeout_secs(t);
     }
     if let Some(ref effort) = opts.reasoning_effort {
-        p = p.with_reasoning_effort(Some(effort.clone()));
+        b = b.reasoning_effort(Some(effort.clone()));
+    }
+    if opts.reasoning_effort_passthrough {
+        b = b.with_reasoning_effort_passthrough();
     }
     if !opts.extra_headers.is_empty() {
-        p = p.with_extra_headers(opts.extra_headers.clone());
+        b = b.extra_headers(opts.extra_headers.clone());
     }
     if opts.api_path.is_some() {
-        p = p.with_api_path(opts.api_path.clone());
+        b = b.api_path(opts.api_path.clone());
     }
     if let Some(mt) = opts.provider_max_tokens {
-        p = p.with_max_tokens(Some(mt));
+        b = b.max_tokens(Some(mt));
     }
     if let Some(ref cert_path) = opts.tls_ca_cert_path {
-        p = p.with_tls_ca_cert_path(cert_path);
+        b = b.tls_ca_cert_path(cert_path);
     }
-    if let Some(extra) = &opts.provider_extra {
-        if extra.is_object() {
-            p = p.with_extra_body(extra.clone());
-        } else {
-            let config_path = format!("[providers.models.{}].provider_extra", p.alias);
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "alias": p.alias,
-                        "config_path": &config_path,
-                    })),
-                "provider_extra must be a JSON object (use TOML inline \
-                 table syntax, not a JSON string). Got: {extra}. Config path: {config_path}",
-            );
-        }
+    b = b.tool_result_image_policy(opts.tool_result_image_policy);
+    if opts.replay_assistant_reasoning == Some(false) {
+        b = b.without_assistant_reasoning_replay();
+    }
+    if opts.thinking_passthrough {
+        b = b.with_thinking_passthrough();
+    }
+    // The configured `[multimodal]` policy. Without this the provider boundary
+    // would re-normalize already-prepared messages under defaults and could
+    // trim images the runtime had accepted under the operator's settings.
+    b = b.multimodal(opts.multimodal.clone());
+    if opts.cache_passthrough {
+        b = b.with_cache_passthrough();
+    }
+    if let Some(cache_ttl) = opts.cache_ttl {
+        b = b.with_cache_ttl(cache_ttl);
+    }
+    // `provider_extra` alias is captured before `build()` because the WARN
+    // path below reads it for logging. Only object-shaped JSON is threaded
+    // through; other shapes produce a WARN and are ignored (matching the
+    // pre-refactor behaviour).
+    //
+    // `chat_template_kwargs` is folded into the same `extra_body` object under
+    // its own top-level key, so a chat-template payload rides the request body
+    // even when `provider_extra` is unset. The builder exposes a single
+    // `extra_body` slot, hence the merge here rather than two setter calls.
+    if let Some(extra) = merge_extra_body(
+        opts.provider_extra.as_ref(),
+        opts.chat_template_kwargs.as_ref(),
+    ) {
+        b = b.extra_body(extra);
+    }
+    let p = b.build();
+    if let Some(extra) = &opts.provider_extra
+        && !extra.is_object()
+    {
+        let config_path = format!("[providers.models.{}].provider_extra", p.alias);
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "alias": p.alias,
+                    "config_path": &config_path,
+                })),
+            "provider_extra must be a JSON object (use TOML inline \
+             table syntax, not a JSON string). Got: {extra}. Config path: {config_path}",
+        );
+    }
+    if let Some(kwargs) = &opts.chat_template_kwargs
+        && !kwargs.is_object()
+    {
+        let config_path = format!("[providers.models.{}].chat_template_kwargs", p.alias);
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "alias": p.alias,
+                    "config_path": &config_path,
+                })),
+            "chat_template_kwargs must be a JSON object (use TOML inline \
+             table syntax). Got: {kwargs}. Config path: {config_path}",
+        );
     }
     Box::new(p)
 }
 
-/// Build an `OpenAiResponsesModelProvider` from the per-alias runtime options,
-/// applying the same `max_tokens` / `reasoning_effort` overrides every family
-/// that speaks the responses wire shares. Returns `None` unless `wire_api`
-/// selects the responses protocol, so a caller can route with a single
-/// `if let Some(p) = build_responses_provider_if_requested(..)` and fall
-/// through to its chat-completions build otherwise.
 fn build_responses_provider_if_requested(
     wire_api: Option<zeroclaw_config::schema::WireApi>,
     alias: &str,
@@ -236,48 +393,40 @@ fn build_responses_provider_if_requested(
     if wire_api != Some(zeroclaw_config::schema::WireApi::Responses) {
         return None;
     }
-    let mut p = crate::openai::OpenAiResponsesModelProvider::new(alias, base_url, key);
+    let mut builder = crate::openai::OpenAiResponsesModelProvider::builder(alias).credential(key);
+    if let Some(url) = base_url {
+        builder = builder.api_url(url);
+    }
+    if let Some(t) = opts.provider_timeout_secs {
+        builder = builder.timeout_secs(t);
+    }
     if let Some(mt) = opts.provider_max_tokens {
-        p = p.with_max_tokens(Some(mt));
+        builder = builder.max_tokens(Some(mt));
     }
     if let Some(ref effort) = opts.reasoning_effort {
-        p = p.with_reasoning_effort(Some(effort.clone()));
+        builder = builder.reasoning_effort(Some(effort.clone()));
     }
-    Some(Box::new(p))
+    if !opts.extra_headers.is_empty() {
+        builder = builder.extra_headers(opts.extra_headers.clone());
+    }
+    Some(Box::new(builder.build()))
 }
 
 pub(crate) fn build_kimi_code_compat(
     alias: &str,
     key: Option<&str>,
     base_url: &str,
-) -> OpenAiCompatibleModelProvider {
-    OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
-        alias,
-        "Kimi Code",
-        base_url,
-        key,
-        AuthStyle::Bearer,
-        "KimiCLI/0.77",
-        true,
-    )
-    .with_models_dev_key("moonshotai")
+) -> crate::compatible::OpenAiCompatibleBuilder {
+    OpenAiCompatibleModelProvider::builder(alias)
+        .display_name("Kimi Code")
+        .base_url(base_url)
+        .credential(key)
+        .auth_style(AuthStyle::Bearer)
+        .user_agent("KimiCLI/0.77")
+        .vision(true)
+        .models_dev_key("moonshotai")
 }
 
-/// Dispatch family construction by routing `(family, alias)` to the typed
-/// slot's `FamilyProviderFactory` impl. Generated from
-/// `for_each_model_provider_slot!` so the family list lives in exactly one
-/// place — adding a row to the slot macro requires a corresponding impl,
-/// caught at compile time when the macro expands.
-///
-/// `family` is the canonicalized family name (post-V2 synonym mapping);
-/// `alias` is the per-family entry key (`default`, `prod_v2`, …).
-///
-/// `config` is `Option` so legacy entry points (tests, programmatic
-/// factory calls without agent context) can dispatch without a real
-/// `Config` — those fall back to the family struct's `Default` impl,
-/// which gives compat-only families full functionality and bespoke
-/// families their unconfigured defaults (Azure errors helpfully on
-/// missing `resource`, etc.).
 pub fn dispatch_family_factory(
     config: Option<&zeroclaw_config::schema::Config>,
     family: &str,
@@ -286,6 +435,17 @@ pub fn dispatch_family_factory(
     api_url: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
 ) -> Result<Box<dyn ModelProvider>> {
+    // openai missing-entry fallback: see `openai_missing_entry_fallback_config`.
+    // A persisted entry keeps its stored `wire_api`; an implicit dispatch with no
+    // entry (bare `openai` ref or a dangling alias) stays on the chat-completions
+    // wire so existing installs don't flip wire + tool-calling mode on upgrade.
+    if family == "openai" {
+        let default_cfg = openai_missing_entry_fallback_config();
+        let cfg = config
+            .and_then(|c| c.providers.models.openai.get(alias))
+            .unwrap_or(&default_cfg);
+        return cfg.create_provider(alias, key, api_url, opts);
+    }
     macro_rules! emit_dispatch {
         ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
             match family {
@@ -344,6 +504,21 @@ pub(crate) fn fallback_auth_ready_for_alias(
         .filter(|value| !value.is_empty())
         .unwrap_or(family);
 
+    // openai missing-entry fallback: keep construction symmetric with
+    // `dispatch_family_factory`. `wire_api` does not influence auth-readiness,
+    // but constructing the same chat-anchored fallback avoids any future
+    // divergence if that changes.
+    if provider_kind == "openai" {
+        let default_cfg = openai_missing_entry_fallback_config();
+        let cfg = config
+            .providers
+            .models
+            .openai
+            .get(alias)
+            .unwrap_or(&default_cfg);
+        return cfg.fallback_auth_ready(key, opts);
+    }
+
     macro_rules! emit_auth_ready {
         ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
             match provider_kind {
@@ -376,42 +551,89 @@ pub(crate) fn fallback_auth_ready_for_alias(
     zeroclaw_config::for_each_model_provider_slot!(emit_auth_ready)
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// Per-family impls — grouped by category. Adding a family means: one row
-// in `for_each_model_provider_slot!` (zeroclaw-config) plus one impl
-// here. Compiler enforces both via the slot-macro-driven dispatch above.
-// ════════════════════════════════════════════════════════════════════════
-
 use zeroclaw_config::schema::{
     Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnthropicModelProviderConfig,
     AnyscaleModelProviderConfig, ArceeModelProviderConfig, AstraiModelProviderConfig,
-    AtomicChatModelProviderConfig, AuthMode, AvianModelProviderConfig, AzureModelProviderConfig,
-    BaichuanModelProviderConfig, BasetenModelProviderConfig, BedrockModelProviderConfig,
-    CerebrasModelProviderConfig, CloudflareModelProviderConfig, CohereModelProviderConfig,
-    CopilotModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
+    AtlasCloudModelProviderConfig, AtomicChatModelProviderConfig, AuthMode,
+    AvianModelProviderConfig, AzureModelProviderConfig, BaichuanModelProviderConfig,
+    BasetenModelProviderConfig, BedrockModelProviderConfig, CerebrasModelProviderConfig,
+    CloudflareModelProviderConfig, CohereModelProviderConfig, CopilotModelProviderConfig,
+    CrusoeModelProviderConfig, CustomModelProviderConfig, DeepinfraModelProviderConfig,
     DeepmystModelProviderConfig, DeepseekModelProviderConfig, DoubaoModelProviderConfig,
     FeatherlessModelProviderConfig, FireworksModelProviderConfig, FriendliModelProviderConfig,
     GeminiCliModelProviderConfig, GeminiModelProviderConfig, GithubModelsModelProviderConfig,
-    GlmModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
-    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
-    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
-    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
-    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
-    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
-    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
-    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
-    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
-    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
-    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
-    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
-    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
-    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    GlmModelProviderConfig, GrokCliModelProviderConfig, GroqModelProviderConfig,
+    HAILO_OLLAMA_DEFAULT_URI, HailoOllamaEndpoint, HailoOllamaModelProviderConfig,
+    HuggingfaceModelProviderConfig, HunyuanModelProviderConfig, HyperbolicModelProviderConfig,
+    InceptionModelProviderConfig, KiloCliModelProviderConfig, KiloModelProviderConfig,
+    LambdaAiModelProviderConfig, LeptonModelProviderConfig, LitellmModelProviderConfig,
+    LlamacppModelProviderConfig, LmstudioModelProviderConfig, ManifestModelProviderConfig,
+    MinimaxModelProviderConfig, MistralModelProviderConfig, MoonshotEndpoint,
+    MoonshotModelProviderConfig, MorphModelProviderConfig, NearaiModelProviderConfig,
+    NebiusModelProviderConfig, NovitaModelProviderConfig, NscaleModelProviderConfig,
+    NvidiaModelProviderConfig, OllamaModelProviderConfig, OpenAIModelProviderConfig,
+    OpenRouterModelProviderConfig, OpencodeModelProviderConfig, OsaurusModelProviderConfig,
+    OvhModelProviderConfig, PerplexityModelProviderConfig, QianfanModelProviderConfig,
+    QwenModelProviderConfig, RekaModelProviderConfig, SambanovaModelProviderConfig,
+    SglangModelProviderConfig, SiliconflowModelProviderConfig, StepfunModelProviderConfig,
+    SyntheticModelProviderConfig, TelnyxModelProviderConfig, TogetherModelProviderConfig,
+    UpstageModelProviderConfig, VeniceModelProviderConfig, VercelModelProviderConfig,
+    VllmModelProviderConfig, XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZerorouterModelProviderConfig,
 };
 
+#[must_use]
+/// Resolve endpoint behavior for one canonical provider family.
+pub fn endpoint_for_family(provider_type: &str) -> Option<ProviderEndpoint> {
+    macro_rules! emit_endpoint {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match provider_type {
+                $( $type_str => Some(<$cfg_ty as FamilyProviderFactory>::ENDPOINT), )+
+                _ => None,
+            }
+        };
+    }
+    zeroclaw_config::for_each_model_provider_slot!(emit_endpoint)
+}
+
+/// Get the fixed default API URL for a canonical provider family.
+#[deprecated(note = "use endpoint_for_family or default_model_provider_url")]
+pub fn get_default_url(provider_type: &str) -> Option<&'static str> {
+    endpoint_for_family(provider_type).and_then(ProviderEndpoint::fixed_url)
+}
+
+/// How a context-window discovery probe authenticates to `provider_type`'s
+/// model catalog, or `None` when that family is not probeable — per the
+/// family's `FamilyProviderFactory::MODEL_CONTEXT_CATALOG_AUTH` declaration.
+/// (Plain text rather than an intra-doc link: the trait is crate-private, and
+/// a public item may not link to it.)
+///
+/// Generated by [`for_each_model_provider_slot!`] — the same macro that
+/// defines the typed slots — so the answer is derived from the family list
+/// instead of tracking it by hand. A family declares this beside its own spec
+/// and is classified the moment its slot exists, which is the property the
+/// previous hand-written list in [`crate::fetch_context_window`] did not have.
+///
+/// [`for_each_model_provider_slot!`]: zeroclaw_config::for_each_model_provider_slot
+#[must_use]
+pub fn family_model_context_catalog_auth(provider_type: &str) -> Option<AuthStyle> {
+    macro_rules! emit_context_catalog_auth {
+        ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+            match provider_type {
+                $(
+                    $type_str => {
+                        <$cfg_ty as FamilyProviderFactory>::MODEL_CONTEXT_CATALOG_AUTH
+                    }
+                )+
+                _ => None,
+            }
+        };
+    }
+    zeroclaw_config::for_each_model_provider_slot!(emit_context_catalog_auth)
+}
+
 // ── Pure-compat families ───────────────────────────────────────────────
-// `OpenAiCompatibleModelProvider::new(DISPLAY, DEFAULT_URL, key, AUTH)` —
+// `OpenAiCompatibleModelProvider::builder(alias).display_name(DISPLAY).base_url(DEFAULT_URL).credential(key).auth_style(AUTH).build()` —
 // no modifiers, no per-alias logic. The blanket impl supplies
 // `FamilyProviderFactory` automatically.
 
@@ -426,6 +648,18 @@ impl CompatFamilySpec for CloudflareModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://gateway.ai.cloudflare.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("cloudflare-ai-gateway");
+}
+impl CompatFamilySpec for AtlasCloudModelProviderConfig {
+    const DISPLAY: &'static str = "Atlas Cloud";
+    const DEFAULT_URL: &'static str = "https://api.atlascloud.ai/v1";
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
+}
+impl CompatFamilySpec for ZerorouterModelProviderConfig {
+    const DISPLAY: &'static str = "ZeroRouter";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::ZEROROUTER_DEFAULT_URL;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const PUBLIC_MODEL_LISTING: bool = true;
 }
 impl CompatFamilySpec for SyntheticModelProviderConfig {
     const DISPLAY: &'static str = "Synthetic";
@@ -466,18 +700,28 @@ impl CompatFamilySpec for TogetherModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.together.xyz";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("togetherai");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
+}
+impl CompatFamilySpec for CrusoeModelProviderConfig {
+    const DISPLAY: &'static str = "Crusoe Managed Inference";
+    const DEFAULT_URL: &'static str = zeroclaw_config::schema::CrusoeEndpoint::DEFAULT_URI;
+    const AUTH: AuthStyle = AuthStyle::Bearer;
+    const MODELS_DEV_KEY: Option<&'static str> = None;
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for FireworksModelProviderConfig {
     const DISPLAY: &'static str = "Fireworks AI";
     const DEFAULT_URL: &'static str = "https://api.fireworks.ai/inference/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("fireworks-ai");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for NovitaModelProviderConfig {
     const DISPLAY: &'static str = "Novita AI";
     const DEFAULT_URL: &'static str = "https://api.novita.ai/openai";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("novita-ai");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for PerplexityModelProviderConfig {
     const DISPLAY: &'static str = "Perplexity";
@@ -543,6 +787,7 @@ impl CompatFamilySpec for HyperbolicModelProviderConfig {
     const DISPLAY: &'static str = "Hyperbolic";
     const DEFAULT_URL: &'static str = "https://api.hyperbolic.xyz/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
     // No models.dev entry and no OpenRouter prefix — operator must paste a
     // credential before `list_models` returns anything.
 }
@@ -551,6 +796,7 @@ impl CompatFamilySpec for DeepinfraModelProviderConfig {
     const DEFAULT_URL: &'static str = "https://api.deepinfra.com/v1/openai";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("deepinfra");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for HuggingfaceModelProviderConfig {
     const DISPLAY: &'static str = "Hugging Face";
@@ -585,12 +831,14 @@ impl CompatFamilySpec for AnyscaleModelProviderConfig {
     const DISPLAY: &'static str = "Anyscale";
     const DEFAULT_URL: &'static str = "https://api.endpoints.anyscale.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for NebiusModelProviderConfig {
-    const DISPLAY: &'static str = "Nebius AI Studio";
-    const DEFAULT_URL: &'static str = "https://api.studio.nebius.ai/v1";
+    const DISPLAY: &'static str = "Nebius Token Factory";
+    const DEFAULT_URL: &'static str = "https://api.tokenfactory.nebius.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("nebius");
+    const SERVES_MODEL_CONTEXT_CATALOG: bool = true;
 }
 impl CompatFamilySpec for FriendliModelProviderConfig {
     const DISPLAY: &'static str = "Friendli AI";
@@ -649,6 +897,7 @@ impl CompatFamilySpec for StepfunModelProviderConfig {
     const DISPLAY: &'static str = "Stepfun";
     const DEFAULT_URL: &'static str = "https://api.stepfun.com/v1";
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const ENDPOINT_IS_DYNAMIC: bool = true;
     const MODELS_DEV_KEY: Option<&'static str> = Some("stepfun");
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("stepfun");
 }
@@ -682,6 +931,7 @@ impl CompatFamilySpec for MoonshotModelProviderConfig {
     const DISPLAY: &'static str = "Moonshot";
     const DEFAULT_URL: &'static str = crate::MOONSHOT_INTL_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::Bearer;
+    const ENDPOINT_IS_DYNAMIC: bool = true;
     const MODELS_DEV_KEY: Option<&'static str> = Some("moonshotai");
 
     fn build_compat(
@@ -689,7 +939,7 @@ impl CompatFamilySpec for MoonshotModelProviderConfig {
         alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
-    ) -> OpenAiCompatibleModelProvider {
+    ) -> crate::compatible::OpenAiCompatibleBuilder {
         let base_url = api_url.unwrap_or(Self::DEFAULT_URL);
         if self.endpoint == MoonshotEndpoint::Code || base_url == crate::moonshot_code_base_url() {
             return build_kimi_code_compat(alias, key, base_url);
@@ -713,7 +963,7 @@ impl CompatFamilySpec for VeniceModelProviderConfig {
         alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
-    ) -> OpenAiCompatibleModelProvider {
+    ) -> crate::compatible::OpenAiCompatibleBuilder {
         self.build_compat_base(alias, key, api_url)
             .without_native_tools()
     }
@@ -737,20 +987,15 @@ impl CompatFamilySpec for AtomicChatModelProviderConfig {
         alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
-    ) -> OpenAiCompatibleModelProvider {
+    ) -> crate::compatible::OpenAiCompatibleBuilder {
         self.build_compat_base(alias, key, api_url)
             .without_native_tools()
     }
 }
 
-impl CompatFamilySpec for XaiModelProviderConfig {
-    const DISPLAY: &'static str = "xAI";
-    const DEFAULT_URL: &'static str = "https://api.x.ai/v1";
-    const AUTH: AuthStyle = AuthStyle::Bearer;
-    const MODELS_DEV_KEY: Option<&'static str> = Some("xai");
-}
+impl FamilyProviderFactory for XaiModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(XAI_DEFAULT_URL);
 
-impl FamilyProviderFactory for MinimaxModelProviderConfig {
     fn create_provider(
         &self,
         alias: &str,
@@ -758,12 +1003,53 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // OAuth refresh path: when the operator supplied an
-        // `oauth_refresh_token`, exchange it for a short-lived access
-        // token before constructing the provider. Region picked from
-        // the typed `endpoint` enum (Cn/Intl). Operators preferring
-        // dashboard-generated long-lived API keys leave the refresh
-        // token unset and populate `api_key` directly.
+        if let Some(p) = build_responses_provider_if_requested(
+            self.base.wire_api,
+            alias,
+            api_url.or(Some(fixed_family_endpoint::<Self>())),
+            key,
+            opts,
+        ) {
+            return Ok(p);
+        }
+
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("xAI")
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()))
+            .canonical_base_url(fixed_family_endpoint::<Self>())
+            .credential(key)
+            .auth_style(AuthStyle::Bearer)
+            .models_dev_key("xai");
+
+        if !has_api_key(key) {
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
+            let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
+            b = b.auth_profile("xai", auth_service, opts.auth_profile_override.clone());
+        }
+
+        Ok(apply_compat_options(b, opts))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
+impl FamilyProviderFactory for MinimaxModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
         let refreshed_key: Option<String> = self
             .oauth_refresh_token
             .as_deref()
@@ -780,15 +1066,13 @@ impl FamilyProviderFactory for MinimaxModelProviderConfig {
             })
             .transpose()?;
         let resolved_key = refreshed_key.as_deref().or(key);
-        let p = OpenAiCompatibleModelProvider::new(
-            alias,
-            "MiniMax",
-            api_url.unwrap_or(crate::MINIMAX_INTL_BASE_URL),
-            resolved_key,
-            AuthStyle::Bearer,
-        )
-        .with_merge_system_into_user();
-        Ok(apply_compat_options(p, opts))
+        let b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("MiniMax")
+            .base_url(api_url.unwrap_or(crate::MINIMAX_INTL_BASE_URL))
+            .credential(resolved_key)
+            .auth_style(AuthStyle::Bearer)
+            .merge_system_into_user_preserving_native();
+        Ok(apply_compat_options(b, opts))
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -800,6 +1084,7 @@ impl CompatFamilySpec for ZaiModelProviderConfig {
     const DISPLAY: &'static str = "Z.AI";
     const DEFAULT_URL: &'static str = crate::ZAI_GLOBAL_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::ZhipuJwt;
+    const ENDPOINT_IS_DYNAMIC: bool = true;
     const MODELS_DEV_KEY: Option<&'static str> = Some("zai");
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("z-ai");
 }
@@ -808,32 +1093,31 @@ impl CompatFamilySpec for GlmModelProviderConfig {
     const DISPLAY: &'static str = "GLM";
     const DEFAULT_URL: &'static str = crate::GLM_GLOBAL_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::ZhipuJwt;
+    const ENDPOINT_IS_DYNAMIC: bool = true;
     const MODELS_DEV_KEY: Option<&'static str> = Some("zhipuai");
     fn build_compat(
         &self,
         alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
-    ) -> OpenAiCompatibleModelProvider {
+    ) -> crate::compatible::OpenAiCompatibleBuilder {
         // GLM exposes vision-capable models (e.g. `glm-4.5v`). Compose the
         // catalog-conf'd base with vision flag override via the constructor
         // variant; we replay both consts manually since this constructor
         // path doesn't fold through `build_compat_base`.
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
-            alias,
-            Self::DISPLAY,
-            api_url.unwrap_or(Self::DEFAULT_URL),
-            key,
-            Self::AUTH,
-            true,
-        );
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name(Self::DISPLAY)
+            .base_url(api_url.unwrap_or(Self::DEFAULT_URL))
+            .credential(key)
+            .auth_style(Self::AUTH)
+            .vision(true);
         if let Some(catalog_key) = Self::MODELS_DEV_KEY {
-            p = p.with_models_dev_key(catalog_key);
+            b = b.models_dev_key(catalog_key);
         }
         if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
-            p = p.with_openrouter_vendor_prefix(prefix);
+            b = b.openrouter_vendor_prefix(prefix);
         }
-        p
+        b
     }
 }
 
@@ -843,14 +1127,39 @@ impl CompatFamilySpec for NvidiaModelProviderConfig {
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const MODELS_DEV_KEY: Option<&'static str> = Some("nvidia");
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("nvidia");
+
+    fn build_compat(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+    ) -> crate::compatible::OpenAiCompatibleBuilder {
+        // NVIDIA NIM exposes vision-capable models (e.g. `nvidia/llama-3.2-90av`,
+        // `google/deepseek-r1`). Compose the catalog-conf'd base with vision flag
+        // override via the constructor variant; we replay both consts manually
+        // since this constructor path doesn't fold through `build_compat_base`.
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name(Self::DISPLAY)
+            .base_url(api_url.unwrap_or(Self::DEFAULT_URL))
+            .canonical_base_url(Self::DEFAULT_URL)
+            .credential(key)
+            .auth_style(Self::AUTH)
+            .vision(true);
+        if let Some(catalog_key) = Self::MODELS_DEV_KEY {
+            b = b.models_dev_key(catalog_key);
+        }
+        if let Some(prefix) = Self::OPENROUTER_VENDOR_PREFIX {
+            b = b.openrouter_vendor_prefix(prefix);
+        }
+        b
+    }
 }
 
 impl CompatFamilySpec for QianfanModelProviderConfig {
     const DISPLAY: &'static str = "Qianfan";
-    // Default is meaningless — `build_compat` always computes via
-    // `qianfan_base_url(api_url)`. Use the helper's default fallback as
-    // a placeholder.
-    const DEFAULT_URL: &'static str = "https://qianfan.baidubce.com/v2";
+    // The helper preserves the ordinary operator override while falling back
+    // to this fixed family default.
+    const DEFAULT_URL: &'static str = crate::QIANFAN_BASE_URL;
     const AUTH: AuthStyle = AuthStyle::Bearer;
     const OPENROUTER_VENDOR_PREFIX: Option<&'static str> = Some("baidu");
     fn build_compat(
@@ -858,7 +1167,7 @@ impl CompatFamilySpec for QianfanModelProviderConfig {
         alias: &str,
         key: Option<&str>,
         api_url: Option<&str>,
-    ) -> OpenAiCompatibleModelProvider {
+    ) -> crate::compatible::OpenAiCompatibleBuilder {
         let base_url = crate::qianfan_base_url(api_url);
         let computed_url = Some(base_url.as_str());
         self.build_compat_base(alias, key, computed_url)
@@ -871,6 +1180,8 @@ impl CompatFamilySpec for QianfanModelProviderConfig {
 // (auth services, key fallback defaults, conditional native_tools, …).
 
 impl FamilyProviderFactory for OpenRouterModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::openrouter::BASE_URL);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -878,17 +1189,22 @@ impl FamilyProviderFactory for OpenRouterModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p =
-            crate::openrouter::OpenRouterModelProvider::new(alias, key, opts.provider_timeout_secs)
-                .with_max_tokens(opts.provider_max_tokens);
-        if let Some(extra) = opts.provider_extra.clone() {
-            p = p.with_extra_body(extra);
+        let mut b = crate::openrouter::OpenRouterModelProvider::builder(alias)
+            .credential(key)
+            .max_tokens(opts.provider_max_tokens);
+        if let Some(t) = opts.provider_timeout_secs {
+            b = b.timeout_secs(t);
         }
-        Ok(Box::new(p))
+        if let Some(extra) = opts.provider_extra.clone() {
+            b = b.extra_body(extra);
+        }
+        Ok(Box::new(b.build()))
     }
 }
 
 impl FamilyProviderFactory for AnthropicModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::anthropic::BASE_URL);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -896,15 +1212,47 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = crate::anthropic::AnthropicModelProvider::with_base_url(alias, key, api_url);
+        let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
+            .credential(key)
+            .server_fallback_models(self.server_fallback_models.clone())
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
-            p = p.with_max_tokens(mt);
+            b = b.max_tokens(mt);
         }
-        Ok(Box::new(p))
+        if let Some(ts) = opts.provider_timeout_secs {
+            b = b.timeout_secs(ts);
+        }
+        if let Some(cache_ttl) = opts.cache_ttl {
+            b = b.cache_ttl(cache_ttl);
+        }
+        Ok(Box::new(b.build()))
+    }
+}
+
+/// Config used when the `openai` family is dispatched with **no persisted
+/// entry** — a bare `model_provider = "openai"` reference or a dotted ref to a
+/// nonexistent alias.
+///
+/// This deliberately differs from [`OpenAIModelProviderConfig::default`], which
+/// selects the responses wire for *new persisted slots* created via
+/// `create_map_key` / `ensure`. Implicit dispatch must instead leave `wire_api`
+/// unset so it resolves to the historical chat-completions wire; otherwise an
+/// existing install with a bare `openai` ref would silently flip both its wire
+/// protocol and its tool-calling mode on upgrade, contradicting the
+/// backward-compatibility guarantee. Persisted entries are never routed through
+/// this helper — they keep whatever `wire_api` they stored.
+fn openai_missing_entry_fallback_config() -> OpenAIModelProviderConfig {
+    OpenAIModelProviderConfig {
+        base: zeroclaw_config::schema::ModelProviderConfig {
+            wire_api: None,
+            ..zeroclaw_config::schema::ModelProviderConfig::default()
+        },
     }
 }
 
 impl FamilyProviderFactory for OpenAIModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -919,20 +1267,27 @@ impl FamilyProviderFactory for OpenAIModelProviderConfig {
             ));
         }
         // Responses wire protocol with standard API key — full streaming tool calls.
+        // New OpenAI provider slots default wire_api to Responses via
+        // OpenAIModelProviderConfig::default() (persisted-slot creation). Bare/
+        // dangling dispatch uses openai_missing_entry_fallback_config() and stays
+        // on the chat wire; unset/legacy configs also fall through below.
         if let Some(p) =
             build_responses_provider_if_requested(self.base.wire_api, alias, api_url, key, opts)
         {
             return Ok(p);
         }
-        // Default: chat_completions wire with standard API key.
-        let mut p = crate::openai::OpenAiModelProvider::with_base_url(alias, api_url, key);
+        // Fallback: chat_completions wire (explicit opt-in or legacy unset configs).
+        let mut b = crate::openai::OpenAiModelProvider::builder(alias).credential(key);
+        if let Some(url) = api_url {
+            b = b.base_url(url);
+        }
         if let Some(t) = opts.provider_timeout_secs {
-            p = p.with_timeout_secs(t);
+            b = b.timeout_secs(t);
         }
         if let Some(mt) = opts.provider_max_tokens {
-            p = p.with_max_tokens(Some(mt));
+            b = b.max_tokens(Some(mt));
         }
-        Ok(Box::new(p))
+        Ok(Box::new(b.build()))
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -944,7 +1299,7 @@ fn normalize_ollama_compat_base_url(api_url: Option<&str>) -> String {
     let raw = api_url
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or("http://localhost:11434/v1");
+        .unwrap_or(fixed_family_endpoint::<OllamaModelProviderConfig>());
 
     let Ok(mut url) = reqwest::Url::parse(raw) else {
         return raw.trim_end_matches('/').to_string();
@@ -964,26 +1319,27 @@ fn build_ollama_compat_provider(
     key: Option<&str>,
     api_url: Option<&str>,
     opts: &ModelProviderRuntimeOptions,
-) -> OpenAiCompatibleModelProvider {
+) -> crate::compatible::OpenAiCompatibleBuilder {
     let base_url = normalize_ollama_compat_base_url(api_url);
     let ollama_key = key.map(str::trim).filter(|value| !value.is_empty());
-    let mut p = OpenAiCompatibleModelProvider::new_with_vision(
-        alias,
-        "Ollama",
-        &base_url,
-        ollama_key,
-        AuthStyle::Bearer,
-        true,
-    )
-    .with_local_model_tool_sanitize()
-    .with_public_model_listing();
+    let mut b = OpenAiCompatibleModelProvider::builder(alias)
+        .display_name("Ollama")
+        .base_url(&base_url)
+        .canonical_base_url(OLLAMA_COMPAT_DEFAULT_URL)
+        .credential(ollama_key)
+        .auth_style(AuthStyle::Bearer)
+        .vision(true)
+        .local_model_tool_sanitize()
+        .public_model_listing();
     if opts.merge_system_into_user {
-        p = p.with_merge_system_into_user();
+        b = b.merge_system_into_user_preserving_native();
     }
-    p
+    b
 }
 
 impl FamilyProviderFactory for OllamaModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OLLAMA_COMPAT_DEFAULT_URL);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1002,7 +1358,93 @@ impl FamilyProviderFactory for OllamaModelProviderConfig {
     }
 }
 
+impl FamilyProviderFactory for HailoOllamaModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(HAILO_OLLAMA_DEFAULT_URI);
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        use zeroclaw_config::schema::ModelEndpoint;
+
+        if opts.tls_ca_cert_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support tls_ca_cert_path");
+        }
+        if opts.think == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "thinking".to_string(),
+                message: "Hailo-Ollama does not support think=true".to_string(),
+            }));
+        }
+        if opts.vision == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "vision".to_string(),
+                message: "Hailo-Ollama does not support vision=true".to_string(),
+            }));
+        }
+        if opts.provider_extra.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support provider_extra");
+        }
+        if opts.api_path.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support api_path");
+        }
+        if opts.wire_api.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support wire_api overrides");
+        }
+        if opts.chat_template_kwargs.is_some() {
+            anyhow::bail!("Hailo-Ollama does not support chat_template_kwargs");
+        }
+        if opts.native_tools == Some(true) {
+            return Err(anyhow::Error::new(crate::ProviderCapabilityError {
+                model_provider: alias.to_string(),
+                capability: "native_tools".to_string(),
+                message: "Hailo-Ollama does not support native tool calling".to_string(),
+            }));
+        }
+
+        let max_tokens = opts
+            .provider_max_tokens
+            .map_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_PREDICT, |value| {
+                i32::try_from(value).unwrap_or(i32::MAX)
+            });
+        let tuning = crate::ollama::OllamaTuning {
+            num_ctx: self
+                .base
+                .context_window
+                .map(|value| u32::try_from(value).unwrap_or(u32::MAX))
+                .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_NUM_CTX),
+            num_predict: max_tokens,
+            temperature_override: None,
+        };
+        let endpoint = HailoOllamaEndpoint::default();
+        let base_url = api_url.unwrap_or_else(|| endpoint.uri());
+        Ok(Box::new(
+            crate::hailo_ollama::HailoOllamaModelProvider::new(
+                alias,
+                Some(base_url),
+                opts.provider_timeout_secs
+                    .unwrap_or(zeroclaw_api::model_provider::BASELINE_TIMEOUT_SECS),
+                self.queue_timeout_secs
+                    .unwrap_or(crate::hailo_ollama::HAILO_DEFAULT_QUEUE_TIMEOUT_SECS),
+                tuning,
+            )?
+            .with_auth_headers(key, &opts.extra_headers)?,
+        ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
 impl FamilyProviderFactory for GeminiModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1017,15 +1459,17 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
             )
         });
         let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
-        Ok(Box::new(crate::gemini::GeminiModelProvider::new_with_auth(
-            alias,
-            key,
-            auth_service,
-            opts.auth_profile_override.clone(),
-            self.oauth_project.clone(),
-            self.oauth_client_id.clone(),
-            self.oauth_client_secret.clone(),
-        )))
+        Ok(Box::new(
+            crate::gemini::GeminiModelProvider::builder(alias)
+                .api_key(key)
+                .managed_auth(auth_service, opts.auth_profile_override.clone())
+                .oauth_project_seed(self.oauth_project.clone())
+                .oauth_client(
+                    self.oauth_client_id.clone(),
+                    self.oauth_client_secret.clone(),
+                )
+                .build(),
+        ))
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1034,6 +1478,8 @@ impl FamilyProviderFactory for GeminiModelProviderConfig {
 }
 
 impl FamilyProviderFactory for TelnyxModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(crate::telnyx::BASE_URL);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1041,13 +1487,17 @@ impl FamilyProviderFactory for TelnyxModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::telnyx::TelnyxModelProvider::new(
-            alias, key,
-        )))
+        Ok(Box::new(
+            crate::telnyx::TelnyxModelProvider::builder(alias)
+                .api_key(key)
+                .build(),
+        ))
     }
 }
 
 impl FamilyProviderFactory for AzureModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1094,19 +1544,20 @@ impl FamilyProviderFactory for AzureModelProviderConfig {
         })?;
         let api_version = self.api_version.as_deref();
         Ok(Box::new(
-            crate::azure_openai::AzureOpenAiModelProvider::new(
-                alias,
-                key,
-                resource,
-                deployment,
-                api_version,
-                opts.reasoning_effort.clone(),
-            ),
+            crate::azure_openai::AzureOpenAiModelProvider::builder(alias)
+                .resource_name(resource)
+                .deployment_name(deployment)
+                .credential(key)
+                .api_version(api_version)
+                .reasoning_effort(opts.reasoning_effort.clone())
+                .build(),
         ))
     }
 }
 
 impl FamilyProviderFactory for BedrockModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1114,15 +1565,22 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = if let Some(api_key) = key {
-            crate::bedrock::BedrockModelProvider::with_bearer_token(alias, api_key)
+        let builder = crate::bedrock::BedrockModelProvider::builder(alias);
+        // Explicit-key path stays no-probe — do not run BEDROCK_API_KEY /
+        // AwsCredentials::from_env / from_credential_process (which can
+        // spawn a shell command) when the operator has already resolved
+        // a Bedrock API key from config.
+        let builder = if let Some(api_key) = key {
+            builder.bearer_token(api_key)
         } else {
-            crate::bedrock::BedrockModelProvider::new(alias)
+            builder
         };
-        if let Some(mt) = opts.provider_max_tokens {
-            p = p.with_max_tokens(mt);
-        }
-        Ok(Box::new(p))
+        let builder = if let Some(mt) = opts.provider_max_tokens {
+            builder.max_tokens(mt)
+        } else {
+            builder
+        };
+        Ok(Box::new(builder.build()))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1131,6 +1589,8 @@ impl FamilyProviderFactory for BedrockModelProviderConfig {
 }
 
 impl FamilyProviderFactory for QwenModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1138,11 +1598,6 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        // Per-alias OAuth refresh path: when `oauth_refresh_token` is set
-        // on this alias config, exchange it for a short-lived access
-        // token immediately. Operator override of the baked client_id
-        // and resource URL flow through the same path. When unset, fall
-        // through to the upstream `qwen login` file-cache integration.
         let alias_oauth: Option<crate::QwenOauthCredentials> = self
             .oauth_refresh_token
             .as_deref()
@@ -1182,29 +1637,25 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
             .map(ToString::to_string)
             .or_else(|| oauth_context.base_url.clone())
             .unwrap_or_else(|| crate::QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
-        let p = if oauth_context.credential.is_some() {
-            OpenAiCompatibleModelProvider::new_with_user_agent_and_vision(
-                alias,
-                "Qwen Code",
-                &base_url,
-                resolved_key,
-                AuthStyle::Bearer,
-                "QwenCode/1.0",
-                true,
-            )
+        let b = if oauth_context.credential.is_some() {
+            OpenAiCompatibleModelProvider::builder(alias)
+                .display_name("Qwen Code")
+                .base_url(&base_url)
+                .credential(resolved_key)
+                .auth_style(AuthStyle::Bearer)
+                .user_agent("QwenCode/1.0")
+                .vision(true)
         } else {
-            OpenAiCompatibleModelProvider::new_with_vision(
-                alias,
-                "Qwen",
-                &base_url,
-                resolved_key,
-                AuthStyle::Bearer,
-                true,
-            )
+            OpenAiCompatibleModelProvider::builder(alias)
+                .display_name("Qwen")
+                .base_url(&base_url)
+                .credential(resolved_key)
+                .auth_style(AuthStyle::Bearer)
+                .vision(true)
         }
-        .with_models_dev_key("alibaba")
-        .with_openrouter_vendor_prefix("qwen");
-        Ok(apply_compat_options(p, opts))
+        .models_dev_key("alibaba")
+        .openrouter_vendor_prefix("qwen");
+        Ok(apply_compat_options(b, opts))
     }
 
     fn fallback_auth_ready(&self, key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1215,6 +1666,17 @@ impl FamilyProviderFactory for QwenModelProviderConfig {
 }
 
 impl FamilyProviderFactory for GroqModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(GROQ_DEFAULT_URL);
+
+    /// Groq builds its compat provider by hand rather than through
+    /// [`CompatFamilySpec`], so it declares the catalog policy directly. It
+    /// was in the hand-written probe list this const replaces, and
+    /// `create_provider` below authenticates with [`AuthStyle::Bearer`] —
+    /// discovery states the same thing, and
+    /// `groq_probes_with_the_same_auth_its_request_path_uses` fails if the two
+    /// ever diverge.
+    const MODEL_CONTEXT_CATALOG_AUTH: Option<AuthStyle> = Some(AuthStyle::Bearer);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1222,26 +1684,27 @@ impl FamilyProviderFactory for GroqModelProviderConfig {
         _api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let mut p = OpenAiCompatibleModelProvider::new(
-            alias,
-            "Groq",
-            "https://api.groq.com/openai/v1",
-            key,
-            AuthStyle::Bearer,
-        )
-        .with_models_dev_key("groq")
-        .without_assistant_reasoning_replay();
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("Groq")
+            .base_url(fixed_family_endpoint::<Self>())
+            .canonical_base_url(fixed_family_endpoint::<Self>())
+            .credential(key)
+            .auth_style(AuthStyle::Bearer)
+            .models_dev_key("groq")
+            .without_assistant_reasoning_replay();
         // Groq's llama-family models reject native tool calls with HTTP
         // 400; default to text-fallback. Operators can override per-alias
         // via `[providers.models.groq.<alias>] native_tools = true`.
         if opts.native_tools != Some(true) {
-            p = p.without_native_tools();
+            b = b.without_native_tools();
         }
-        Ok(apply_compat_options(p, opts))
+        Ok(apply_compat_options(b, opts))
     }
 }
 
 impl FamilyProviderFactory for CopilotModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Dynamic;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1249,9 +1712,11 @@ impl FamilyProviderFactory for CopilotModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::copilot::CopilotModelProvider::new(
-            alias, key,
-        )))
+        Ok(Box::new(
+            crate::copilot::CopilotModelProvider::builder(alias)
+                .github_token(key)
+                .build(),
+        ))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1260,6 +1725,8 @@ impl FamilyProviderFactory for CopilotModelProviderConfig {
 }
 
 impl FamilyProviderFactory for GeminiCliModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1267,10 +1734,48 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::gemini_cli::GeminiCliModelProvider::new(
-            alias,
-            self.binary_path.as_deref(),
-        )))
+        Ok(Box::new(
+            crate::gemini_cli::GeminiCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .build(),
+        ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
+impl FamilyProviderFactory for GrokCliModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        _api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        if has_api_key(key) {
+            anyhow::bail!(
+                "grok_cli does not accept api_key; use `grok login`, or export `XAI_API_KEY` and list it in the alias env_passthrough"
+            );
+        }
+        Ok(Box::new(
+            crate::grok_cli::GrokCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .working_directory(&self.working_directory)
+                .env_passthrough(self.env_passthrough.clone())
+                .extra_args(self.extra_args.clone())
+                .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
+                .timeout_secs(self.base.timeout_secs)
+                // Optional send-path only: alias `vision = true` makes
+                // ZeroClaw emit ACP image blocks. Grok still advertises
+                // image=false through 0.2.118 and does not reliably use the
+                // pixels; leave unset in production until upstream vision works.
+                .vision_enabled(opts.vision == Some(true))
+                .build()?,
+        ))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1279,6 +1784,8 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
 }
 
 impl FamilyProviderFactory for KiloCliModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1286,10 +1793,11 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::kilocli::KiloCliModelProvider::new(
-            alias,
-            self.binary_path.as_deref(),
-        )))
+        Ok(Box::new(
+            crate::kilocli::KiloCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .build(),
+        ))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1311,6 +1819,8 @@ impl CompatFamilySpec for KiloModelProviderConfig {
 }
 
 impl FamilyProviderFactory for LmstudioModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(LMSTUDIO_DEFAULT_URL);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1322,14 +1832,13 @@ impl FamilyProviderFactory for LmstudioModelProviderConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("lm-studio");
-        let p = OpenAiCompatibleModelProvider::new(
-            alias,
-            "LM Studio",
-            api_url.unwrap_or("http://localhost:1234/v1"),
-            Some(lm_studio_key),
-            AuthStyle::Bearer,
-        );
-        Ok(apply_compat_options(p, opts))
+        let b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("LM Studio")
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()))
+            .canonical_base_url(fixed_family_endpoint::<Self>())
+            .credential(Some(lm_studio_key))
+            .auth_style(AuthStyle::Bearer);
+        Ok(apply_compat_options(b, opts))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1338,6 +1847,8 @@ impl FamilyProviderFactory for LmstudioModelProviderConfig {
 }
 
 impl FamilyProviderFactory for LlamacppModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(LLAMACPP_DEFAULT_URL);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1345,7 +1856,7 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
         api_url: Option<&str>,
         opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        let base_url = api_url.unwrap_or("http://localhost:8080/v1");
+        let base_url = api_url.unwrap_or(fixed_family_endpoint::<Self>());
         let llama_cpp_key = key
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -1359,19 +1870,18 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
         ) {
             return Ok(p);
         }
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
-            alias,
-            "llama.cpp",
-            base_url,
-            Some(llama_cpp_key),
-            AuthStyle::Bearer,
-            true,
-        )
-        .with_local_model_tool_sanitize();
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("llama.cpp")
+            .base_url(base_url)
+            .canonical_base_url(fixed_family_endpoint::<Self>())
+            .credential(Some(llama_cpp_key))
+            .auth_style(AuthStyle::Bearer)
+            .vision(true)
+            .local_model_tool_sanitize();
         if opts.merge_system_into_user {
-            p = p.with_merge_system_into_user();
+            b = b.merge_system_into_user_preserving_native();
         }
-        Ok(apply_compat_options(p, opts))
+        Ok(apply_compat_options(b, opts))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1380,6 +1890,8 @@ impl FamilyProviderFactory for LlamacppModelProviderConfig {
 }
 
 impl FamilyProviderFactory for OsaurusModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OSAURUS_DEFAULT_URL);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1391,14 +1903,13 @@ impl FamilyProviderFactory for OsaurusModelProviderConfig {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("osaurus");
-        let p = OpenAiCompatibleModelProvider::new(
-            alias,
-            "Osaurus",
-            api_url.unwrap_or("http://localhost:1337/v1"),
-            Some(osaurus_key),
-            AuthStyle::Bearer,
-        );
-        Ok(apply_compat_options(p, opts))
+        let b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("Osaurus")
+            .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()))
+            .canonical_base_url(fixed_family_endpoint::<Self>())
+            .credential(Some(osaurus_key))
+            .auth_style(AuthStyle::Bearer);
+        Ok(apply_compat_options(b, opts))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1407,6 +1918,8 @@ impl FamilyProviderFactory for OsaurusModelProviderConfig {
 }
 
 impl FamilyProviderFactory for OvhModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(OVH_DEFAULT_URL);
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1414,15 +1927,19 @@ impl FamilyProviderFactory for OvhModelProviderConfig {
         _api_url: Option<&str>,
         _opts: &ModelProviderRuntimeOptions,
     ) -> Result<Box<dyn ModelProvider>> {
-        Ok(Box::new(crate::openai::OpenAiModelProvider::with_base_url(
-            alias,
-            Some("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"),
-            key,
-        )))
+        Ok(Box::new(
+            crate::openai::OpenAiModelProvider::builder(alias)
+                .credential(key)
+                .base_url(fixed_family_endpoint::<Self>())
+                .canonical_base_url(fixed_family_endpoint::<Self>())
+                .build(),
+        ))
     }
 }
 
 impl FamilyProviderFactory for CustomModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1456,21 +1973,19 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
         ) {
             return Ok(p);
         }
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
-            alias,
-            "Custom",
-            base_url,
-            key,
-            AuthStyle::Bearer,
-            true,
-        );
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("Custom")
+            .base_url(base_url)
+            .credential(key)
+            .auth_style(AuthStyle::Bearer)
+            .vision(true);
         if opts.native_tools != Some(true) {
-            p = p.without_native_tools();
+            b = b.without_native_tools();
         }
         if opts.merge_system_into_user {
-            p = p.with_merge_system_into_user();
+            b = b.merge_system_into_user_preserving_native();
         }
-        Ok(apply_compat_options(p, opts))
+        Ok(apply_compat_options(b, opts))
     }
 
     fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
@@ -1479,6 +1994,8 @@ impl FamilyProviderFactory for CustomModelProviderConfig {
 }
 
 impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::OperatorRequired;
+
     fn create_provider(
         &self,
         alias: &str,
@@ -1497,30 +2014,356 @@ impl FamilyProviderFactory for zeroclaw_config::schema::ModelProviderConfig {
         {
             return Ok(p);
         }
-        let mut p = OpenAiCompatibleModelProvider::new_with_vision(
-            alias,
-            "OpenAI Compatible",
-            base_url,
-            key,
-            AuthStyle::Bearer,
-            true,
-        );
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("OpenAI Compatible")
+            .base_url(base_url)
+            .credential(key)
+            .auth_style(AuthStyle::Bearer)
+            .vision(true);
         if opts.merge_system_into_user {
-            p = p.with_merge_system_into_user();
+            b = b.merge_system_into_user_preserving_native();
         }
-        Ok(apply_compat_options(p, opts))
+        Ok(apply_compat_options(b, opts))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroclaw_config::schema::ModelProviderConfig;
+    use zeroclaw_config::schema::{ModelProviderConfig, WireApi};
 
-    /// Regression for the #7136 review: the Kilo Gateway default exists in two
-    /// places — the typed `KiloEndpoint` in zeroclaw-config and the factory's
-    /// `CompatFamilySpec::DEFAULT_URL` — and they must never drift apart.
-    /// kilo.ai/docs/gateway documents `api.kilo.ai` as the canonical API host.
+    #[test]
+    fn cache_passthrough_runtime_option_reaches_provider_capability() {
+        let provider = apply_compat_options(
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("custom")
+                .base_url("http://127.0.0.1:1")
+                .auth_style(AuthStyle::Bearer),
+            &ModelProviderRuntimeOptions {
+                cache_passthrough: true,
+                ..ModelProviderRuntimeOptions::default()
+            },
+        );
+        assert!(
+            provider.capabilities().prompt_caching,
+            "factory must thread cache_passthrough into the provider capability"
+        );
+
+        let default_provider = apply_compat_options(
+            OpenAiCompatibleModelProvider::builder("test")
+                .display_name("custom")
+                .base_url("http://127.0.0.1:1")
+                .auth_style(AuthStyle::Bearer),
+            &ModelProviderRuntimeOptions::default(),
+        );
+        assert!(!default_provider.capabilities().prompt_caching);
+    }
+
+    /// D2a: `cache_ttl` must survive the factory boundary on both builders.
+    /// The compatible half goes through `apply_compat_options` and the native
+    /// half through `AnthropicModelProviderConfig::create_provider`; each
+    /// drives a structured chat against a capture mock, so deleting the
+    /// `with_cache_ttl` forwarding in `apply_compat_options` or the
+    /// `cache_ttl` forwarding in `create_provider` fails this test (the
+    /// markers lose their `ttl` field). The wire is the observation point
+    /// because both factory functions return `Box<dyn ModelProvider>` and
+    /// the configured lifetime has no trait-object readback.
+    #[tokio::test]
+    async fn cache_ttl_runtime_option_reaches_both_builders() {
+        use crate::traits::{ChatMessage, ChatRequest};
+        use zeroclaw_api::tool::ToolSpec;
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, CacheTtl};
+
+        fn collect_cache_controls(value: &serde_json::Value, out: &mut Vec<serde_json::Value>) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    if let Some(control) = map.get("cache_control") {
+                        out.push(control.clone());
+                    }
+                    for nested in map.values() {
+                        collect_cache_controls(nested, out);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        collect_cache_controls(item, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        async fn compat_request(opts: &ModelProviderRuntimeOptions) -> serde_json::Value {
+            use axum::{Json, Router, routing::post};
+            use std::sync::{Arc, Mutex};
+            use tokio::net::TcpListener;
+
+            let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_route = Arc::clone(&captured);
+            let app = Router::new().route(
+                "/chat/completions",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_for_route);
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        Json(serde_json::json!({
+                            "choices": [{"message": {"content": "ok"}}]
+                        }))
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = apply_compat_options(
+                OpenAiCompatibleModelProvider::builder("test")
+                    .display_name("custom")
+                    .base_url(&format!("http://{addr}"))
+                    .auth_style(AuthStyle::Bearer),
+                opts,
+            );
+            let messages = vec![
+                ChatMessage::system("be brief"),
+                ChatMessage::user("first question"),
+                ChatMessage::assistant("first answer"),
+                ChatMessage::user("second question"),
+            ];
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "test-model",
+                    None,
+                )
+                .await;
+            server.abort();
+            result.unwrap_or_else(|error| panic!("compat request failed: {error}"));
+            let requests = captured.lock().unwrap();
+            requests[0].clone()
+        }
+
+        async fn native_request(opts: &ModelProviderRuntimeOptions) -> serde_json::Value {
+            use axum::{Json, Router, routing::post};
+            use std::sync::{Arc, Mutex};
+            use tokio::net::TcpListener;
+
+            let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_route = Arc::clone(&captured);
+            let app = Router::new().route(
+                "/v1/messages",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let captured = Arc::clone(&captured_for_route);
+                    async move {
+                        captured.lock().unwrap().push(body);
+                        Json(serde_json::json!({
+                            "id": "msg_ttl",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "ok"}],
+                            "model": "claude-sonnet-4-5",
+                            "stop_reason": "end_turn",
+                            "usage": {"input_tokens": 10, "output_tokens": 2}
+                        }))
+                    }
+                }),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = ::zeroclaw_spawn::spawn!(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let provider = AnthropicModelProviderConfig::default()
+                .create_provider(
+                    "anthropic",
+                    Some("test-key"),
+                    Some(&format!("http://{addr}")),
+                    opts,
+                )
+                .expect("native anthropic provider constructs");
+            let messages = vec![
+                ChatMessage::system("You are a helpful assistant."),
+                ChatMessage::user("gen a 2 sum in golang"),
+                ChatMessage::assistant("```go\nfunc twoSum() {}\n```"),
+                ChatMessage::user("what's meaning of make here?"),
+            ];
+            let tools = vec![ToolSpec::new(
+                "shell",
+                "Run a shell command",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }),
+            )];
+            let result = provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: Some(&tools),
+                        thinking: None,
+                    },
+                    "claude-sonnet-4-5",
+                    Some(0.7),
+                )
+                .await;
+            server.abort();
+            result.unwrap_or_else(|error| panic!("native request failed: {error}"));
+            let requests = captured.lock().unwrap();
+            requests[0].clone()
+        }
+
+        let ttl_opts = ModelProviderRuntimeOptions {
+            cache_ttl: Some(CacheTtl::OneHour),
+            cache_passthrough: true,
+            ..ModelProviderRuntimeOptions::default()
+        };
+
+        let compat_one_hour = compat_request(&ttl_opts).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&compat_one_hour, &mut controls);
+        assert_eq!(
+            controls.len(),
+            2,
+            "system + rolling breakpoints expected: {compat_one_hour}"
+        );
+        for control in &controls {
+            assert_eq!(
+                control["ttl"], "1h",
+                "apply_compat_options must forward cache_ttl: {compat_one_hour}"
+            );
+        }
+
+        let compat_default = compat_request(&ModelProviderRuntimeOptions::default()).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&compat_default, &mut controls);
+        assert!(
+            controls.is_empty(),
+            "default options must place no cache_control: {compat_default}"
+        );
+
+        let native_one_hour = native_request(&ttl_opts).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&native_one_hour, &mut controls);
+        assert_eq!(
+            controls.len(),
+            3,
+            "system + tools + rolling markers expected: {native_one_hour}"
+        );
+        for control in &controls {
+            assert_eq!(
+                control["ttl"], "1h",
+                "create_provider must forward cache_ttl: {native_one_hour}"
+            );
+        }
+
+        let native_default = native_request(&ModelProviderRuntimeOptions::default()).await;
+        let mut controls = Vec::new();
+        collect_cache_controls(&native_default, &mut controls);
+        assert_eq!(controls.len(), 3, "marker placement is unconditional");
+        for control in &controls {
+            assert_eq!(
+                serde_json::to_string(control).unwrap(),
+                r#"{"type":"ephemeral"}"#,
+                "default options keep the pre-TTL native wire form: {native_default}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_registry_classifies_every_canonical_family() {
+        macro_rules! collect_names {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {
+                [$($type_str),+]
+            };
+        }
+        let families = zeroclaw_config::for_each_model_provider_slot!(collect_names);
+
+        for family in families {
+            assert!(
+                endpoint_for_family(family).is_some(),
+                "canonical provider {family:?} is missing endpoint metadata"
+            );
+        }
+        assert!(endpoint_for_family("not_a_provider").is_none());
+        assert!(endpoint_for_family("openai-compatible").is_none());
+        assert!(endpoint_for_family("openai_compatible").is_none());
+    }
+
+    #[test]
+    fn every_fixed_endpoint_constructs_without_an_override() {
+        macro_rules! assert_fixed_construction {
+            ($(($field:ident, $type_str:literal, $cfg_ty:ty)),+ $(,)?) => {{
+                let opts = ModelProviderRuntimeOptions::default();
+                $(
+                    if let ProviderEndpoint::Fixed(url) =
+                        <$cfg_ty as FamilyProviderFactory>::ENDPOINT
+                    {
+                        let config = <$cfg_ty>::default();
+                        let provider = config
+                            .create_provider($type_str, Some("test-key"), None, &opts)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "fixed provider family {:?} did not construct from its canonical endpoint: {error:#}",
+                                    $type_str
+                                )
+                            });
+                        assert_eq!(
+                            provider.default_base_url(),
+                            Some(url),
+                            "fixed provider family {:?} constructed a different default endpoint",
+                            $type_str
+                        );
+                    }
+                )+
+            }};
+        }
+
+        zeroclaw_config::for_each_model_provider_slot!(assert_fixed_construction);
+    }
+
+    #[test]
+    fn endpoint_registry_matches_independent_non_fixed_oracle() {
+        assert_eq!(
+            endpoint_for_family("groq"),
+            Some(ProviderEndpoint::Fixed("https://api.groq.com/openai/v1"))
+        );
+        assert_eq!(
+            endpoint_for_family("nvidia"),
+            Some(ProviderEndpoint::Fixed(
+                "https://integrate.api.nvidia.com/v1"
+            ))
+        );
+        for family in [
+            "openai", "moonshot", "qwen", "glm", "minimax", "zai", "gemini", "bedrock", "copilot",
+            "stepfun",
+        ] {
+            assert_eq!(
+                endpoint_for_family(family),
+                Some(ProviderEndpoint::Dynamic),
+                "{family} selects its endpoint at runtime"
+            );
+        }
+        for family in ["azure", "custom"] {
+            assert_eq!(
+                endpoint_for_family(family),
+                Some(ProviderEndpoint::OperatorRequired),
+                "{family} requires operator endpoint input"
+            );
+        }
+        for family in ["gemini_cli", "grok_cli", "kilocli"] {
+            assert_eq!(
+                endpoint_for_family(family),
+                Some(ProviderEndpoint::CliBacked),
+                "{family} invokes a CLI instead of a fixed HTTP endpoint"
+            );
+        }
+    }
+
     #[test]
     fn kilo_gateway_default_url_matches_schema_endpoint() {
         use zeroclaw_config::schema::{KiloEndpoint, ModelEndpoint};
@@ -1533,6 +2376,254 @@ mod tests {
             KiloEndpoint::default().uri(),
             "https://api.kilo.ai/api/gateway"
         );
+    }
+
+    #[test]
+    fn grok_cli_factory_rejects_typed_api_key_instead_of_ignoring_it() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "default",
+            Some("typed-test-key"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("grok_cli api_key must not be silently ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not accept api_key"));
+    }
+
+    #[test]
+    fn grok_cli_factory_forwards_acp_stdout_limit() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            max_acp_stdout_bytes: Some(0),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "default",
+            None,
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("invalid ACP stdout limit must not be ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("max_acp_stdout_bytes"));
+    }
+
+    #[test]
+    fn grok_cli_factory_enables_explicit_vision_override() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            binary_path: Some(
+                std::env::current_exe()
+                    .expect("current test executable")
+                    .display()
+                    .to_string(),
+            ),
+            working_directory: working_directory.path().display().to_string(),
+            ..Default::default()
+        };
+        let provider = config
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions {
+                    vision: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("vision opt-in must build the Grok CLI provider");
+
+        assert!(provider.capabilities().vision);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn atlascloud_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{AtlasCloudEndpoint, ModelEndpoint};
+        assert_eq!(
+            <AtlasCloudModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            AtlasCloudEndpoint::default().uri(),
+            "schema AtlasCloudEndpoint and factory DEFAULT_URL disagree"
+        );
+        assert_eq!(
+            get_default_url("atlascloud"),
+            Some("https://api.atlascloud.ai/v1")
+        );
+    }
+
+    #[test]
+    fn merge_extra_body_nests_chat_template_kwargs_under_own_key() {
+        let kwargs = serde_json::json!({"thinking": true, "reasoning_effort": "max"});
+        let merged = merge_extra_body(None, Some(&kwargs))
+            .expect("chat_template_kwargs alone must produce an extra_body object");
+        assert_eq!(
+            merged.get("chat_template_kwargs"),
+            Some(&kwargs),
+            "chat_template_kwargs must be nested under its own top-level key"
+        );
+    }
+
+    #[test]
+    fn merge_extra_body_combines_provider_extra_and_chat_template_kwargs() {
+        let provider_extra = serde_json::json!({"top_p": 0.95});
+        let kwargs = serde_json::json!({"thinking": true});
+        let merged = merge_extra_body(Some(&provider_extra), Some(&kwargs))
+            .expect("both sources present must produce an extra_body object");
+        assert_eq!(
+            merged.get("top_p").and_then(serde_json::Value::as_f64),
+            Some(0.95),
+            "provider_extra keys must remain at the top level"
+        );
+        assert_eq!(
+            merged.get("chat_template_kwargs"),
+            Some(&kwargs),
+            "chat_template_kwargs must coexist with provider_extra keys"
+        );
+    }
+
+    #[test]
+    fn merge_extra_body_ignores_non_object_provider_extra() {
+        let provider_extra = serde_json::json!("not-an-object");
+        assert!(
+            merge_extra_body(Some(&provider_extra), None).is_none(),
+            "a non-object provider_extra with no chat_template_kwargs must yield None"
+        );
+    }
+
+    #[test]
+    fn merge_extra_body_ignores_non_object_chat_template_kwargs() {
+        // Scalars, arrays, and null are not valid chat-template payloads; drop
+        // them the same way provider_extra drops non-object shapes.
+        for shape in [
+            serde_json::json!("max"),
+            serde_json::json!(true),
+            serde_json::json!(["a", "b"]),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                merge_extra_body(None, Some(&shape)).is_none(),
+                "a non-object chat_template_kwargs ({shape}) must be dropped, yielding None"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_extra_body_is_none_when_both_absent() {
+        assert!(
+            merge_extra_body(None, None).is_none(),
+            "no extras must yield None so the caller skips extra_body"
+        );
+    }
+
+    #[test]
+    fn zerorouter_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{ModelEndpoint, ZerorouterEndpoint};
+        assert_eq!(
+            <ZerorouterModelProviderConfig as CompatFamilySpec>::DEFAULT_URL,
+            ZerorouterEndpoint::default().uri(),
+            "schema ZerorouterEndpoint and factory DEFAULT_URL disagree on the ZeroRouter URL"
+        );
+        assert_eq!(
+            ZerorouterEndpoint::default().uri(),
+            "https://zerorouter.ai/v1",
+            "the default must be the hosted deployment — a localhost default \
+             gives a zero-config user a connection refusal or a stray dev \
+             instance's partial catalog"
+        );
+        assert!(
+            !ZerorouterModelProviderConfig::default()
+                .fallback_auth_ready(None, &ModelProviderRuntimeOptions::default()),
+            "keyless inference must not be viable without the deferred login flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn zerorouter_public_catalog_needs_no_credential() {
+        use axum::http::HeaderMap;
+        use axum::routing::get;
+        use axum::{Json, Router};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+
+        let requests = Arc::new(AtomicUsize::new(0));
+        let authorized = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let with_header = Arc::clone(&authorized);
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: HeaderMap| {
+                let seen = Arc::clone(&seen);
+                let with_header = Arc::clone(&with_header);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if headers.contains_key(axum::http::header::AUTHORIZATION) {
+                        with_header.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Json(serde_json::json!({
+                        "data": [{
+                            "id": "router/model-1",
+                            "pricing": {
+                                "prompt": "0.000001",
+                                "completion": "0.000002"
+                            }
+                        }]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public catalog fixture");
+        let addr = listener.local_addr().expect("read fixture address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve public catalog fixture");
+        });
+
+        let provider = ZerorouterModelProviderConfig::default()
+            .create_provider(
+                "public",
+                None,
+                Some(&format!("http://{addr}/v1")),
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .expect("construct a keyless ZeroRouter catalog client");
+
+        assert_eq!(
+            provider.list_models().await.expect("list public models"),
+            vec!["router/model-1".to_string()]
+        );
+        let priced = provider
+            .list_models_with_pricing()
+            .await
+            .expect("list public model pricing");
+        assert_eq!(priced.len(), 1);
+        assert_eq!(priced[0].id, "router/model-1");
+        let pricing = priced[0]
+            .pricing
+            .as_ref()
+            .expect("the public catalog pricing must be preserved");
+        assert_eq!(pricing.prompt.as_deref(), Some("0.000001"));
+        assert_eq!(pricing.completion.as_deref(), Some("0.000002"));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            authorized.load(Ordering::SeqCst),
+            0,
+            "public ZeroRouter catalog requests must omit Authorization"
+        );
+
+        server.abort();
     }
 
     #[test]
@@ -1552,9 +2643,12 @@ mod tests {
 
     #[test]
     fn openai_factory_routes_to_standard_when_requires_openai_auth_false() {
+        // Explicit chat_completions: OpenAIModelProviderConfig::default() now
+        // selects the responses wire, so this regression pins the legacy path.
         let cfg = OpenAIModelProviderConfig {
             base: ModelProviderConfig {
                 requires_openai_auth: false,
+                wire_api: Some(WireApi::ChatCompletions),
                 ..Default::default()
             },
         };
@@ -1562,6 +2656,77 @@ mod tests {
             .create_provider("test", None, None, &ModelProviderRuntimeOptions::default())
             .unwrap();
         assert!(!provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn openai_factory_defaults_new_provider_to_responses_wire() {
+        // Creating a new OpenAI provider slot (create_map_key / ensure) uses
+        // OpenAIModelProviderConfig::default(), which must select responses.
+        let provider = OpenAIModelProviderConfig::default()
+            .create_provider(
+                "test",
+                Some("sk-test"),
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(provider.default_wire_api(), "responses");
+        assert!(provider.capabilities().native_tool_calling);
+    }
+
+    #[test]
+    fn openai_dispatch_missing_entry_stays_on_chat_wire() {
+        // The responses default applies only to persisted slot creation. An implicit
+        // dispatch with no config entry — a bare `model_provider = "openai"` ref or
+        // a dangling alias —
+        // must keep the historical chat-completions wire and prompt-guided tools,
+        // so existing installs don't silently flip wire + tool-calling on upgrade.
+        let provider = dispatch_family_factory(
+            None,
+            "openai",
+            "default",
+            Some("sk-test"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("bare openai dispatch should build");
+        assert_eq!(
+            provider.default_wire_api(),
+            "chat_completions",
+            "missing-entry openai dispatch must not adopt the responses wire"
+        );
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "missing-entry openai dispatch must keep prompt-guided tool calling"
+        );
+    }
+
+    #[test]
+    fn openai_dispatch_persisted_entry_honors_responses_default() {
+        // The counterpart to the missing-entry test: a persisted openai slot that
+        // stored wire_api = responses (as create_map_key now writes) still routes
+        // through the responses provider when dispatched.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.openai.insert(
+            "default".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    wire_api: Some(WireApi::Responses),
+                    ..Default::default()
+                },
+            },
+        );
+        let provider = dispatch_family_factory(
+            Some(&config),
+            "openai",
+            "default",
+            Some("sk-test"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("persisted openai dispatch should build");
+        assert_eq!(provider.default_wire_api(), "responses");
+        assert!(provider.capabilities().native_tool_calling);
     }
 
     #[tokio::test]
@@ -1590,14 +2755,20 @@ mod tests {
             provider_timeout_secs: Some(1),
             ..Default::default()
         };
-        let provider = OpenAIModelProviderConfig::default()
-            .create_provider(
-                "native",
-                Some("test-key"),
-                Some(&format!("http://{addr}")),
-                &opts,
-            )
-            .expect("openai provider should build");
+        // Pin the chat-completions path explicitly: OpenAI defaults to responses.
+        let provider = OpenAIModelProviderConfig {
+            base: ModelProviderConfig {
+                wire_api: Some(WireApi::ChatCompletions),
+                ..Default::default()
+            },
+        }
+        .create_provider(
+            "native",
+            Some("test-key"),
+            Some(&format!("http://{addr}")),
+            &opts,
+        )
+        .expect("openai provider should build");
 
         let started = Instant::now();
         let result = provider
@@ -1710,7 +2881,8 @@ mod tests {
             None,
             Some("http://192.168.1.100:11434/v1"),
             &ModelProviderRuntimeOptions::default(),
-        );
+        )
+        .build();
 
         assert_eq!(provider.name, "Ollama");
         assert_eq!(provider.base_url, "http://192.168.1.100:11434/v1");
@@ -1724,7 +2896,8 @@ mod tests {
             None,
             Some("http://192.168.1.100:11434"),
             &ModelProviderRuntimeOptions::default(),
-        );
+        )
+        .build();
 
         assert_eq!(provider.base_url, "http://192.168.1.100:11434/v1");
     }
@@ -1736,7 +2909,8 @@ mod tests {
             None,
             Some("https://ollama.com/api"),
             &ModelProviderRuntimeOptions::default(),
-        );
+        )
+        .build();
 
         assert_eq!(provider.base_url, "https://ollama.com/v1");
     }
@@ -1748,7 +2922,8 @@ mod tests {
             Some("  ollama-key  "),
             Some("https://ollama.com/v1"),
             &ModelProviderRuntimeOptions::default(),
-        );
+        )
+        .build();
 
         assert_eq!(provider.credential.as_deref(), Some("ollama-key"));
     }
@@ -1827,6 +3002,197 @@ mod tests {
             )
             .unwrap();
         assert_ne!(provider.default_wire_api(), "responses");
+    }
+
+    #[tokio::test]
+    async fn responses_factory_forwards_timeout_secs_to_responses_provider() {
+        use axum::{Json, Router, routing::post};
+        use serde_json::json;
+        use tokio::time::{Duration, Instant};
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
+
+        async fn slow_responses() -> Json<serde_json::Value> {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Json(json!({
+                "id": "resp_slow",
+                "object": "response",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "too late"}]}],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new().route("/v1/responses", post(slow_responses));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some(format!("http://{addr}/v1")),
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let opts = ModelProviderRuntimeOptions {
+            provider_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider(
+                "vllm",
+                Some("test-key"),
+                Some(&format!("http://{addr}/v1")),
+                &opts,
+            )
+            .expect("openai responses provider should build");
+
+        // Sanity-check routing + URL composition.
+        assert_eq!(
+            provider.default_wire_api(),
+            "responses",
+            "factory should route to the responses provider when wire_api=Responses"
+        );
+        assert_eq!(
+            provider.default_base_url(),
+            Some(format!("http://{addr}/v1/responses").as_str()),
+            "factory-composed URL must end with /responses"
+        );
+
+        let started = Instant::now();
+        let result = provider
+            .chat_with_system(None, "hello", "gpt-5", Some(0.7))
+            .await;
+        let elapsed = started.elapsed();
+
+        server.abort();
+
+        assert!(
+            result.is_err(),
+            "slow response should time out when factory forwards provider_timeout_secs (1s)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "request waited for the server response instead of using configured 1s timeout: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_factory_forwards_extra_headers_to_responses_provider() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+        use serde_json::json;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+        use zeroclaw_config::schema::{CustomModelProviderConfig, ModelProviderConfig, WireApi};
+
+        let captured: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+
+        async fn capture_headers(
+            State(captured): State<Arc<Mutex<Option<HeaderMap>>>>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            *captured.lock().expect("captured headers mutex") = Some(headers);
+            Json(json!({
+                "id": "resp_ok",
+                "object": "response",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}],
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("test server addr");
+        let app = Router::new()
+            .route("/v1/responses", post(capture_headers))
+            .with_state(Arc::clone(&captured));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+
+        let cfg = CustomModelProviderConfig {
+            base: ModelProviderConfig {
+                uri: Some(format!("http://{addr}/v1")),
+                wire_api: Some(WireApi::Responses),
+                ..Default::default()
+            },
+        };
+        let mut extra_headers = HashMap::new();
+        // The two non-reserved custom headers we expect to see on the wire.
+        extra_headers.insert("X-Trace-Id".to_string(), "trace-abc-123".to_string());
+        extra_headers.insert("X-Tenant".to_string(), "acme".to_string());
+        // The reserved-header case we expect the factory to drop — the
+        // built-in `Bearer test-key` (from `Some("test-key")` below) must be
+        // the only Authorization value on the request.
+        extra_headers.insert(
+            "Authorization".to_string(),
+            "Bearer should-be-dropped".to_string(),
+        );
+        // And the case-insensitive variant — must be dropped by the same
+        // case-insensitive check in `build_default_headers`.
+        extra_headers.insert(
+            "authorization".to_string(),
+            "Bearer lower-case-should-also-be-dropped".to_string(),
+        );
+        let opts = ModelProviderRuntimeOptions {
+            extra_headers,
+            ..Default::default()
+        };
+        let provider = cfg
+            .create_provider(
+                "vllm",
+                Some("test-key"),
+                Some(&format!("http://{addr}/v1")),
+                &opts,
+            )
+            .expect("openai responses provider should build");
+
+        let result = provider
+            .chat_with_system(None, "hello", "gpt-5", Some(0.7))
+            .await;
+
+        server.abort();
+
+        assert!(result.is_ok(), "fast response should succeed: {result:?}");
+
+        let captured_headers = captured
+            .lock()
+            .expect("captured headers mutex")
+            .clone()
+            .expect("server handler must have captured the request headers");
+
+        // (a) configured custom headers arrive on the wire.
+        assert_eq!(
+            captured_headers
+                .get("X-Trace-Id")
+                .map(|v| v.to_str().unwrap()),
+            Some("trace-abc-123"),
+            "configured extra_headers['X-Trace-Id'] must reach the wire"
+        );
+        assert_eq!(
+            captured_headers
+                .get("X-Tenant")
+                .map(|v| v.to_str().unwrap()),
+            Some("acme"),
+            "configured extra_headers['X-Tenant'] must reach the wire"
+        );
+
+        let auth_values: Vec<&str> = captured_headers
+            .get_all("Authorization")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        assert_eq!(
+            auth_values.len(),
+            1,
+            "exactly one Authorization header must reach the wire; got {auth_values:?}"
+        );
+        assert_eq!(
+            auth_values[0], "Bearer test-key",
+            "the surviving Authorization must be the built-in bearer credential, not the dropped extra_headers entry"
+        );
     }
 
     #[test]
@@ -1911,11 +3277,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(provider.default_wire_api(), "responses");
-        // Security/privacy fallback pin: with no alias-level `uri`, the blanket
-        // compat route must hand OpenCode's DEFAULT_URL to the responses
-        // provider. If it stopped doing so, the provider would silently default
-        // to OpenAI's /v1/responses and send OpenCode credentials to the wrong
-        // host.
         assert_eq!(
             provider.default_base_url(),
             Some("https://opencode.ai/zen/v1/responses")
@@ -2016,5 +3377,192 @@ mod tests {
 
         let paths = capture.lock().expect("capture lock poisoned").clone();
         assert_eq!(paths, vec!["/zen/v1/responses".to_string()]);
+    }
+
+    /// The exact set of families eligible for generic context-window
+    /// discovery. This is the whole contract in one place: a family probes
+    /// only by declaring it beside its own spec, and the set is small because
+    /// the bar is evidence that `GET {base}/models` really returns
+    /// `data[].id` with a per-model `context_length`, not that the family
+    /// speaks the OpenAI-compatible chat wire.
+    const PROBEABLE_FAMILIES: [&str; 9] = [
+        "together",
+        "groq",
+        "fireworks",
+        "deepinfra",
+        "hyperbolic",
+        "anyscale",
+        "novita",
+        "nebius",
+        "crusoe",
+    ];
+
+    /// The families the hand-written probe list in `fetch_context_window` used
+    /// to name. Every one must still probe, or moving the declaration into the
+    /// registry silently took context-window discovery away from providers
+    /// that had it.
+    #[test]
+    fn every_previously_listed_family_still_probes_its_context_catalog() {
+        for family in PROBEABLE_FAMILIES {
+            assert!(
+                family_model_context_catalog_auth(family).is_some(),
+                "{family} was in the hand-written probe list and must keep probing"
+            );
+        }
+    }
+
+    /// Chat-wire compatibility is not catalog evidence, so `CompatFamilySpec`
+    /// alone must not make a family probeable. NEAR AI is the concrete reason:
+    /// it is a compat chat family whose catalog is at `/v1/model/list` in a
+    /// `models[].modelId` shape with no context field, so probing
+    /// `{base}/models` would attach the operator's credential to an endpoint
+    /// this repository never claims exists.
+    #[test]
+    fn compat_families_without_evidence_are_not_probed() {
+        for family in [
+            "nearai",
+            "mistral",
+            "deepseek",
+            "cerebras",
+            "perplexity",
+            "vllm",
+            "cohere",
+            "huggingface",
+        ] {
+            assert!(
+                family_model_context_catalog_auth(family).is_none(),
+                "{family} is chat-compatible but its catalog shape is unverified; it must not be probed"
+            );
+        }
+    }
+
+    /// Opting in is deliberate, so a family that wraps a non-compat runtime
+    /// stays out. Widening to "ask everything" would send a doomed request per
+    /// alias on every `doctor` run and imply a catalog that does not exist.
+    #[test]
+    fn bespoke_non_compat_families_are_not_probed() {
+        for family in ["anthropic", "openai", "bedrock"] {
+            assert!(
+                family_model_context_catalog_auth(family).is_none(),
+                "{family} has no OpenAI-compatible /models catalog to ask"
+            );
+        }
+        assert!(
+            family_model_context_catalog_auth("not-a-provider").is_none(),
+            "an unknown provider type must not be probed"
+        );
+    }
+
+    /// The registry is the only place eligibility lives, so this walks every
+    /// slot the family macro defines and pins the answer for all of them —
+    /// not just the ones a test remembered to name. A family added later
+    /// starts at `None` and shows up here the moment someone opts it in.
+    #[test]
+    fn no_family_outside_the_probeable_set_is_eligible() {
+        let mut eligible: Vec<&str> = zeroclaw_config::providers::ModelProviders::slot_names()
+            .iter()
+            .copied()
+            .filter(|family| family_model_context_catalog_auth(family).is_some())
+            .collect();
+        eligible.sort_unstable();
+        let mut expected = PROBEABLE_FAMILIES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            eligible, expected,
+            "the eligible set changed; widening it requires evidence that the family serves \
+             GET {{base}}/models with data[].id and context_length"
+        );
+    }
+
+    /// A probeable family with no resolvable default endpoint would answer
+    /// `None` for every operator who did not set `uri` by hand — discovery
+    /// that looks enabled and silently is not. Eligibility and a default URL
+    /// have to arrive together.
+    #[test]
+    fn every_probeable_family_resolves_a_default_catalog_url() {
+        // Walk the registry, not the list above: a family opted in later must
+        // be caught here even though no test names it.
+        for family in zeroclaw_config::providers::ModelProviders::slot_names() {
+            if family_model_context_catalog_auth(family).is_none() {
+                continue;
+            }
+            assert!(
+                endpoint_for_family(family)
+                    .and_then(ProviderEndpoint::fixed_url)
+                    .is_some(),
+                "{family} is probeable but has no default endpoint to probe, so discovery \
+                 silently answers None for every operator who did not set `uri` by hand"
+            );
+        }
+    }
+
+    /// The credential-safety invariant, stated over the whole registry rather
+    /// than the two families that motivated it: a probe must present the
+    /// stored credential exactly the way that family's request path does. Any
+    /// family whose auth transforms the credential (`ZhipuJwt` mints a
+    /// short-lived JWT from `id.secret`) is caught here if it is ever opted in
+    /// without discovery being taught the same transformation.
+    #[test]
+    fn zhipu_jwt_families_are_not_eligible_for_generic_discovery() {
+        // The premise: these two really do transform the stored credential.
+        assert!(matches!(
+            <ZaiModelProviderConfig as CompatFamilySpec>::AUTH,
+            AuthStyle::ZhipuJwt
+        ));
+        assert!(matches!(
+            <GlmModelProviderConfig as CompatFamilySpec>::AUTH,
+            AuthStyle::ZhipuJwt
+        ));
+        for family in ["zai", "glm"] {
+            assert!(
+                family_model_context_catalog_auth(family).is_none(),
+                "{family} converts its stored id.secret into a per-request JWT; the generic \
+                 catalog reader must not be handed that credential"
+            );
+        }
+        // Stated over the registry rather than the two names above, so a
+        // third JWT family cannot be opted in without this failing.
+        for family in zeroclaw_config::providers::ModelProviders::slot_names() {
+            assert!(
+                !matches!(
+                    family_model_context_catalog_auth(family),
+                    Some(AuthStyle::ZhipuJwt)
+                ),
+                "{family} is eligible for generic discovery with credential-transforming auth"
+            );
+        }
+    }
+
+    /// Groq declares its catalog policy by hand because it builds its provider
+    /// by hand. Pin the two together so discovery cannot drift away from the
+    /// auth the request path actually uses.
+    #[test]
+    fn groq_probes_with_the_same_auth_its_request_path_uses() {
+        assert!(
+            matches!(
+                family_model_context_catalog_auth("groq"),
+                Some(AuthStyle::Bearer)
+            ),
+            "groq's create_provider authenticates with Bearer; discovery must say the same"
+        );
+    }
+
+    /// Every compat family that opted in probes with its own
+    /// `CompatFamilySpec::AUTH`, because the blanket derives one from the
+    /// other rather than letting a family state it twice.
+    #[test]
+    fn compat_probes_derive_auth_from_the_family_spec() {
+        assert!(matches!(
+            <TogetherModelProviderConfig as FamilyProviderFactory>::MODEL_CONTEXT_CATALOG_AUTH,
+            Some(AuthStyle::Bearer)
+        ));
+        assert!(matches!(
+            <TogetherModelProviderConfig as CompatFamilySpec>::AUTH,
+            AuthStyle::Bearer
+        ));
+        assert!(
+            <ZaiModelProviderConfig as FamilyProviderFactory>::MODEL_CONTEXT_CATALOG_AUTH.is_none(),
+            "a family that did not opt in has no catalog policy at all"
+        );
     }
 }

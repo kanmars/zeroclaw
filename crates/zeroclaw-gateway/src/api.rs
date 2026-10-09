@@ -1,14 +1,14 @@
 //! REST API handlers for the web dashboard.
-//!
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
-use super::AppState;
+use super::{AppState, GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use zeroclaw_config::schema::{ChannelAliasInfo, Config};
 use zeroclaw_memory::MemoryEntry;
 
@@ -23,13 +23,16 @@ fn integration_entry_json(
         "category": entry.category,
         "category_label": entry.category.label(),
         "status": entry.status,
+        // Canonical config map key (provider family key / ChannelsConfig map
+        // key) for deep links; null when the entry has no config section.
+        "key": &entry.key,
     })
 }
 
 // ── Bearer token auth extractor ─────────────────────────────────
 
 /// Extract and validate bearer token from Authorization header.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -37,7 +40,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
-pub(super) fn require_auth(
+pub(crate) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -46,6 +49,16 @@ pub(super) fn require_auth(
     }
 
     let token = extract_bearer_token(headers).unwrap_or("");
+    // Defense-in-depth: reject empty tokens explicitly so a future
+    // refactor of is_authenticated cannot accidentally treat "" as valid.
+    if token.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+            })),
+        ));
+    }
     if state.pairing.is_authenticated(token) {
         Ok(())
     } else {
@@ -112,10 +125,21 @@ pub struct CronAddBody {
     pub job_type: Option<String>,
     pub prompt: Option<String>,
     pub delivery: Option<zeroclaw_runtime::cron::DeliveryConfig>,
+    /// Agent session context: `"isolated"` (default) or `"main"`. For agent jobs,
+    /// a present value that is not one of those two names is rejected; omitted
+    /// keeps the isolated default. Same contract as the `cron_add` tool. Shell
+    /// jobs ignore this field.
     pub session_target: Option<String>,
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub delete_after_run: Option<bool>,
+    /// If false, disable memory recall for this agent cron job (default: true).
+    pub uses_memory: Option<bool>,
+    /// Shell output format for shell-type cron jobs. `"wrapped"` (default) or
+    /// `"raw"`. Only meaningful when `job_type` is `"shell"` (or inferred as
+    /// shell when no prompt is given). Rejected for agent jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +159,12 @@ pub struct CronPatchBody {
     /// Toggle the job on/off without deleting it (pause/resume). `None` leaves
     /// the current state unchanged.
     pub enabled: Option<bool>,
+    /// If false, disable memory recall for this agent cron job (default: true).
+    pub uses_memory: Option<bool>,
+    /// Shell output format override. `"wrapped"` (default) or `"raw"`.
+    /// Only applied to shell-type jobs.
+    #[serde(default)]
+    pub shell_output_format: Option<zeroclaw_config::schema::CronShellOutputFormat>,
 }
 
 enum CronTimezonePatch {
@@ -205,6 +235,48 @@ pub struct SessionMessagePostBody {
 
 // ── Handlers ────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StatusNodes {
+    pub connected: Vec<String>,
+    pub mdns_peers: Vec<crate::nodes::mdns::MdnsPeerSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct StatusResponse {
+    pub version: String,
+    /// Dotted `<type>.<alias>` of the resolved model provider, or `null` when none is configured.
+    /// The unqualified provider name is reserved; this field is always qualified.
+    pub model_provider: Option<String>,
+    pub model: String,
+    /// Resolved model temperature, or `null` when no temperature is configured.
+    pub temperature: Option<f64>,
+    pub uptime_seconds: u64,
+    /// RFC 3339 UTC wall-clock time when the daemon started.
+    pub daemon_started_at: String,
+    pub gateway_port: u16,
+    pub locale: String,
+    pub memory_backend: String,
+    pub paired: bool,
+    pub channels: BTreeMap<String, bool>,
+    pub nodes: StatusNodes,
+    pub health: zeroclaw_runtime::health::HealthSnapshot,
+    /// Configured agent alias used for per-agent resolution, or `null` for the install-wide view.
+    pub agent_alias: Option<String>,
+    /// Self-process resource snapshot; unsupported hosts report zero memory and a null CPU value.
+    pub process: zeroclaw_runtime::process_stats::ProcessStats,
+    /// Whether the gateway polls for newer releases and shows an update indicator.
+    pub check_updates: bool,
+    /// Whether browser-triggered self-upgrade is enabled.
+    pub allow_self_upgrade: bool,
+    /// How the daemon is restarted after an upgrade: supervised, desktop_supervised,
+    /// self-respawn, or manual.
+    pub restart_mode: crate::version::RestartMode,
+    /// Operator-facing command or instruction for completing an upgrade restart.
+    pub restart_hint: String,
+}
+
 /// Query parameters for `GET /api/status`. Pass `?agent=<alias>` to
 /// have `model_provider`, `model`, `temperature`, and `memory_backend`
 /// reflect that specific agent's resolved config; omit it for the
@@ -230,10 +302,10 @@ pub async fn handle_api_status(
 
     // Per-alias map keyed by composite `<type>.<alias>`. Every
     // populated `[channels.<type>.<alias>]` is a separate dashboard row.
-    let mut channels = serde_json::Map::new();
+    let mut channels = BTreeMap::new();
     for info in config.channels_by_alias() {
         let composite = format!("{}.{}", info.channel_type, info.alias);
-        channels.insert(composite, serde_json::Value::Bool(true));
+        channels.insert(composite, true);
     }
 
     let locale = config
@@ -285,44 +357,77 @@ pub async fn handle_api_status(
 
     let process = zeroclaw_runtime::process_stats::sample();
 
-    let body = serde_json::json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "model_provider": model_provider,
-        "model": model,
-        "temperature": temperature,
-        "uptime_seconds": health.uptime_seconds,
-        "daemon_started_at": zeroclaw_runtime::health::daemon_started_at(),
-        "gateway_port": config.gateway.port,
-        "locale": locale,
-        "memory_backend": memory_backend,
-        "paired": state.pairing.is_paired(),
-        "channels": channels,
-        "health": health,
-        "agent_alias": agent_alias,
-        "process": process,
-    });
+    // Upgrade affordance: whether the dashboard should poll for updates / offer
+    // the upgrade button, and which restart command to show afterwards.
+    let restart = crate::version::detect_restart();
+
+    let body = StatusResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        model_provider,
+        model,
+        temperature,
+        uptime_seconds: health.uptime_seconds,
+        daemon_started_at: zeroclaw_runtime::health::daemon_started_at(),
+        gateway_port: config.gateway.port,
+        locale,
+        memory_backend,
+        paired: state.pairing.is_paired(),
+        channels,
+        nodes: StatusNodes {
+            connected: state.node_registry.node_ids(),
+            mdns_peers: state.mdns_peer_registry.snapshots(),
+        },
+        health,
+        agent_alias: agent_alias.map(String::from),
+        process,
+        check_updates: config.gateway.check_updates,
+        allow_self_upgrade: config.gateway.allow_self_upgrade,
+        restart_mode: restart.mode,
+        restart_hint: restart.hint,
+    };
 
     Json(body).into_response()
 }
 
-/// GET /api/tools — list registered tool specs
+#[derive(Debug, Deserialize)]
+pub struct ToolsQuery {
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+/// GET /api/tools - list registered tool specs, optionally scoped to `?agent=`
 pub async fn handle_api_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ToolsQuery>,
 ) -> impl IntoResponse {
     if let Err(e) = require_auth(&state, &headers) {
         return e.into_response();
     }
 
-    let tools: Vec<serde_json::Value> = state
-        .tools_registry
+    let registry = query
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .and_then(|alias| state.tools_registry_by_agent.get(alias).cloned())
+        .unwrap_or_else(|| std::sync::Arc::clone(&state.tools_registry));
+
+    let tools: Vec<serde_json::Value> = registry
         .iter()
         .map(|spec| {
-            serde_json::json!({
+            let mut tool = serde_json::json!({
                 "name": spec.name,
                 "description": spec.description,
                 "parameters": spec.parameters,
-            })
+            });
+            if let Some(output) = &spec.output {
+                tool["output"] = output.clone();
+            }
+            if !spec.param_domains.is_empty() {
+                tool["param_domains"] = serde_json::json!(spec.param_domains);
+            }
+            tool
         })
         .collect();
 
@@ -372,8 +477,25 @@ pub async fn handle_api_cron_add(
         model,
         allowed_tools,
         delete_after_run,
+        uses_memory,
+        shell_output_format,
     } = body;
 
+    let _reservation = match state
+        .agent_lifecycle
+        .reserve_config_mutation(agent_alias.trim())
+    {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": error.to_string()
+                })),
+            )
+                .into_response();
+        }
+    };
     let config = state.config.read().clone();
     if config.agent(&agent_alias).is_none() {
         return (
@@ -405,6 +527,12 @@ pub async fn handle_api_cron_add(
         matches!(job_type.as_deref(), Some("agent")) || (job_type.is_none() && prompt.is_some());
 
     let result = if is_agent {
+        if shell_output_format.is_some() {
+            return bad_request(
+                "shell_output_format is not applicable to agent jobs; agent execution ignores it",
+            )
+            .into_response();
+        }
         let prompt = match prompt.as_deref() {
             Some(p) if !p.trim().is_empty() => p,
             _ => {
@@ -416,10 +544,13 @@ pub async fn handle_api_cron_add(
             }
         };
 
-        let session_target = session_target
-            .as_deref()
-            .map(zeroclaw_runtime::cron::SessionTarget::parse)
-            .unwrap_or_default();
+        let session_target = match session_target {
+            Some(raw) => match zeroclaw_runtime::cron::SessionTarget::try_parse(&raw) {
+                Ok(target) => target,
+                Err(e) => return bad_request(e).into_response(),
+            },
+            None => zeroclaw_runtime::cron::SessionTarget::Isolated,
+        };
 
         let default_delete = matches!(schedule, zeroclaw_runtime::cron::Schedule::At { .. });
         let delete_after_run = delete_after_run.unwrap_or(default_delete);
@@ -435,6 +566,7 @@ pub async fn handle_api_cron_add(
             delivery,
             delete_after_run,
             allowed_tools,
+            uses_memory.unwrap_or(true),
         )
     } else {
         let command = match command.as_deref() {
@@ -448,7 +580,8 @@ pub async fn handle_api_cron_add(
             }
         };
 
-        zeroclaw_runtime::cron::add_shell_job_with_approval(
+        let fmt = shell_output_format.unwrap_or_default();
+        zeroclaw_runtime::cron::add_shell_job_with_approval_and_format(
             &config,
             &agent_alias,
             name,
@@ -456,6 +589,7 @@ pub async fn handle_api_cron_add(
             command,
             delivery,
             false,
+            fmt,
         )
     };
 
@@ -483,13 +617,20 @@ pub async fn handle_api_cron_runs(
     let limit = params.limit.unwrap_or(20).clamp(1, 100) as usize;
     let config = state.config.read().clone();
 
-    // Verify the job exists before listing runs.
+    // A missing job is not necessarily a missing history: a successful
+    // auto-delete one-shot removes its job row while its run record is
+    // retained durably. 404 only when neither the job nor any run exists.
     if let Err(e) = zeroclaw_runtime::cron::get_job(&config, &id) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
-        )
-            .into_response();
+        let retained = zeroclaw_runtime::cron::list_runs(&config, &id, 1)
+            .map(|runs| !runs.is_empty())
+            .unwrap_or(false);
+        if !retained {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
+            )
+                .into_response();
+        }
     }
 
     match zeroclaw_runtime::cron::list_runs(&config, &id, limit) {
@@ -505,6 +646,11 @@ pub async fn handle_api_cron_runs(
                         "status": r.status,
                         "output": r.output,
                         "duration_ms": r.duration_ms,
+                        "execution": r.execution,
+                        "delivery": r.delivery,
+                        "persistence": r.persistence,
+                        "principal": r.principal,
+                        "executing_agent": r.executing_agent,
                     })
                 })
                 .collect();
@@ -528,6 +674,11 @@ pub async fn handle_api_cron_run(
         return e.into_response();
     }
 
+    let selection = zeroclaw_runtime::live_config_authority::AgentExecutionCapability::from_parts(
+        state.config.clone(),
+        state.agent_lifecycle.clone(),
+    )
+    .capture_selection();
     let config = state.config.read().clone();
 
     let job = match zeroclaw_runtime::cron::get_job(&config, &id) {
@@ -541,73 +692,24 @@ pub async fn handle_api_cron_run(
         }
     };
 
-    let started_at = chrono::Utc::now();
-    let (mut success, output) =
-        zeroclaw_runtime::cron::scheduler::execute_job_now(&config, &job).await;
-    let finished_at = chrono::Utc::now();
-    let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = zeroclaw_runtime::cron::scheduler::deliver_and_classify_run_result(
+    let event_tx = Some(state.event_tx.clone());
+    let result = zeroclaw_runtime::cron::scheduler::run_manual_job_with_selection(
         &config,
         &job,
-        success,
-        output,
         zeroclaw_runtime::cron::scheduler::CronDeliveryContext::GatewayManual,
+        &event_tx,
+        Some(selection),
     )
     .await;
-    success = outcome.success;
-
-    if let Err(e) = zeroclaw_runtime::cron::record_run(
-        &config,
-        &job.id,
-        started_at,
-        finished_at,
-        &outcome.status,
-        Some(&outcome.output),
-        duration_ms,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to persist run history"
-        );
-    }
-    if let Err(e) = zeroclaw_runtime::cron::record_last_run_with_status(
-        &config,
-        &job.id,
-        finished_at,
-        &outcome.status,
-        &outcome.output,
-    ) {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"job_id": job.id, "error": format!("{}", e)})),
-            "manual cron trigger: failed to update last_run state"
-        );
-    }
-
-    // Broadcast the result so dashboard/SSE clients refresh in real time,
-    // matching the scheduler's automatic-execution behavior.
-    let _ = state.event_tx.send(serde_json::json!({
-        "type": "cron_result",
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "manual": true,
-        "timestamp": finished_at.to_rfc3339(),
-    }));
 
     Json(serde_json::json!({
-        "status": &outcome.status,
-        "job_id": job.id,
-        "success": success,
-        "output": &outcome.output,
-        "duration_ms": duration_ms,
-        "started_at": started_at.to_rfc3339(),
-        "finished_at": finished_at.to_rfc3339(),
+        "status": result.status,
+        "job_id": result.job_id,
+        "success": result.success,
+        "output": result.output,
+        "duration_ms": result.duration_ms,
+        "started_at": result.started_at.to_rfc3339(),
+        "finished_at": result.finished_at.to_rfc3339(),
     }))
     .into_response()
 }
@@ -634,6 +736,8 @@ pub async fn handle_api_cron_patch(
         command,
         prompt,
         enabled,
+        uses_memory,
+        shell_output_format,
     } = body;
     let timezone_patch = match parse_timezone_patch(tz, clear_tz) {
         Ok(patch) => patch,
@@ -651,14 +755,22 @@ pub async fn handle_api_cron_patch(
         }
     };
     let is_agent = matches!(existing.job_type, zeroclaw_runtime::cron::JobType::Agent);
-    // The agent only gates a shell `command` change (risk profile). For a shell
-    // job the new command can arrive via either `command` OR `prompt` (the
-    // `prompt` field is folded into the command below), so the existence check
-    // must cover both. Skip it for patches that don't set a shell command —
-    // schedule, name, and enable/disable toggles don't need an agent supplied —
-    // and for agent-type jobs, where `prompt` is an LLM prompt, not a shell
-    // command, and so is not agent-gated. This needs `existing.job_type`, hence
-    // it runs after the job is fetched.
+    if shell_output_format.is_some() {
+        if is_agent {
+            return bad_request(
+                "shell_output_format is not applicable to agent jobs; agent execution ignores it",
+            )
+            .into_response();
+        }
+        if existing.source == "declarative" {
+            return bad_request(format!(
+                "shell_output_format for declarative job '{id}' is set via \
+                 cron.{id}.shell_output_format in config.toml, not the API; \
+                 the DB column is not read for declarative jobs and this PATCH would have no effect"
+            ))
+            .into_response();
+        }
+    }
     let setting_shell_command = !is_agent && (command.is_some() || prompt.is_some());
     if setting_shell_command && config.agent(&agent_alias).is_none() {
         return (
@@ -716,6 +828,8 @@ pub async fn handle_api_cron_patch(
         command: patch_command,
         prompt: patch_prompt,
         enabled,
+        uses_memory,
+        shell_output_format,
         ..zeroclaw_runtime::cron::CronJobPatch::default()
     };
 
@@ -784,7 +898,23 @@ pub async fn handle_api_cron_settings_patch(
         return e.into_response();
     }
 
-    let mut config = state.config.read().clone();
+    // Admit one serialized config commit: held from this read through the
+    // save-and-publish below so a concurrent config writer can't land
+    // between them. The save runs retained on the commit, so a dropped
+    // request cannot abandon a dispatched save without its publication.
+    let commit = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "config commit refused without any change: the daemon generation is closing"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut config = commit.current_config();
 
     if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
         config.scheduler.enabled = v;
@@ -799,15 +929,43 @@ pub async fn handle_api_cron_settings_patch(
         config.mark_dirty("scheduler.max-run-history");
     }
 
-    if let Err(e) = config.save_dirty().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
-        )
-            .into_response();
-    }
-
-    *state.config.write() = config.clone();
+    let revision = match commit.next_revision() {
+        Ok(revision) => revision,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config revision unavailable: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let task =
+        zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(async move {
+            if let Err(e) = config.save_dirty().await {
+                return Err(format!("Failed to save config: {e}"));
+            }
+            commit
+                .publish(revision, config.clone())
+                .map_err(|e| format!("Failed to publish config: {e}"))?;
+            Ok(config)
+        }));
+    let config = match task.await {
+        Ok(Ok(config)) => config,
+        Ok(Err(message)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": message})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("config commit task failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
 
     Json(serde_json::json!({
         "status": "ok",
@@ -902,12 +1060,6 @@ pub async fn handle_api_doctor(
     .into_response()
 }
 
-/// Resolve a memory handle for the request. When `agent` names a
-/// configured `[agents.<alias>]` entry the handle is built via
-/// `zeroclaw_memory::create_memory_for_agent` so SQL backends filter by
-/// the agent's UUID, Markdown reads only that agent's directory, etc.
-/// Otherwise the install-wide `state.mem` handle is returned (the
-/// dashboard's legacy cross-agent view).
 async fn resolve_memory_handle(
     state: &AppState,
     agent_alias: Option<&str>,
@@ -960,11 +1112,6 @@ pub async fn handle_api_memory_list(
         let query = params.query.as_deref().unwrap_or("");
         let since = params.since.as_deref();
         let until = params.until.as_deref();
-        // The Memory::recall trait has no category parameter — every backend
-        // (Markdown, SQLite, Qdrant, …) implements it the same way. To keep
-        // search + category composable across all of them, post-filter here
-        // on the entries `recall()` returned rather than threading category
-        // into the trait surface.
         match mem.recall(query, 50, None, since, until).await {
             Ok(entries) => {
                 let entries = match params.category.as_deref() {
@@ -1242,6 +1389,111 @@ pub async fn handle_api_channels(
     Json(serde_json::json!({ "channels": channels })).into_response()
 }
 
+/// POST /api/channels/{channel}/relink — replace a QR channel's pairing.
+///
+/// `{channel}` is the composite `<type>.<alias>` name returned by
+/// `GET /api/channels`. Dispatches to the channel-owned relink hook
+/// ([`zeroclaw_channels::login_relink::relink`]); the gateway performs no
+/// file operations of its own and holds no knowledge of channel session
+/// layouts.
+///
+/// Responses (all authenticated via the standard bearer guard):
+///
+/// - `200` with `"outcome": "cleared"` — persisted login removed
+///   (`"removed"` lists the paths). `"restart_required": true`: the running
+///   channel keeps its in-memory session until the daemon restarts it, so
+///   the caller follows up with `POST /admin/reload` (which enforces its
+///   own, stricter admin policy — relink deliberately does not bypass it).
+/// - `200` with `"outcome": "nothing_to_clear"` — the channel supports
+///   relinking but held no persisted login; the next start already mints a
+///   fresh QR.
+/// - `409` with `"outcome": "unsupported"` — the channel type has no relink
+///   hook (it does not use QR-pairing sessions) or its feature is not
+///   compiled into this binary. **Explicit no-op: nothing was touched.**
+/// - `404` — no `[channels.<type>.<alias>]` block matches `{channel}`.
+pub async fn handle_api_channel_relink(
+    State(state): State<AppState>,
+    Path(channel): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.read().clone();
+    let Some(info) = config
+        .channels_by_alias()
+        .into_iter()
+        .find(|info| format!("{}.{}", info.channel_type, info.alias) == channel)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": format!("unknown channel {channel} — use the composite name from GET /api/channels"),
+            })),
+        )
+            .into_response();
+    };
+
+    // Resolve the string key to the typed QR-pairing channel once; probe
+    // and relink dispatch on the same enum. `None` means the channel type
+    // has no relink hook or its feature is not compiled — an explicit
+    // no-op conflict where nothing is touched.
+    let compiled_key = compiled_readiness_key_for_alias(&config, &info);
+    let Some(qr_channel) = zeroclaw_channels::listing::qr_pairing_channel(compiled_key) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "unsupported",
+                "error": format!(
+                    "channel type {} has no relink operation (it does not use QR-pairing sessions) \
+                     or the feature is not compiled into this binary; nothing was changed",
+                    info.channel_type
+                ),
+            })),
+        )
+            .into_response();
+    };
+
+    match zeroclaw_channels::login_relink::relink(qr_channel, &config, &info.alias) {
+        Ok(zeroclaw_channels::login_relink::RelinkOutcome::Cleared { removed }) => {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"channel": channel, "removed": removed})),
+                "channel persisted login cleared for relink"
+            );
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "cleared",
+                "removed": removed,
+                "restart_required": true,
+                "note": "restart the channel (POST /admin/reload) to begin the fresh QR pairing",
+            }))
+            .into_response()
+        }
+        Ok(zeroclaw_channels::login_relink::RelinkOutcome::NothingToClear) => {
+            Json(serde_json::json!({
+                "channel": channel,
+                "outcome": "nothing_to_clear",
+                "removed": [],
+                "restart_required": false,
+                "note": "no persisted login was stored; the next channel start already begins a fresh QR pairing",
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "channel": channel,
+                "error": format!("failed to clear persisted login: {e}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/tuis — list connected TUI sessions
 pub async fn handle_api_tuis(
     State(state): State<AppState>,
@@ -1346,14 +1598,53 @@ fn channel_readiness(
         if info.channel_type == "webhook" {
             apply_webhook_readiness(config, &info.alias, health, state, &mut readiness);
         } else {
-            readiness.notes.push(format!(
-                "Live readiness is not checked for `{}` channels yet.",
-                info.channel_type
-            ));
+            apply_persisted_login_readiness(config, info, &mut readiness);
         }
     }
 
     readiness
+}
+
+/// Fill `readiness.authenticated` from the channel-owned persisted-login
+/// probe (`zeroclaw_channels::login_probe`). The probe resolves the same
+/// on-disk session signal each QR-pairing channel uses at startup to decide
+/// between resuming a session and minting a fresh QR code; nothing is
+/// cached and nothing is written. Channel types without a typed QR-pairing
+/// key (no probe, or feature not compiled) keep `authenticated: unknown`
+/// and the existing "not checked yet" note.
+fn apply_persisted_login_readiness(
+    config: &zeroclaw_config::schema::Config,
+    info: &zeroclaw_config::schema::ChannelAliasInfo,
+    readiness: &mut ChannelReadiness,
+) {
+    use zeroclaw_channels::login_probe::PersistedLogin;
+
+    // Resolve the string key to the typed QR-pairing channel once; all
+    // downstream dispatch is on the enum.
+    let compiled_key = compiled_readiness_key_for_alias(config, info);
+    let Some(channel) = zeroclaw_channels::listing::qr_pairing_channel(compiled_key) else {
+        readiness.notes.push(format!(
+            "Live readiness is not checked for `{}` channels yet.",
+            info.channel_type
+        ));
+        return;
+    };
+
+    match zeroclaw_channels::login_probe::persisted_login(channel, config, &info.alias) {
+        PersistedLogin::Present => {
+            readiness.authenticated = ChannelReadinessState::Ready;
+            readiness.notes.push(format!(
+                "Live listener readiness is not checked for `{}` channels yet.",
+                info.channel_type
+            ));
+        }
+        PersistedLogin::Absent => {
+            readiness.authenticated = ChannelReadinessState::Missing;
+            readiness.requirements.push(
+                "Pair this channel: no persisted login session was found on disk.".to_string(),
+            );
+        }
+    }
 }
 
 fn channel_readiness_summary(readiness: &ChannelReadiness) -> (&'static str, &'static str) {
@@ -1363,10 +1654,10 @@ fn channel_readiness_summary(readiness: &ChannelReadiness) -> (&'static str, &'s
         return ("inactive", "degraded");
     }
 
-    if readiness.authenticated == ChannelReadinessState::Unknown
-        && readiness.listening == ChannelReadinessState::Unknown
+    if readiness.authenticated == ChannelReadinessState::Missing
+        || readiness.listening == ChannelReadinessState::Missing
     {
-        return ("unknown", "degraded");
+        return ("error", "down");
     }
 
     if readiness.authenticated == ChannelReadinessState::Ready
@@ -1374,7 +1665,9 @@ fn channel_readiness_summary(readiness: &ChannelReadiness) -> (&'static str, &'s
     {
         ("active", "healthy")
     } else {
-        ("error", "down")
+        // At least one probe is Unknown and none reported Missing: not
+        // enough signal to call the channel either healthy or down.
+        ("unknown", "degraded")
     }
 }
 
@@ -1530,6 +1823,58 @@ pub async fn handle_api_sessions_list(
     Json(serde_json::json!({ "sessions": sessions })).into_response()
 }
 
+/// Resolve a path `{id}` to the persisted session key.
+///
+/// `GET /api/sessions` advertises both a display `session_id` (`gw_` stripped
+/// for gateway sessions) and the full DB `session_key` for API operations.
+/// Accept either form so callers that reuse `session_key` do not get a doubled
+/// `gw_` prefix (`gw_gw_<id>`).
+///
+/// Resolution prefers **key existence** over punctuation heuristics (WebSocket
+/// clients may pick display ids that contain `_`, e.g. `team_alpha` →
+/// `gw_team_alpha`):
+/// 1. exact `id` if it already exists as a session key
+/// 2. raw `gw_{id}` if it already exists
+/// 3. the canonical sanitized gateway key
+/// 4. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise use the
+///    canonical sanitized gateway key
+fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> String {
+    if exists(id) {
+        return id.to_string();
+    }
+    if !id.starts_with("gw_") {
+        let legacy_key = format!("{GW_SESSION_PREFIX}{id}");
+        if exists(&legacy_key) {
+            return legacy_key;
+        }
+        return gateway_session_key(id);
+    }
+    id.to_string()
+}
+
+/// Resolve an API session id to a live process-local cancellation key.
+///
+/// Cancellation registration deliberately keeps the accepted display id raw,
+/// because sanitization would make `team.alpha` and `team_alpha` share a
+/// token. A full persisted key is checked first so callers can pass the
+/// `session_key` returned by `GET /api/sessions`; when the caller passes a
+/// display id, the raw gateway prefix is added exactly once. There is no
+/// sanitized fallback here: guessing from a lossy key could abort a different
+/// live session.
+fn resolve_gateway_cancel_key(id: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
+    if exists(id) {
+        return Some(id.to_string());
+    }
+
+    let display_key = gateway_cancel_key(id);
+    exists(&display_key).then_some(display_key)
+}
+
+/// Display session id used by WebSocket `?session_id=` / event filters.
+fn gateway_display_session_id(session_key: &str) -> &str {
+    session_key.strip_prefix("gw_").unwrap_or(session_key)
+}
+
 /// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
 pub async fn handle_api_session_messages(
     State(state): State<AppState>,
@@ -1549,14 +1894,7 @@ pub async fn handle_api_session_messages(
         .into_response();
     };
 
-    // Accept either the full DB key (channel-driven sessions like
-    // `discord.clamps_…`) or the stripped form (legacy callers that pass
-    // just the UUID for gateway sessions).
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
     let msgs = backend.load_with_timestamps(&session_key);
     let messages: Vec<serde_json::Value> = msgs
         .into_iter()
@@ -1604,12 +1942,8 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
-    if !backend
-        .list_sessions()
-        .iter()
-        .any(|key| key == &session_key)
-    {
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    if !backend.session_exists(&session_key) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -1643,12 +1977,15 @@ pub async fn handle_api_session_message_post(
         )
             .into_response();
     }
+    state.session_queue.advance_generation(&session_key);
 
-    // Use the raw dashboard session ID here to match the WS `?session_id=`
-    // query parameter; the `gw_` storage key is only for persistence.
+    // Match WS `?session_id=` / `event_matches_session` (display id), not the
+    // path string — callers that pass the full `session_key` must still notify
+    // the connected WebSocket.
+    let display_session_id = gateway_display_session_id(&session_key);
     let event = serde_json::json!({
         "type": "message",
-        "session_id": id.clone(),
+        "session_id": display_session_id,
         "role": "assistant",
         "content": body.content.clone(),
         "source": "api",
@@ -1658,7 +1995,7 @@ pub async fn handle_api_session_message_post(
 
     Json(serde_json::json!({
         "status": "ok",
-        "session_id": id,
+        "session_id": display_session_id,
         "message": {
             "role": "assistant",
             "content": message.content,
@@ -1686,35 +2023,58 @@ pub async fn handle_api_session_delete(
             .into_response();
     };
 
-    let session_key = if id.starts_with("gw_") || id.contains('_') {
-        id.clone()
-    } else {
-        format!("gw_{id}")
-    };
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
-    // If a turn is in flight for this session, cancel it and evict the entry
-    // from `cancel_tokens` here rather than leaving the WebSocket handler's
-    // post-`tokio::join!` cleanup (`ws.rs:535`) as the only path. Without
-    // this, deleting a session mid-turn leaks the map entry until the
-    // streaming task happens to wake up — and on a process crash the
-    // entry is lost entirely.
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
-    if let Some(token) = token {
+    let cancellation = {
+        let mut tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key))
+            .and_then(|cancel_key| tokens.remove(&cancel_key).map(|token| (cancel_key, token)))
+    };
+    if let Some((cancel_key, token)) = cancellation {
         token.cancel();
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "session_key": session_key,
+                    "cancel_key": cancel_key,
+                })
+            ),
             "cancelled in-flight turn for deleted session"
         );
     }
 
+    // Take the same permit turns hold. The cancel above makes a running turn
+    // unwind; waiting here means neither a turn nor a reconnecting socket's
+    // history refresh can straddle the delete.
+    let _session_guard = match state.session_queue.acquire(&session_key).await {
+        Ok(guard) => guard,
+        Err(crate::session_queue::SessionQueueError::QueueFull { .. }) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": "Session queue is full"})),
+            )
+                .into_response();
+        }
+        Err(crate::session_queue::SessionQueueError::Timeout { .. }) => {
+            return (
+                StatusCode::REQUEST_TIMEOUT,
+                Json(serde_json::json!({"error": "Timed out waiting for session queue"})),
+            )
+                .into_response();
+        }
+    };
+
     match backend.delete_session(&session_key) {
-        Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
+        Ok(true) => {
+            // A connection still holding the deleted conversation must not
+            // mistake a recreation under the same key for its own history.
+            state.session_queue.advance_generation(&session_key);
+            Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -1756,11 +2116,10 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
     // Verify the session exists before renaming
-    let sessions = backend.list_sessions();
-    if !sessions.contains(&session_key) {
+    if !backend.session_exists(&session_key) {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
@@ -1830,7 +2189,7 @@ pub async fn handle_api_session_state(
             .into_response();
     };
 
-    let session_key = format!("gw_{id}");
+    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
@@ -1860,17 +2219,6 @@ pub async fn handle_api_session_state(
 
 // ── Session abort endpoint ────────────────────────────────────────
 
-/// POST /api/sessions/{id}/abort — cancel an in-flight agent response.
-///
-/// Looks up the cancellation token for the given session. If a turn is
-/// currently running the token is cancelled, which causes the agent's
-/// streaming loop and tool-call loop to exit early. The WebSocket handler
-/// is responsible for cleaning up partial state and sending the abort
-/// frame to the client.
-///
-/// Returns 200 with `{"status": "aborted"}` if a running turn was found,
-/// or `{"status": "no_active_response"}` if the session was idle (no
-/// token present). Both are success — abort is idempotent.
 pub async fn handle_api_session_abort(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1880,23 +2228,26 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    let session_key = format!("gw_{id}");
+    // Resolve + look up under one lock so display ids and full session keys
+    // both address the raw, collision-safe cancellation key.
+    let (cancel_key, token) = {
+        let tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        let cancel_key = resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key));
+        let token = cancel_key
+            .as_deref()
+            .and_then(|key| tokens.get(key).cloned());
+        (cancel_key, token)
+    };
 
-    // Look up and cancel the token. Hold the lock only long enough to
-    // clone the token — cancellation itself does not need the lock.
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .get(&session_key)
-        .cloned();
-
-    if let Some(token) = token {
+    if let (Some(cancel_key), Some(token)) = (cancel_key, token) {
         token.cancel();
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
+                .with_attrs(::serde_json::json!({"cancel_key": cancel_key})),
             "session abort requested"
         );
         Json(serde_json::json!({ "status": "aborted" })).into_response()
@@ -1907,12 +2258,6 @@ pub async fn handle_api_session_abort(
 
 // ── Claude Code hook endpoint ────────────────────────────────────
 
-/// POST /hooks/claude-code — receives HTTP hook events from Claude Code
-/// sessions spawned by `ClaudeCodeRunnerTool`.
-///
-/// Claude Code posts structured JSON describing tool executions, completions,
-/// and errors. This handler logs the event and (when a Slack channel is
-/// configured) could be wired to update a Slack message in-place.
 pub async fn handle_claude_code_hook(
     State(state): State<AppState>,
     Json(payload): Json<zeroclaw_tools::claude_code_runner::ClaudeCodeHookEvent>,
@@ -1928,23 +2273,33 @@ pub async fn handle_claude_code_hook(
 }
 
 // Shared test helper: `api_config` tests reuse this AppState builder for the
-// agent rename/delete cascade handlers (#7907 regression coverage).
+// agent rename/delete cascade handlers/coverage).
+
 #[cfg(test)]
 pub(crate) use tests::test_state;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
-    use parking_lot::RwLock;
-    #[cfg(feature = "channel-linq")]
+    // Gated on every channel feature whose `AppState` fields below are built
+    // with `HashMap::new()`, not just `channel-linq`. With only one of the
+    // others enabled the import vanished while its uses remained, so
+    // `--features channel-nextcloud` alone failed to compile. `--all-features`
+    // hid it, because `channel-linq` was always along for the ride.
+    #[cfg(any(
+        feature = "channel-linq",
+        feature = "channel-nextcloud",
+        feature = "channel-whatsapp-cloud"
+    ))]
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_infra::session_sqlite::SqliteSessionBackend;
     use zeroclaw_infra::session_store::SessionStore;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
     use zeroclaw_providers::ModelProvider;
@@ -2034,6 +2389,10 @@ mod tests {
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
+
+        async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
+            Ok(0)
+        }
     }
     impl ::zeroclaw_api::attribution::Attributable for MockMemory {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -2098,8 +2457,11 @@ mod tests {
     }
 
     pub(crate) fn test_state(config: zeroclaw_config::schema::Config) -> AppState {
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: Arc::new(RwLock::new(config)),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: Arc::new(MockModelProvider),
             model: "test-model".into(),
             temperature: None,
@@ -2112,8 +2474,11 @@ mod tests {
                 ),
             ),
             auto_save: false,
-            webhook_secret_hash: None,
-            pairing: Arc::new(PairingGuard::new(false, &[])),
+            pairing: Arc::new(PairingGuard::new(
+                false,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             auth_limiter: Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
@@ -2130,17 +2495,17 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: Arc::new(crate::sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
             device_registry: None,
@@ -2154,6 +2519,7 @@ mod tests {
             reload_tx: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -2179,6 +2545,121 @@ mod tests {
         serde_json::from_slice(&body).expect("valid json response")
     }
 
+    #[tokio::test]
+    async fn api_status_contract_includes_connected_nodes_and_mdns_peers() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let (invoke_tx, _invoke_rx) = tokio::sync::mpsc::channel(1);
+        assert!(state.node_registry.register(nodes::NodeInfo {
+            node_id: "connected-node".into(),
+            capabilities: Vec::new(),
+            invoke_tx,
+        }));
+        state.mdns_peer_registry.insert(
+            "peer-1".into(),
+            nodes::mdns::MdnsPeer {
+                name: "peer-one".into(),
+                addr: "10.0.0.2".into(),
+                port: 42617,
+                version: "0.8.2".into(),
+                path_prefix: Some("/peer".into()),
+                last_seen: Instant::now(),
+            },
+        );
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        assert_eq!(
+            json["nodes"]["connected"],
+            serde_json::json!(["connected-node"])
+        );
+        assert_eq!(
+            json["nodes"]["mdns_peers"],
+            serde_json::json!([{
+                "id": "peer-1",
+                "name": "peer-one",
+                "addr": "10.0.0.2",
+                "port": 42617,
+                "version": "0.8.2",
+                "path_prefix": "/peer",
+                "base_url": "http://10.0.0.2:42617/peer",
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn api_status_contract_preserves_nullable_and_nested_fields() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let json = response_json(response).await;
+        let actual_fields: std::collections::BTreeSet<_> = json
+            .as_object()
+            .expect("status response object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected_fields = [
+            "agent_alias",
+            "allow_self_upgrade",
+            "channels",
+            "check_updates",
+            "daemon_started_at",
+            "gateway_port",
+            "health",
+            "locale",
+            "memory_backend",
+            "model",
+            "model_provider",
+            "nodes",
+            "paired",
+            "process",
+            "restart_hint",
+            "restart_mode",
+            "temperature",
+            "uptime_seconds",
+            "version",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual_fields, expected_fields);
+        assert!(json["version"].as_str().is_some());
+        assert!(json["temperature"].is_null());
+        assert!(json["agent_alias"].is_null());
+        assert!(json["uptime_seconds"].is_u64());
+        assert!(json["daemon_started_at"].as_str().is_some());
+        assert!(json["channels"].is_object());
+        assert!(json["nodes"]["connected"].is_array());
+        assert!(json["nodes"]["mdns_peers"].is_array());
+        assert!(json["health"]["pid"].is_u64());
+        assert!(json["health"]["components"].is_object());
+        assert!(json["process"]["rss_bytes"].is_u64());
+        assert!(
+            json["process"]["cpu_percent"].is_null() || json["process"]["cpu_percent"].is_number()
+        );
+        assert!(json["check_updates"].is_boolean());
+        assert!(json["allow_self_upgrade"].is_boolean());
+        assert_eq!(
+            json["restart_mode"],
+            crate::version::detect_restart().mode.as_str()
+        );
+        assert!(json["restart_hint"].as_str().is_some());
+    }
+
     #[test]
     fn integration_entry_json_derives_category_label_from_category() {
         let entry = zeroclaw_runtime::integrations::IntegrationEntry {
@@ -2186,6 +2667,7 @@ mod tests {
             description: "Run browser automation".into(),
             category: zeroclaw_runtime::integrations::IntegrationCategory::ToolsAutomation,
             status: zeroclaw_runtime::integrations::IntegrationStatus::Active,
+            key: None,
         };
 
         let json = integration_entry_json(&entry);
@@ -2193,10 +2675,27 @@ mod tests {
         assert_eq!(json["category"], "ToolsAutomation");
         assert_eq!(json["category_label"], "Tools & Automation");
         assert_eq!(json["status"], "Active");
+        assert!(json["key"].is_null());
+    }
+
+    #[test]
+    fn integration_entry_json_exposes_config_key() {
+        let entry = zeroclaw_runtime::integrations::IntegrationEntry {
+            name: "Z.AI".into(),
+            description: String::new(),
+            category: zeroclaw_runtime::integrations::IntegrationCategory::AiModel,
+            status: zeroclaw_runtime::integrations::IntegrationStatus::Available,
+            key: Some("zai".into()),
+        };
+
+        let json = integration_entry_json(&entry);
+
+        assert_eq!(json["key"], "zai");
     }
 
     fn memory_entry_with_content(content: String) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: "entry-1".into(),
             key: "huge-memory".into(),
             content,
@@ -2207,6 +2706,9 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.5),
             superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
             agent_alias: None,
             agent_id: None,
         }
@@ -2291,6 +2793,68 @@ mod tests {
         assert_eq!(content.chars().count(), MEMORY_API_CONTENT_MAX_CHARS);
         assert!(content.ends_with("..."));
         assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_tools_scopes_listing_by_agent_query() {
+        use zeroclaw_api::tool::ToolSpec;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let mut state = test_state(config);
+
+        let spec = |name: &str| {
+            ToolSpec::new(
+                name.to_string(),
+                format!("{name} desc"),
+                serde_json::json!({}),
+            )
+        };
+        state.tools_registry = Arc::new(vec![spec("default_tool")]);
+        let mut by_agent: std::collections::HashMap<String, Arc<Vec<ToolSpec>>> =
+            std::collections::HashMap::new();
+        by_agent.insert("alpha".to_string(), Arc::new(vec![spec("alpha_tool")]));
+        by_agent.insert("beta".to_string(), Arc::new(vec![spec("beta_tool")]));
+        state.tools_registry_by_agent = Arc::new(by_agent);
+
+        async fn tool_names(state: AppState, agent: Option<&str>) -> Vec<String> {
+            let response = handle_api_tools(
+                State(state),
+                HeaderMap::new(),
+                Query(ToolsQuery {
+                    agent: agent.map(str::to_string),
+                }),
+            )
+            .await
+            .into_response();
+            response_json(response).await["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect()
+        }
+
+        // A known agent gets its own scoped listing.
+        assert_eq!(
+            tool_names(state.clone(), Some("beta")).await,
+            vec!["beta_tool".to_string()]
+        );
+        // Omitted agent falls back to the default seed listing.
+        assert_eq!(
+            tool_names(state.clone(), None).await,
+            vec!["default_tool".to_string()]
+        );
+        // Unknown and blank aliases fall back to the default rather than error,
+        // so a stale UI selection still renders something.
+        assert_eq!(
+            tool_names(state.clone(), Some("ghost")).await,
+            vec!["default_tool".to_string()]
+        );
+        assert_eq!(
+            tool_names(state.clone(), Some("   ")).await,
+            vec!["default_tool".to_string()]
+        );
     }
 
     #[test]
@@ -2379,7 +2943,7 @@ mod tests {
             zeroclaw_config::schema::NextcloudTalkConfig {
                 enabled: true,
                 base_url: "https://cloud.example.com".to_string(),
-                app_token: "test-token".to_string(),
+                app_token: None,
                 ..Default::default()
             },
         );
@@ -2408,15 +2972,296 @@ mod tests {
         assert_eq!(nextcloud["health"], "unavailable");
     }
 
+    /// Bind `channel_ref` (e.g. `"wechat.admin"`) to an enabled agent so
+    /// readiness reaches the authenticated/listening probes.
+    fn bind_channel_to_agent(config: &mut zeroclaw_config::schema::Config, channel_ref: &str) {
+        config.agents.insert(
+            "rowan".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![zeroclaw_config::providers::ChannelRef::new(
+                    channel_ref.to_string(),
+                )],
+                ..Default::default()
+            },
+        );
+    }
+
+    #[cfg(feature = "channel-wechat")]
+    #[tokio::test]
+    async fn api_channels_wechat_authenticated_tracks_persisted_login() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.channels.wechat.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WeChatConfig {
+                enabled: true,
+                state_dir: Some(temp.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+        bind_channel_to_agent(&mut config, "wechat.admin");
+
+        // Unpaired: nothing persisted in the channel's state dir.
+        let response = handle_api_channels(State(test_state(config.clone())), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channel = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .find(|channel| channel["name"] == "wechat.admin")
+            .cloned()
+            .expect("wechat channel is listed");
+        assert_eq!(channel["readiness"]["authenticated"], "missing");
+        assert_eq!(channel["status"], "error");
+        assert_eq!(channel["health"], "down");
+        assert!(
+            channel["readiness"]["requirements"]
+                .as_array()
+                .expect("requirements array")
+                .iter()
+                .any(|item| item
+                    .as_str()
+                    .is_some_and(|s| s.contains("Pair this channel")))
+        );
+
+        // Paired: the channel's own persisted login (account.json token).
+        std::fs::write(
+            temp.path().join("account.json"),
+            r#"{"token": "tok_persisted", "account_id": "acct_1"}"#,
+        )
+        .unwrap();
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channel = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .find(|channel| channel["name"] == "wechat.admin")
+            .cloned()
+            .expect("wechat channel is listed");
+        assert_eq!(channel["readiness"]["authenticated"], "ready");
+        // Listener liveness is still unprobed, so the summary stays
+        // conservative rather than claiming the channel is up.
+        assert_eq!(channel["readiness"]["listening"], "unknown");
+        assert_eq!(channel["status"], "unknown");
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn api_channels_whatsapp_web_unpaired_reports_missing_auth_without_touching_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_path = temp.path().join("session.db");
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.channels.whatsapp.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some(session_path.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+        bind_channel_to_agent(&mut config, "whatsapp.admin");
+
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channel = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .find(|channel| channel["name"] == "whatsapp.admin")
+            .cloned()
+            .expect("whatsapp channel is listed");
+        assert_eq!(channel["readiness"]["authenticated"], "missing");
+        assert_eq!(channel["status"], "error");
+        assert!(
+            !session_path.exists(),
+            "the readiness probe must never create the session database"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_channels_without_login_probe_keeps_authenticated_unknown() {
+        let mut config = config_with_telegram("default");
+        bind_channel_to_agent(&mut config, "telegram.default");
+
+        let response = handle_api_channels(State(test_state(config)), HeaderMap::new())
+            .await
+            .into_response();
+        let json = response_json(response).await;
+        let channel = json["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .find(|channel| channel["name"] == "telegram.default")
+            .cloned()
+            .expect("telegram channel is listed");
+        assert_eq!(channel["readiness"]["authenticated"], "unknown");
+        assert!(
+            channel["readiness"]["notes"]
+                .as_array()
+                .expect("notes array")
+                .iter()
+                .any(|note| {
+                    note.as_str()
+                        .is_some_and(|s| s.contains("not checked for `telegram`"))
+                })
+        );
+    }
+
+    #[cfg(feature = "channel-wechat")]
+    #[tokio::test]
+    async fn api_channel_relink_wechat_clears_persisted_login_then_noops() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.channels.wechat.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WeChatConfig {
+                enabled: true,
+                state_dir: Some(temp.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+        std::fs::write(
+            temp.path().join("account.json"),
+            r#"{"token": "tok_persisted", "account_id": "acct_1"}"#,
+        )
+        .unwrap();
+        std::fs::write(temp.path().join("sync.json"), r#"{"get_updates_buf": "c"}"#).unwrap();
+
+        let response = handle_api_channel_relink(
+            State(test_state(config.clone())),
+            Path("wechat.admin".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "cleared");
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(json["removed"].as_array().expect("removed array").len(), 2);
+        assert!(!temp.path().join("account.json").exists());
+        assert!(!temp.path().join("sync.json").exists());
+
+        // Relinking again is the documented no-op.
+        let response = handle_api_channel_relink(
+            State(test_state(config)),
+            Path("wechat.admin".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "nothing_to_clear");
+        assert_eq!(json["restart_required"], false);
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn api_channel_relink_whatsapp_web_unpaired_noops_without_touching_disk() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_path = temp.path().join("session.db");
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.channels.whatsapp.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some(session_path.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        );
+
+        let response = handle_api_channel_relink(
+            State(test_state(config)),
+            Path("whatsapp.admin".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "nothing_to_clear");
+        assert!(
+            !session_path.exists(),
+            "relinking an unpaired channel must not create the session database"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_channel_relink_unsupported_channel_is_explicit_conflict_noop() {
+        let config = config_with_telegram("default");
+
+        let response = handle_api_channel_relink(
+            State(test_state(config)),
+            Path("telegram.default".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let json = response_json(response).await;
+        assert_eq!(json["outcome"], "unsupported");
+        assert!(
+            json["error"]
+                .as_str()
+                .expect("error string")
+                .contains("nothing was changed")
+        );
+    }
+
+    #[tokio::test]
+    async fn api_channel_relink_unknown_channel_is_not_found() {
+        let response = handle_api_channel_relink(
+            State(test_state(zeroclaw_config::schema::Config::default())),
+            Path("wechat.ghost".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn api_channel_relink_requires_bearer_auth_when_pairing_enabled() {
+        let state = AppState {
+            pairing: Arc::new(PairingGuard::new(
+                true,
+                &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            )),
+            ..test_state(config_with_telegram("default"))
+        };
+
+        let response = handle_api_channel_relink(
+            State(state),
+            Path("telegram.default".to_string()),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     fn link_job_to_test_agent(state: &AppState, job_id: &str) {
-        state
-            .config
-            .write()
-            .agents
-            .get_mut("test-agent")
-            .expect("test-agent configured by with_test_agent")
-            .cron_jobs
-            .push(job_id.to_string());
+        state.publish_test_config(|config| {
+            config
+                .agents
+                .get_mut("test-agent")
+                .expect("test-agent configured by with_test_agent")
+                .cron_jobs
+                .push(job_id.to_string());
+        });
     }
 
     fn config_with_webhook(
@@ -2570,7 +3415,11 @@ mod tests {
         let config = config_with_webhook("paired", true, true, 42632, Some("/eyrie"));
         zeroclaw_runtime::health::mark_component_ok("channel:webhook.paired");
         let mut state = test_state(config.clone());
-        state.pairing = Arc::new(PairingGuard::new(true, &[]));
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let health = zeroclaw_runtime::health::snapshot();
         let info = first_channel_info(&config);
         let readiness = channel_readiness(&config, &info, &health, &state);
@@ -2625,6 +3474,28 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("Bind this channel"))
         );
+    }
+
+    #[test]
+    fn require_auth_rejects_empty_bearer_token() {
+        let config = zeroclaw_config::schema::Config::default();
+        let mut state = test_state(config);
+        state.pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer ".parse().unwrap(), // empty token after prefix
+        );
+
+        let result = require_auth(&state, &headers);
+        assert!(result.is_err(), "empty bearer token must be rejected");
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2843,6 +3714,629 @@ mod tests {
         assert_eq!(messages[1].content, "queued notification");
     }
 
+    #[test]
+    fn resolve_gateway_session_key_accepts_full_key_and_display_id() {
+        let none = |_key: &str| false;
+        assert_eq!(
+            resolve_gateway_session_key("operator-1", none),
+            "gw_operator-1"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("gw_operator-1", none),
+            "gw_operator-1"
+        );
+        // Underscore-bearing display ids must still map into the gw_ namespace
+        // when no exact key exists (punctuation is not a session namespace).
+        assert_eq!(
+            resolve_gateway_session_key("team_alpha", none),
+            "gw_team_alpha"
+        );
+
+        let gateway_only = |key: &str| key == "gw_team_alpha";
+        assert_eq!(
+            resolve_gateway_session_key("team_alpha", gateway_only),
+            "gw_team_alpha"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("gw_team_alpha", gateway_only),
+            "gw_team_alpha"
+        );
+
+        let channel_only = |key: &str| key == "discord.clamps_room";
+        assert_eq!(
+            resolve_gateway_session_key("discord.clamps_room", channel_only),
+            "discord.clamps_room"
+        );
+
+        // Exact match wins when both the bare id and gw_ form exist.
+        let both = |key: &str| key == "team_alpha" || key == "gw_team_alpha";
+        assert_eq!(
+            resolve_gateway_session_key("team_alpha", both),
+            "team_alpha"
+        );
+
+        let legacy_dotted = |key: &str| key == "gw_team.alpha";
+        assert_eq!(
+            resolve_gateway_session_key("team.alpha", legacy_dotted),
+            "gw_team.alpha",
+            "existing raw gateway keys remain addressable"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("team.alpha", none),
+            "gw_team_alpha",
+            "new dotted display ids use the canonical sanitized gateway key"
+        );
+    }
+
+    #[test]
+    fn resolve_gateway_cancel_key_accepts_display_and_full_ids_without_collisions() {
+        let dotted = |key: &str| key == "gw_team.alpha";
+        assert_eq!(
+            resolve_gateway_cancel_key("team.alpha", dotted),
+            Some("gw_team.alpha".to_string())
+        );
+        assert_eq!(
+            resolve_gateway_cancel_key("gw_team.alpha", dotted),
+            Some("gw_team.alpha".to_string())
+        );
+
+        let both = |key: &str| key == "gw_team.alpha" || key == "gw_team_alpha";
+        assert_eq!(
+            resolve_gateway_cancel_key("team.alpha", both),
+            Some("gw_team.alpha".to_string()),
+            "dotted display ids must retain their raw cancellation identity"
+        );
+        assert_eq!(
+            resolve_gateway_cancel_key("team_alpha", both),
+            Some("gw_team_alpha".to_string()),
+            "underscored display ids must not collide with dotted ids"
+        );
+    }
+
+    #[test]
+    fn gateway_display_session_id_strips_gw_prefix() {
+        assert_eq!(gateway_display_session_id("gw_operator-1"), "operator-1");
+        assert_eq!(gateway_display_session_id("gw_team_alpha"), "team_alpha");
+        assert_eq!(
+            gateway_display_session_id("discord.clamps_room"),
+            "discord.clamps_room"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_full_session_key_from_sessions_list() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_key = "gw_operator-1".to_string();
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(session_key.clone(), std::sync::Arc::new(token.clone()));
+
+        // Same id GET /api/sessions advertises as session_key for abort.
+        let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["status"], "aborted",
+            "full session_key must abort; doubled gw_ prefix yields no_active_response"
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_still_accepts_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_operator-1".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_underscore_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team_alpha".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
+
+        // List contract: session_id=team_alpha, session_key=gw_team_alpha.
+        // Treating "_" as "already a full key" would miss this cancel token.
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(
+            json["status"], "aborted",
+            "underscore display ids must resolve to gw_ + id, not the bare id"
+        );
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_dotted_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team.alpha".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_full_dotted_session_key() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team.alpha".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_keeps_dotted_and_underscored_ids_separate() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let dotted_token = tokio_util::sync::CancellationToken::new();
+        let underscored_token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team.alpha".to_string(),
+                std::sync::Arc::new(dotted_token.clone()),
+            );
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team_alpha".to_string(),
+                std::sync::Arc::new(underscored_token.clone()),
+            );
+
+        let dotted_response = handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(dotted_response.status(), StatusCode::OK);
+        assert_eq!(response_json(dotted_response).await["status"], "aborted");
+        assert!(dotted_token.is_cancelled());
+        assert!(
+            !underscored_token.is_cancelled(),
+            "aborting team.alpha must not cancel team_alpha"
+        );
+
+        let underscored_response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(underscored_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(underscored_response).await["status"],
+            "aborted"
+        );
+        assert!(underscored_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_delete_cancels_full_dotted_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team.alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
+
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(token.is_cancelled());
+        assert!(
+            !backend.session_exists("gw_team.alpha"),
+            "deletion must target the persisted dotted session key"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_delete_cancels_raw_dotted_turn_for_sanitized_persistence_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        // This is the persistence identity used by the streamed webhook
+        // path. The live cancellation identity must remain the raw dotted
+        // display id, so deletion has to resolve the two independently.
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
+
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            token.is_cancelled(),
+            "deletion must cancel the raw dotted turn even when persistence is sanitized"
+        );
+        assert!(!backend.session_exists("gw_team_alpha"));
+    }
+
+    #[tokio::test]
+    async fn session_message_post_accepts_full_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let mut rx = state.event_tx.subscribe();
+
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_operator-1".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "via session_key"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(
+            json["session_id"], "operator-1",
+            "API response should use the display session id"
+        );
+        let messages = backend.load("gw_operator-1");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "via session_key");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("broadcast event")
+            .expect("broadcast value");
+        assert_eq!(event["type"], "message");
+        assert_eq!(
+            event["session_id"], "operator-1",
+            "broadcast must use display id so the WS filter accepts it"
+        );
+        assert_eq!(event["content"], "via session_key");
+    }
+
+    #[tokio::test]
+    async fn session_message_post_accepts_underscore_display_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let mut rx = state.event_tx.subscribe();
+
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "underscore display id"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let messages = backend.load("gw_team_alpha");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "underscore display id");
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("broadcast event")
+            .expect("broadcast value");
+        assert_eq!(event["session_id"], "team_alpha");
+    }
+
+    #[tokio::test]
+    async fn session_rename_accepts_full_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let response = handle_api_session_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_operator-1".to_string()),
+            Json(serde_json::json!({ "name": "ops" })),
+        )
+        .await
+        .into_response();
+
+        // Master doubles the prefix (`gw_gw_operator-1`) and returns 404.
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "ops");
+        assert!(
+            backend.list_sessions().iter().any(|k| k == "gw_operator-1"),
+            "rename must target the real session key, not a doubled gw_ prefix"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_rename_accepts_underscore_display_session_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend);
+
+        let response = handle_api_session_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+            Json(serde_json::json!({ "name": "alpha desk" })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["name"], "alpha desk");
+    }
+
+    #[tokio::test]
+    async fn session_state_accepts_full_session_key_and_underscore_display_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        // File SessionStore does not persist turn state; SQLite does.
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        backend
+            .set_session_state("gw_team_alpha", "running", Some("turn-1"))
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend);
+
+        let full_key_response = handle_api_session_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("gw_team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(full_key_response.status(), StatusCode::OK);
+        let full_key_json = response_json(full_key_response).await;
+        assert_eq!(full_key_json["state"], "running");
+        assert_eq!(full_key_json["turn_id"], "turn-1");
+
+        let display_response = handle_api_session_state(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(display_response.status(), StatusCode::OK);
+        let display_json = response_json(display_response).await;
+        assert_eq!(
+            display_json["state"], "running",
+            "state handler must accept underscore display ids from the sessions list"
+        );
+        assert_eq!(display_json["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn cron_add_refuses_alias_during_destructive_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = with_test_agent(zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(config.clone());
+        let mut cleanup = state.agent_lifecycle.begin_delete("test-agent").unwrap();
+        cleanup.commit_destructive_mutation();
+        let body = || {
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "agent": "test-agent", "schedule": "*/5 * * * *", "command": "echo hello"
+                }))
+                .unwrap(),
+            )
+        };
+        let response = handle_api_cron_add(State(state.clone()), HeaderMap::new(), body())
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&config)
+                .unwrap()
+                .is_empty()
+        );
+        drop(cleanup);
+        let response = handle_api_cron_add(State(state), HeaderMap::new(), body())
+            .await
+            .into_response();
+        let result = response_json(response).await;
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(zeroclaw_runtime::cron::list_jobs(&config).unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn cron_api_shell_roundtrip_includes_delivery() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2930,6 +4424,174 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_type, zeroclaw_runtime::cron::JobType::Agent);
         assert_eq!(jobs[0].prompt.as_deref(), Some("summarize the latest logs"));
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Isolated
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_persists_session_target_main() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "main-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "continue in the primary session",
+                    "session_target": "main"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = state.config.read().clone();
+        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Main
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_accepts_session_target_case_and_whitespace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "main-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "continue in the primary session",
+                    "session_target": "  MAIN  "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let jobs = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap();
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Main
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_rejects_invalid_session_target_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "typo-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "should not be created",
+                    "session_target": "shared"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("session_target"),
+            "error should name the field, got {error}"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty(),
+            "invalid session_target must not persist a job"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_rejects_empty_session_target_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "empty-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "should not be created",
+                    "session_target": "   "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session_target")
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3264,13 +4926,6 @@ mod tests {
         );
     }
 
-    // --- PATCH agent-requirement boundary (#7666) ---------------------------
-    // These pin the relaxed `agent` rule: it is required only when a patch sets a
-    // *shell command* (the risk-profile gate), and not for enable/disable,
-    // metadata-only patches, or agent-type jobs. Regression coverage for the
-    // `#[serde(default)] agent` + `setting_shell_command` scoping so a future
-    // refactor can't silently reopen the gate or re-require agent where it isn't.
-
     #[tokio::test]
     async fn cron_api_patch_enabled_without_agent() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3539,6 +5194,276 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cron_api_patch_updates_imperative_shell_output_format() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let job = zeroclaw_runtime::cron::add_shell_job_with_approval(
+            &state.config.read().clone(),
+            "test-agent",
+            Some("format-job".to_string()),
+            zeroclaw_runtime::cron::Schedule::Cron {
+                expr: "*/5 * * * *".to_string(),
+                tz: None,
+            },
+            "echo hello-raw-patch-run",
+            None,
+            true,
+        )
+        .expect("job added");
+        assert_eq!(
+            job.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "imperative jobs default to wrapped"
+        );
+        // The stored alias resolves ownership when `test-agent` is an enabled
+        // configured agent; the `cron_jobs` claim is the single-enabled-claimant
+        // fallback for rows without one, same as
+        // `cron_api_run_executes_shell_job_and_records_run`.
+        link_job_to_test_agent(&state, &job.id);
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(job.id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "shell_output_format": "raw" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "an imperative job's shell_output_format is a real, storable mutation"
+        );
+        let updated = zeroclaw_runtime::cron::get_job(&state.config.read().clone(), &job.id)
+            .expect("updated job");
+        assert_eq!(
+            updated.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            "get_job must reflect the patched format for an imperative job"
+        );
+
+        // The regression this PATCH must actually prove: the persisted
+        // value is what execution reads, not just what get_job() reports.
+        // A job created wrapped, then PATCHed to raw, must run raw.
+        let run_response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job.id.clone()))
+                .await
+                .into_response();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json = response_json(run_response).await;
+        assert_eq!(run_json["success"], true);
+        let output = run_json["output"].as_str().unwrap_or_default();
+        assert!(
+            output.contains("hello-raw-patch-run"),
+            "expected bare stdout in output, got: {output}"
+        );
+        assert!(
+            !output.contains("status="),
+            "a PATCH-to-raw job must run raw (bare stdout), not the wrapped status envelope; got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_rejects_shell_output_format_for_declarative_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config = with_test_agent(config);
+        // `sync_declarative_jobs` only materializes a job for an agent that
+        // claims it via `cron_jobs`, exactly like `seed_claiming_agent` in
+        // cron::store's own tests.
+        config.agents.get_mut("test-agent").unwrap().cron_jobs = vec!["decl-job".to_string()];
+
+        let decl = zeroclaw_config::schema::CronJobDecl {
+            name: Some("decl-job".to_string()),
+            job_type: "shell".to_string(),
+            schedule: zeroclaw_config::schema::CronScheduleDecl::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: None,
+            },
+            command: Some("echo decl-output".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            uses_memory: true,
+            session_target: None,
+            delivery: None,
+            shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+        };
+        let mut decls = std::collections::HashMap::new();
+        decls.insert("decl-job".to_string(), decl.clone());
+        config.cron.insert("decl-job".to_string(), decl);
+        zeroclaw_runtime::cron::sync_declarative_jobs(&config, &decls).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("decl-job".to_string()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "shell_output_format": "raw" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "a declarative job's shell_output_format is owned by config.toml, not the API"
+        );
+        let json = response_json(response).await;
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("declarative"),
+            "error should explain the field is config-owned for declarative jobs"
+        );
+        assert!(
+            error.contains("cron.decl-job.shell_output_format"),
+            "error should name the exact config key to edit instead: {error}"
+        );
+        let unchanged =
+            zeroclaw_runtime::cron::get_job(&state.config.read().clone(), "decl-job").unwrap();
+        assert_eq!(
+            unchanged.shell_output_format,
+            zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            "the rejected PATCH must not have changed the resolved format"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_patch_rejects_shell_output_format_for_agent_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-format-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "do something"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let id = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap()[0]
+            .id
+            .clone();
+
+        let response = handle_api_cron_patch(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(id.clone()),
+            Json(
+                serde_json::from_value::<CronPatchBody>(
+                    serde_json::json!({ "shell_output_format": "raw" }),
+                )
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell_output_format is shell-only and must not be persisted for agent jobs"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("agent job"),
+            "error should explain the field does not apply to agent jobs"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_add_rejects_shell_output_format_for_agent_job() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-format-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "do something",
+                    "shell_output_format": "raw"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "shell_output_format must be rejected at creation for agent jobs, matching the PATCH contract, \
+             instead of silently discarded"
+        );
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("agent job"),
+            "error should explain the field does not apply to agent jobs"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty(),
+            "a rejected create must not persist a job"
+        );
+    }
+
+    #[tokio::test]
     async fn cron_api_rejects_announce_delivery_without_target() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
@@ -3611,8 +5536,9 @@ mod tests {
         )
         .expect("job added");
 
-        // Imperative jobs get UUID ids; the scheduler resolves owning
-        // agent by reverse-lookup against `agent.cron_jobs`.
+        // The stored alias resolves ownership when `test-agent` is an enabled
+        // configured agent; the `cron_jobs` claim is the single-enabled-claimant
+        // fallback for rows without one.
         link_job_to_test_agent(&state, &job.id);
 
         let response =
@@ -3636,6 +5562,70 @@ mod tests {
             .expect("runs listed");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn cron_runs_endpoint_serves_retained_history_after_job_deletion() {
+        // A successful auto-delete one-shot removes its job row but keeps
+        // its run record; the runs endpoint must serve that durable record
+        // rather than 404 on the missing job — and still 404 when neither
+        // job nor history exists.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+        let config = state.config.read().clone();
+
+        let now = chrono::Utc::now();
+        zeroclaw_runtime::cron::record_run(
+            &config,
+            "retained-one-shot",
+            now,
+            now + chrono::Duration::milliseconds(5),
+            "ok",
+            zeroclaw_runtime::cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            zeroclaw_runtime::cron::RunProvenance {
+                principal: None,
+                executing_agent: Some("test-agent"),
+                job_source: Some("imperative"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        let response = handle_api_cron_runs(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("retained-one-shot".to_string()),
+            axum::extract::Query(CronRunsQuery { limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        let runs = json["runs"].as_array().expect("runs array");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["status"], "ok");
+        assert_eq!(runs[0]["executing_agent"], "test-agent");
+
+        let response = handle_api_cron_runs(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("never-existed".to_string()),
+            axum::extract::Query(CronRunsQuery { limit: None }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3742,12 +5732,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    // ── Token rotation / device revocation security tests ────────────────────
-    //
-    // GHSA-f385-f6h2-3gqj follow-up (#6984): `POST /api/devices/{id}/token/rotate`
-    // and `DELETE /api/devices/{id}` must both invalidate the bearer token
-    // associated with the device, not just rotate a code or delete the row.
-
     use crate::api_pairing::{
         DeviceInfo, DeviceRegistry, revoke_device, rotate_token as rotate_device_token,
         submit_pairing_enhanced,
@@ -3763,25 +5747,31 @@ mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
 
-        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let code = pairing.pairing_code().unwrap();
         let token = pairing.try_pair(&code, "test").await.unwrap().unwrap();
         let token_hash = PairingGuard::token_hash(&token);
 
         let registry = Arc::new(DeviceRegistry::new(&data_dir));
         let device_id = "dev-1".to_string();
-        registry.register(
-            token_hash,
-            DeviceInfo {
-                id: device_id.clone(),
-                name: None,
-                device_type: None,
-                paired_at: Utc::now(),
-                last_seen: Utc::now(),
-                ip_address: None,
-                capabilities: None,
-            },
-        );
+        registry
+            .register(
+                token_hash,
+                DeviceInfo {
+                    id: device_id.clone(),
+                    name: None,
+                    device_type: None,
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
 
         let mut state = test_state(config);
         state.pairing = pairing;
@@ -3798,9 +5788,6 @@ mod tests {
         h
     }
 
-    /// The backfill inserts a placeholder row for every paired-token hash that
-    /// has no device entry, skips hashes that already have one (without
-    /// clobbering their metadata), and is idempotent across restarts.
     #[tokio::test]
     async fn reconcile_backfills_orphan_token_hashes() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3808,18 +5795,20 @@ mod tests {
 
         // A real, already-registered device with a name.
         let known_hash = "a".repeat(64);
-        registry.register(
-            known_hash.clone(),
-            DeviceInfo {
-                id: "known".into(),
-                name: Some("My Laptop".into()),
-                device_type: Some("desktop".into()),
-                paired_at: Utc::now(),
-                last_seen: Utc::now(),
-                ip_address: None,
-                capabilities: None,
-            },
-        );
+        registry
+            .register(
+                known_hash.clone(),
+                DeviceInfo {
+                    id: "known".into(),
+                    name: Some("My Laptop".into()),
+                    device_type: Some("desktop".into()),
+                    paired_at: Utc::now(),
+                    last_seen: Utc::now(),
+                    ip_address: None,
+                    capabilities: None,
+                },
+            )
+            .expect("test device registry insert");
 
         let orphan_a = "b".repeat(64);
         let orphan_b = "c".repeat(64);
@@ -3832,6 +5821,7 @@ mod tests {
         // Existing metadata is preserved, not clobbered.
         let known = registry
             .list()
+            .expect("test device registry list")
             .into_iter()
             .find(|d| d.id == "known")
             .expect("known device still present");
@@ -3845,18 +5835,17 @@ mod tests {
         assert_eq!(registry.device_count(), 3);
     }
 
-    /// Security-management contract: a token paired through the legacy `/pair`
-    /// route is an orphan (authenticates, but absent from the registry). After
-    /// backfill it is keyed by the SAME `token_hash` the auth gate uses, so the
-    /// revoke-by-device path (`revoke` → `PairingGuard::revoke_token_hash`)
-    /// invalidates exactly that bearer token.
     #[tokio::test]
     async fn backfilled_orphan_is_revocable_by_its_real_hash() {
         let tmp = tempfile::TempDir::new().unwrap();
         let data_dir = tmp.path().join("workspace");
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let pairing = PairingGuard::new(true, &[]);
+        let pairing = PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        );
         let code = pairing.pairing_code().unwrap();
         let token = pairing
             .try_pair(&code, "legacy-client")
@@ -3878,6 +5867,7 @@ mod tests {
         // revoking that hash from the guard actually de-authenticates the token.
         let device = registry
             .list()
+            .expect("test device registry list")
             .into_iter()
             .next()
             .expect("one backfilled device");
@@ -3893,10 +5883,6 @@ mod tests {
         );
     }
 
-    /// Regression: `POST /api/devices/{id}/token/rotate` MUST invalidate the
-    /// old bearer token. The pre-fix handler only issued a new pairing code
-    /// and left the leaked token authenticating (GHSA-f385-f6h2-3gqj
-    /// incident-response gap).
     #[tokio::test]
     async fn rotate_token_invalidates_old_bearer_token() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3922,9 +5908,6 @@ mod tests {
         assert!(json["pairing_code"].is_string());
     }
 
-    /// Enforcement: after rotate, the on-disk `gateway.paired_tokens` field
-    /// must not still contain the revoked token, so a daemon restart cannot
-    /// resurrect it.
     #[tokio::test]
     async fn rotate_token_persists_revocation_to_config() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3947,11 +5930,6 @@ mod tests {
         );
     }
 
-    /// Regression: `POST /api/pair` MUST persist the newly issued token to
-    /// `gateway.paired_tokens` before reporting success. The pre-fix handler
-    /// registered the device and returned "Pairing successful" but left the
-    /// token only in memory, so a restart after rotate/re-pair silently
-    /// dropped the replacement credential (GHSA-f385-f6h2-3gqj §5).
     #[tokio::test]
     async fn submit_pairing_enhanced_persists_new_token() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3959,11 +5937,12 @@ mod tests {
 
         let code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("require_pairing was enabled");
 
         let response = submit_pairing_enhanced(
             State(state.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:40002".parse().unwrap()),
             HeaderMap::new(),
             Json(serde_json::json!({ "code": code, "device_name": "repaired" })),
         )
@@ -3986,8 +5965,6 @@ mod tests {
         );
     }
 
-    /// Enforcement: `DELETE /api/devices/{id}` must also invalidate the
-    /// device's bearer token, not just the SQLite row.
     #[tokio::test]
     async fn revoke_device_invalidates_bearer_token() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4037,11 +6014,6 @@ mod tests {
         );
     }
 
-    /// Enforcement: when a pairing code is already pending, rotate still
-    /// revokes the bearer token (that is the load-bearing security effect)
-    /// but does not issue a new code; the pending code from the other flow
-    /// is preserved. The check + write must be atomic — see
-    /// `concurrent_rotates_do_not_both_issue_a_pairing_code` below.
     #[tokio::test]
     async fn rotate_with_pending_code_revokes_but_returns_null_code() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4049,7 +6021,7 @@ mod tests {
 
         let pending_code = state
             .pairing
-            .generate_new_pairing_code()
+            .generate_new_pairing_code(crate::live_pairing_code_policy(&state))
             .expect("require_pairing was enabled");
 
         let response = rotate_device_token(
@@ -4076,11 +6048,6 @@ mod tests {
         assert_eq!(json["device_id"], device_id);
     }
 
-    /// Enforcement: two rotates that race must not both succeed in issuing
-    /// a pairing code. The first one wins the slot; the second observes the
-    /// occupied slot atomically and returns `pairing_code: null`. Both
-    /// rotates revoke the bearer token they target, because revocation is
-    /// the load-bearing action and must not depend on the slot.
     #[tokio::test]
     async fn concurrent_rotates_do_not_both_issue_a_pairing_code() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -4092,7 +6059,11 @@ mod tests {
             ..zeroclaw_config::schema::Config::default()
         };
 
-        let pairing = Arc::new(PairingGuard::new(true, &[]));
+        let pairing = Arc::new(PairingGuard::new(
+            true,
+            &[],
+            zeroclaw_config::pairing::PairingCodePolicy::default(),
+        ));
         let code = pairing.pairing_code().unwrap();
         let admin_token = pairing.try_pair(&code, "admin").await.unwrap().unwrap();
 
@@ -4100,21 +6071,23 @@ mod tests {
         for id in ["dev-a", "dev-b"] {
             // Each device needs its own paired token so revoke has a hash.
             let code = pairing
-                .generate_new_pairing_code()
+                .generate_new_pairing_code(zeroclaw_config::pairing::PairingCodePolicy::default())
                 .expect("pairing enabled");
             let tok = pairing.try_pair(&code, id).await.unwrap().unwrap();
-            registry.register(
-                PairingGuard::token_hash(&tok),
-                DeviceInfo {
-                    id: id.to_string(),
-                    name: None,
-                    device_type: None,
-                    paired_at: Utc::now(),
-                    last_seen: Utc::now(),
-                    ip_address: None,
-                    capabilities: None,
-                },
-            );
+            registry
+                .register(
+                    PairingGuard::token_hash(&tok),
+                    DeviceInfo {
+                        id: id.to_string(),
+                        name: None,
+                        device_type: None,
+                        paired_at: Utc::now(),
+                        last_seen: Utc::now(),
+                        ip_address: None,
+                        capabilities: None,
+                    },
+                )
+                .expect("test device registry insert");
         }
 
         let mut state = test_state(config);
@@ -4149,5 +6122,168 @@ mod tests {
             "exactly one of two racing rotates must win the pairing slot, \
              got {codes_issued} (j1={j1}, j2={j2})"
         );
+    }
+
+    /// Regression: a shell cron job created via the gateway API with
+    /// `shell_output_format = raw` must persist the format, return raw
+    /// stdout when triggered, and not wrap output in the status envelope.
+    #[tokio::test]
+    async fn cron_api_shell_raw_output_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        // 1. Create a shell job with shell_output_format = raw via the API.
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "raw-echo",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo hello-raw",
+                    "shell_output_format": "raw"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(add_response.status(), StatusCode::OK);
+        let add_json = response_json(add_response).await;
+        assert_eq!(add_json["status"], "ok");
+        let job_id = add_json["job"]["id"].as_str().expect("job id").to_string();
+
+        // 2. Read the job back via list and verify shell_output_format persisted.
+        let list_response = handle_api_cron_list(State(state.clone()), HeaderMap::new())
+            .await
+            .into_response();
+        let list_json = response_json(list_response).await;
+        let jobs = list_json["jobs"].as_array().expect("jobs array");
+        let listed = jobs
+            .iter()
+            .find(|j| j["id"].as_str() == Some(&job_id))
+            .expect("job in list");
+        assert_eq!(
+            listed["shell_output_format"].as_str(),
+            Some("raw"),
+            "shell_output_format must persist through the API store path"
+        );
+
+        // 3. Link to test-agent so the scheduler can resolve the owner.
+        link_job_to_test_agent(&state, &job_id);
+
+        // 4. Trigger the job manually and verify raw output.
+        let run_response =
+            handle_api_cron_run(State(state.clone()), HeaderMap::new(), Path(job_id.clone()))
+                .await
+                .into_response();
+        assert_eq!(run_response.status(), StatusCode::OK);
+        let run_json = response_json(run_response).await;
+        assert_eq!(run_json["status"], "ok", "job should succeed: {run_json}");
+        assert_eq!(run_json["success"], true);
+
+        let output = run_json["output"].as_str().expect("output string");
+        assert_eq!(
+            output, "hello-raw",
+            "raw mode must return trimmed stdout, not the wrapped envelope: {output}"
+        );
+        assert!(
+            !output.contains("status="),
+            "raw output must not contain the status envelope: {output}"
+        );
+        assert!(
+            !output.contains("stdout:"),
+            "raw output must not contain the stdout header: {output}"
+        );
+    }
+
+    #[cfg(feature = "a2a")]
+    mod a2a_auth {
+        use super::*;
+        use tower::ServiceExt;
+
+        const TOKEN: &str = "a2a-test-token";
+
+        fn paired_state() -> AppState {
+            let mut config = zeroclaw_config::schema::Config::default();
+            config.a2a.server.enabled = true;
+            let agent = zeroclaw_config::schema::AliasedAgentConfig {
+                a2a: zeroclaw_config::multi_agent::AgentA2aConfig {
+                    published: true,
+                    exposed_skills: Vec::new(),
+                },
+                ..Default::default()
+            };
+            config.agents.insert("maker".to_string(), agent);
+            let mut state = test_state(config);
+            state.pairing = Arc::new(PairingGuard::new(
+                true,
+                &[TOKEN.to_string()],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
+            ));
+            state
+        }
+
+        async fn status_of(
+            router: axum::Router,
+            req: axum::http::Request<axum::body::Body>,
+        ) -> StatusCode {
+            router.oneshot(req).await.expect("router response").status()
+        }
+
+        #[tokio::test]
+        async fn task_endpoint_rejects_unauthenticated_request() {
+            let router = crate::a2a::a2a_task_route().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/a2a/maker")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"parts":[{"kind":"text","text":"hi"}]}}}"#,
+                ))
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn catalog_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/.well-known/agents-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_unauthenticated_request() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn alias_card_serves_with_valid_token() {
+            let router = crate::a2a::a2a_routes().with_state(paired_state());
+            let req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/a2a/maker/.well-known/agent-card.json")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(status_of(router, req).await, StatusCode::OK);
+        }
     }
 }

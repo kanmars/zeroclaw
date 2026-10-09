@@ -1,5 +1,4 @@
 //! Channel infrastructure: session backends, debouncing, and stall watchdog.
-//!
 //! These are cross-cutting utilities used by multiple channel implementations.
 
 pub mod acp_session_store;
@@ -33,18 +32,6 @@ pub fn fallback_gateway_bind_socket_addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
-/// Construct the configured session-persistence backend.
-///
-/// `backend` is the value of `[channels].session_backend` from config:
-/// `"sqlite"` (default) opens `{workspace}/sessions/sessions.db`, `"jsonl"`
-/// opens `{workspace}/sessions/*.jsonl`. Unknown values fall back to
-/// SQLite with a warning so a typo in config never silently disables
-/// persistence. The `Arc<dyn SessionBackend>` return type keeps every
-/// call site (channel orchestrator, runtime tools) reading from the
-/// same store.
-///
-/// Errors propagate from the underlying backend constructor (typically
-/// filesystem permissions on the sessions directory).
 pub fn make_session_backend(
     workspace_dir: &Path,
     backend: &str,
@@ -69,37 +56,24 @@ pub fn make_session_backend(
     }
 }
 
-/// Open the SQLite backend and, on first open, import any pre-existing
-/// `sessions/*.jsonl` files left over from the legacy JSONL store. Renames
-/// the imported files to `*.jsonl.migrated` so re-runs are no-ops; preserves
-/// them on disk so an operator can roll back without data loss. Errors from
-/// the import path are logged and skipped — the SQLite backend itself still
-/// opens, since blocking startup on a best-effort migration would be worse
-/// than a partial migration.
 fn open_sqlite_with_jsonl_import(
     workspace_dir: &Path,
 ) -> std::io::Result<session_sqlite::SqliteSessionBackend> {
     let backend = session_sqlite::SqliteSessionBackend::new(workspace_dir)
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-    match backend.migrate_from_jsonl(workspace_dir) {
-        Ok(0) => {}
-        Ok(n) => ::zeroclaw_log::record!(
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+    match backend
+        .migrate_from_jsonl(workspace_dir)
+        .map_err(|e| std::io::Error::other(format!("{e:#}")))?
+    {
+        0 => {}
+        n => ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             &format!(
-                "session_backend=sqlite: imported {n} legacy JSONL session(s) from \
-             {}/sessions; renamed to *.jsonl.migrated.",
+                "session_backend=sqlite: completed {n} legacy JSONL session migration \
+             handoff(s) from {}/sessions to *.jsonl.migrated.",
                 workspace_dir.display()
             )
-        ),
-        Err(e) => ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"e": e.to_string()})),
-            "session_backend=sqlite: JSONL import skipped: . Existing JSONL \
-             sessions remain on disk; switch to session_backend = \"jsonl\" if \
-             you need them visible immediately."
         ),
     }
     Ok(backend)
@@ -141,6 +115,19 @@ mod tests {
     }
 
     #[test]
+    fn make_session_backend_can_reload_from_empty_sqlite_to_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let sqlite = make_session_backend(tmp.path(), "sqlite").unwrap();
+        drop(sqlite);
+
+        let jsonl = make_session_backend(tmp.path(), "jsonl").unwrap();
+        jsonl
+            .append("reload_user", &user_msg("hello after reload"))
+            .unwrap();
+        assert_eq!(jsonl.load("reload_user").len(), 1);
+    }
+
+    #[test]
     fn make_session_backend_unknown_value_falls_back_to_sqlite() {
         let tmp = TempDir::new().unwrap();
         let backend = make_session_backend(tmp.path(), "totally-not-a-backend").unwrap();
@@ -178,5 +165,40 @@ mod tests {
             jsonl_migrated.exists(),
             ".jsonl.migrated rollback file should remain"
         );
+    }
+
+    #[test]
+    fn make_session_backend_sqlite_fails_closed_on_import_collision() {
+        let tmp = TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("legacy.jsonl"),
+            "{\"role\":\"user\",\"content\":\"from-jsonl\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("legacy.jsonl.migrated"),
+            "existing archive",
+        )
+        .unwrap();
+
+        let err = make_session_backend(tmp.path(), "sqlite")
+            .err()
+            .expect("migration collision must prevent SQLite startup");
+        assert!(err.to_string().contains("Refusing to replace"));
+    }
+
+    #[test]
+    fn make_session_backend_preserves_initialization_error_chain() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sessions/sessions.db")).unwrap();
+
+        let err = make_session_backend(tmp.path(), "sqlite")
+            .err()
+            .expect("a directory cannot be opened as the SQLite database");
+        let message = err.to_string();
+        assert!(message.contains("Failed to open session DB"));
+        assert!(message.contains("unable to open database file"));
     }
 }

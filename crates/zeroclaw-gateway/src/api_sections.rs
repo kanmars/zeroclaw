@@ -4,7 +4,6 @@
 
 use axum::{
     extract::{Query, State},
-    http::HeaderMap,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -15,15 +14,12 @@ use zeroclaw_runtime::rpc::types::{
 };
 
 use super::AppState;
-use super::api::require_auth;
+use super::api_config::{persist_and_swap, try_compute_drift};
 
 /// `GET /api/config/catalog` — list every model provider the CLI wizard knows
 /// about. The dashboard shows these in the "+ Add model provider" picker so
 /// CLI / web stay in sync.
-pub async fn handle_catalog(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_catalog(State(state): State<AppState>) -> Response {
     let _ = state;
 
     let model_providers: Vec<CatalogModelProvider> = zeroclaw_providers::list_model_providers()
@@ -45,29 +41,53 @@ pub struct ModelsQuery {
     /// `provider` alias matches the query-string name the web dashboard uses.
     #[serde(alias = "provider")]
     pub model_provider: String,
+    /// Optional typed-provider alias selected by the configuration form.
+    pub alias: Option<String>,
 }
 
-/// `GET /api/config/catalog/models?model_provider=<name>` — fetch the model list
-/// for one model_provider. Same code path the CLI wizard uses
-/// (`zeroclaw_providers::create_model_provider(...).list_models()`), which goes
-/// through the models.dev cached catalog for OpenAI / Anthropic / Gemini,
-/// the live `/v1/models` endpoint for OpenRouter, etc.
-///
-/// Lazy: the dashboard hits this only when the user picks a model_provider, so
-/// initial catalog load stays fast. Fetch failures return an empty list
-/// with `live: false` so the form falls back to a free-text input.
+impl ModelsQuery {
+    /// The dotted `<family>.<alias>` reference is the canonical source for
+    /// catalog resolution (endpoint, credential, headers) for every provider
+    /// family, not just `hailo_ollama` — `model_catalog_with_config_result`
+    /// resolves any configured alias generically via `find_by_name`. Reducing
+    /// non-Hailo families to the bare family name here silently prevented
+    /// their configured alias (custom endpoints, header-only auth, etc.) from
+    /// ever reaching that exact-profile catalog path through the dashboard.
+    fn catalog_provider_ref(&self) -> String {
+        match self.alias.as_deref() {
+            Some(alias) if !alias.trim().is_empty() => {
+                format!("{}.{}", self.model_provider, alias.trim())
+            }
+            _ => self.model_provider.clone(),
+        }
+    }
+}
+
 pub async fn handle_catalog_models(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(q): Query<ModelsQuery>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-    let _ = state;
     let local = zeroclaw_runtime::quickstart::model_provider_is_local(&q.model_provider);
+    let catalog_provider_ref = q.catalog_provider_ref();
+    // Snapshot config so the catalog resolves the alias credential and can reach
+    // the native /models endpoint (surfacing new native-only models that the
+    // models.dev snapshot may not carry yet) instead of silently falling back.
+    let cfg = state.config.read().clone();
     let (models, pricing, live) =
-        zeroclaw_runtime::quickstart::model_catalog(&q.model_provider).await;
+        match zeroclaw_runtime::quickstart::model_catalog_with_config_result(
+            Some(&cfg),
+            &catalog_provider_ref,
+        )
+        .await
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                return error_response(ConfigApiError::new(
+                    ConfigApiCode::ValidationFailed,
+                    error.to_string(),
+                ));
+            }
+        };
     axum::Json(CatalogModelsResult {
         model_provider: q.model_provider,
         models,
@@ -86,12 +106,6 @@ fn error_response(err: ConfigApiError) -> Response {
 
 // ── Section + picker (mirrors the TUI flow) ──────────────────────────
 
-/// Pure derivation of the section status response from a config snapshot.
-/// `needs_quickstart` is `false` iff at least one enabled `[agents.<alias>]`
-/// block has a resolved model provider with a selected model plus resolved
-/// risk/runtime profile refs. A provider without a bound, runnable agent is
-/// not a completion signal: chat dispatch still bounces with a setup error in
-/// that state.
 #[must_use]
 pub fn derive_section_status(cfg: &zeroclaw_config::schema::Config) -> ConfigStatusResult {
     let missing = quickstart_missing_requirements(cfg);
@@ -199,15 +213,7 @@ fn quickstart_agent_missing_requirements(
     missing
 }
 
-/// `GET /api/config/status` — boolean signal for the dashboard's
-/// fresh-install redirect. The daemon writes a default `config.toml` on
-/// first init, so file existence isn't a useful "is the user new?" check.
-/// Section status: ready iff at least one agent has its
-/// `model_provider`, `risk_profile`, and `runtime_profile` bound.
-pub async fn handle_section_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_section_status(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().clone();
     axum::Json(derive_section_status(&cfg)).into_response()
 }
@@ -232,15 +238,6 @@ pub struct AgentOptionsResponse {
     pub agents: Vec<String>,
 }
 
-/// Build the `AgentOptionsResponse` from a config snapshot. Pure function
-/// so tests can drive the same code path the handler runs without spinning
-/// up an `AppState`.
-///
-/// `get_map_keys` expects **kebab-case** paths (the macro at
-/// `crates/zeroclaw-macros/src/lib.rs:366` builds lookup arms with
-/// `snake_to_kebab(field_name)`). Passing snake_case for any
-/// underscore-bearing field silently returns `None` → empty `Vec` →
-/// dashboard renders "No X configured yet" even though X is configured.
 pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOptionsResponse {
     use zeroclaw_config::traits::AliasSource;
 
@@ -268,27 +265,12 @@ pub fn build_agent_options(cfg: &zeroclaw_config::schema::Config) -> AgentOption
 /// `GET /api/config/agent-options` — every alias-reference list the
 /// agent form needs, derived from the live config. Mirrors the lists the
 /// TUI computes locally for its alias pickers.
-pub async fn handle_agent_options(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_agent_options(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().clone();
     axum::Json(build_agent_options(&cfg)).into_response()
 }
 
-/// `GET /api/config/sections` — list every top-level config section.
-///
-/// Schema-driven: walks `Config::prop_fields()` and collects unique first
-/// segments, then asks `Config::map_key_sections()` for which ones have
-/// pickers. The 4 quickstart sections (`model_providers`, `channels`, `memory`,
-/// `tunnel`) keep their existing per-section dispatch in
-/// `handle_section_picker`; everything else (`gateway`, `observability`,
-/// `scheduler`, ...) renders as a direct form. Adding a new top-level
-/// field to `Config` makes it appear here automatically.
-pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
+pub async fn handle_sections(State(state): State<AppState>) -> Response {
     let cfg = state.config.read().clone();
     let completed: std::collections::HashSet<String> = cfg
         .onboard_state
@@ -310,12 +292,6 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         roots.remove(*hidden);
     }
 
-    // A section gets a picker only when its OWN root carries a map (path
-    // == key) or its immediate child is a typed-family map (path == key
-    // + "." + one segment). Deeper nested maps belong to a subsection's
-    // own editor and must not promote their top-level section to a
-    // picker — `cost.rates.providers.models.<type>` is the rate-sheet's
-    // concern, not a reason to give `[cost]` an Add affordance.
     let all_map_paths: Vec<&'static str> = zeroclaw_config::schema::Config::map_key_sections()
         .iter()
         .map(|s| s.path)
@@ -357,19 +333,8 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
         .collect();
     roots.retain(|k| k.contains('.') || !prefixes_with_children.contains(k));
 
-    // Hard-ban the rate-sheet subtree from the sidebar. `[cost.rates.*]` is
-    // edited from inside the `[cost]` section's tabs (and from each
-    // provider-type page's Costs tab); it has no standalone picker, no
-    // direct form at any intermediate depth, and surfacing a path like
-    // `cost.rates.providers.tts` as its own sidebar entry only yields a
-    // dead-end "no picker" page.
     roots.retain(|k| !k.starts_with("cost.rates"));
 
-    // Sort: curated sections first in their canonical order
-    // (single source of truth in `zeroclaw_config::sections`), then
-    // everything else alphabetically. This is what makes /quickstart's wizard
-    // order and /config's foundation grouping derive from one Rust const
-    // — frontends consume the response order directly.
     let mut ordered: Vec<String> = roots.into_iter().collect();
     ordered.sort_by(|a, b| {
         match (
@@ -386,11 +351,6 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
     let sections: Vec<ConfigSectionEntry> = ordered
         .into_iter()
         .map(|key| {
-            // Picker eligibility = anything `handle_section_picker`
-            // dispatches non-trivially. Wizard sections that opt out
-            // (workspace/hardware/personality) are direct-form. Map-keyed
-            // sections outside the wizard (multi-agent peer groups, etc.)
-            // get the generic schema-walk picker.
             let wizard = zeroclaw_config::sections::Section::from_key(&key);
             let has_picker = match wizard {
                 Some(w) => !matches!(
@@ -401,13 +361,15 @@ pub async fn handle_sections(State(state): State<AppState>, headers: HeaderMap) 
                 ),
                 None => section_has_picker_for_key(&key),
             };
+            let group = zeroclaw_config::sections::section_group_for_key(&key);
             ConfigSectionEntry {
                 completed: completed.contains(&key),
                 ready: section_ready(&cfg, &key, completed.contains(&key)),
                 label: zeroclaw_config::sections::humanize_section_key(&key),
                 help: section_help(&key).to_string(),
                 has_picker,
-                group: section_group(&key).to_string(),
+                group: group.label().to_string(),
+                group_key: group.key().to_string(),
                 is_quickstart: wizard.is_some(),
                 shape: wizard.map(zeroclaw_config::sections::Section::shape),
                 cost_category: zeroclaw_config::schema::cost_category_for_provider_section(&key)
@@ -451,20 +413,6 @@ const HIDDEN_TOP_LEVEL: &[&str] = &[
     "pre_override_snapshots",
 ];
 
-/// Display group for a section. Delegates to
-/// `zeroclaw_config::sections::section_group_for_key` — grouping lives
-/// in the `sections!` table (curated rows) plus its long-tail map, so
-/// the dashboard, the RPC `config/sections` handler, and the TUI all
-/// read one source. Unknown keys fall into `Other` so new schema
-/// additions still surface — they just land in the catch-all bucket
-/// until someone curates them.
-///
-/// Group order in the dashboard sidebar is governed by the frontend (see
-/// `Config.tsx`), mirroring `zeroclaw_config::sections::SECTION_GROUPS`.
-fn section_group(key: &str) -> &'static str {
-    zeroclaw_config::sections::section_group_for_key(key).label()
-}
-
 /// Help text for a section. Delegates to `zeroclaw_config::sections::section_help`
 /// so gateway, CLI, and TUI all read from one source — wizard variants
 /// pull from `Section::help`, everything else from the matching
@@ -479,24 +427,10 @@ pub struct SectionPath {
     pub section: String,
 }
 
-/// `GET /api/config/sections/<section>` — picker items for that section.
-///
-/// Per-section dispatch:
-/// * `providers` → `zeroclaw_providers::list_model_providers()` (CLI's catalog).
-/// * `memory` → `zeroclaw_memory::selectable_memory_backends()`.
-/// * `channels` / `tunnel` → schema-walk: clone config, `init_defaults` the
-///   section, then strip the section prefix from `prop_fields()` and dedupe
-///   by first segment. Same trick the TUI uses; new channels appear
-///   automatically when a `#[nested] Option<...>` field is added.
-/// * Anything else returns 404 (hardware has no picker).
 pub async fn handle_section_picker(
     State(state): State<AppState>,
-    headers: HeaderMap,
     axum::extract::Path(SectionPath { section }): axum::extract::Path<SectionPath>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
     let cfg = state.config.read().clone();
 
     use zeroclaw_config::sections::Section;
@@ -537,14 +471,6 @@ pub async fn handle_section_picker(
     .into_response()
 }
 
-/// Result of picker dispatch for a [`Section`]. `Items` carries the
-/// list rendered into the dashboard / CLI picker UI; `DirectForm`
-/// signals a section without a picker step (the caller falls through
-/// to `/api/config/list?prefix=<section>` for direct field rendering).
-///
-/// Splitting this out from `handle_section_picker` keeps the per-Section
-/// dispatch a pure function — testable without an `AppState` mock and
-/// exhaustively coverable by iterating every variant.
 enum PickerDispatch {
     Items(Vec<PickerItem>),
     DirectForm,
@@ -578,13 +504,16 @@ fn picker_items_for(
         // HashMap. Generic walker covers every section whose schema is
         // `<section>.<alias>` (operator-named keys, no closed kind set).
         Section::PeerGroups
+        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
         | Section::KnowledgeBundles
         | Section::SkillBundles
         | Section::RiskProfiles
-        | Section::RuntimeProfiles => {
+        | Section::RuntimeProfiles
+        | Section::ModelRoutes
+        | Section::EmbeddingRoutes => {
             PickerDispatch::Items(one_tier_alias_map_picker(cfg, section.as_str()))
         }
         Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState => {
@@ -732,11 +661,6 @@ fn memory_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
         .collect()
 }
 
-/// Generic schema-walk picker for sections like `channels` whose subsections
-/// are `#[nested] HashMap<String, T>` fields. Discovery: use `map_key_sections()`
-/// to enumerate all statically-known sub-sections under `<section>.` — this
-/// works for HashMap-based channels without needing init_defaults to insert
-/// entries (HashMap fields start empty and init_defaults leaves them empty).
 fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> Vec<PickerItem> {
     let prefix_with_dot = format!("{section}.");
 
@@ -781,15 +705,6 @@ fn schema_walk_picker(cfg: &zeroclaw_config::schema::Config, section: &str) -> V
         .collect()
 }
 
-/// Generic picker for `OneTierAliasMap` sections — walks the live
-/// `prop_fields()` for the section prefix and returns one PickerItem
-/// per operator-defined alias. The closed-kind enumeration that
-/// [`schema_walk_picker`] does via `Config::map_key_sections()` doesn't
-/// apply here: aliases under `peer_groups`, `cron`, `risk_profiles`,
-/// etc. are operator-named, with no statically-known catalog. Every
-/// existing alias is reported `configured`; the dashboard's `+ Add`
-/// affordance handles new-key creation through
-/// [`handle_select_item`].
 fn one_tier_alias_map_picker(
     cfg: &zeroclaw_config::schema::Config,
     section: &str,
@@ -867,18 +782,20 @@ fn apply_first_run_agent_defaults(cfg: &mut zeroclaw_config::schema::Config, ali
     }
 }
 
-fn mark_section_completed(cfg: &mut zeroclaw_config::schema::Config, section: &str) {
-    if !cfg
+fn mark_section_completed(cfg: &mut zeroclaw_config::schema::Config, section: &str) -> bool {
+    if cfg
         .onboard_state
         .completed_sections
         .iter()
         .any(|completed| completed == section)
     {
-        cfg.onboard_state
-            .completed_sections
-            .push(section.to_string());
-        cfg.mark_dirty("onboard_state.completed_sections");
+        return false;
     }
+    cfg.onboard_state
+        .completed_sections
+        .push(section.to_string());
+    cfg.mark_dirty("onboard_state.completed_sections");
+    true
 }
 
 fn first_alias<'a>(aliases: impl Iterator<Item = &'a String>) -> Option<String> {
@@ -887,16 +804,6 @@ fn first_alias<'a>(aliases: impl Iterator<Item = &'a String>) -> Option<String> 
     aliases.first().map(|alias| (*alias).clone())
 }
 
-/// `tunnel`-flavored picker: synthetic `none` entry first, then every
-/// statically-known option-backed provider from `TunnelConfig`'s
-/// `#[nested] Option<T>` fields. The provider set is sourced from the
-/// schema's own metadata via `nested_option_entries()` rather than
-/// `schema_walk_picker` / `map_key_sections()` — those only enumerate
-/// HashMap-typed sub-sections, so on a fresh config (where every
-/// `Option<Tunnel>` is `None`) the picker would only ever show `none`
-/// and hide every real provider. `nested_option_entries()` reports the
-/// full static catalog with the `is_some()` snapshot, so we get the
-/// closed-kind list without depending on configured state.
 fn tunnel_provider_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
     // The canonical prop name uses an underscore (`tunnel_provider`); the
     // hyphenated form is unknown to get_prop and silently yields "" (no active
@@ -941,21 +848,6 @@ pub struct SectionItemPath {
     pub key: String,
 }
 
-/// `POST /api/config/sections/<section>/items/<key>` — instantiate the
-/// selected item in the live config (idempotent) and return the dotted
-/// prefix the frontend should fetch fields under.
-///
-/// Per-section dispatch:
-/// * `providers` → POST equivalent of `/api/config/map-key?path=providers.models&key=<key>`,
-///   then return `model_providers.<key>`.
-/// * `channels` → init_defaults under `channels.<key>`, return `channels.<key>`.
-/// * `memory` → set_prop `memory.backend = <key>`, return `memory`.
-/// * `tunnel` → set_prop `tunnel.tunnel_provider = <key>` (and init_defaults the
-///   subsection if `<key>` is not "none"), return `tunnel.<key>` (or `tunnel`
-///   for the `none` case).
-///
-/// The optional JSON body `{"alias": "<name>"}` names the entry being created,
-/// e.g. `"work"` for `model_providers.anthropic.work`. Omit to use `"default"`.
 #[derive(Debug, Default, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct SectionSelectBody {
@@ -964,21 +856,65 @@ pub struct SectionSelectBody {
 
 pub async fn handle_section_select(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    principal: crate::principal_gate::RequestPrincipal,
     axum::extract::Path(SectionItemPath { section, key }): axum::extract::Path<SectionItemPath>,
     body: Option<axum::extract::Json<SectionSelectBody>>,
 ) -> Response {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
     let alias = body
         .and_then(|b| b.0.alias)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "default".to_string());
 
-    let mut working = state.config.read().clone();
+    use zeroclaw_config::sections::Section;
+    if matches!(Section::from_key(&section), Some(Section::Agents)) {
+        let reservation = match state.agent_lifecycle.reserve_config_mutation(&key) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                return error_response(
+                    ConfigApiError::new(ConfigApiCode::ValidationFailed, error.to_string())
+                        .with_path(format!("agents.{key}")),
+                );
+            }
+        };
+        // persist_and_swap retains its save. Retain admission until that save
+        // and publication finish, even if the requesting handler is cancelled.
+        let task = zeroclaw_runtime::live_config_authority::spawn_agent_lifecycle_job(Box::pin(
+            async move {
+                let _reservation = reservation;
+                select_section(state, principal, section, key, alias).await
+            },
+        ));
+        return match task.await {
+            Ok(response) => response,
+            Err(error) => error_response(ConfigApiError::new(
+                ConfigApiCode::ValidationFailed,
+                format!("Agent creation completion failed: {error}"),
+            )),
+        };
+    }
+    select_section(state, principal, section, key, alias).await
+}
+
+async fn select_section(
+    state: AppState,
+    principal: crate::principal_gate::RequestPrincipal,
+    section: String,
+    key: String,
+    alias: String,
+) -> Response {
+    // Held through the swap at the end of this handler so a concurrent
+    // config writer can't land between this read and the save below.
+    let _cfg_guard = match state.begin_config_commit().await {
+        Ok(commit) => commit,
+        Err(e) => {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ReloadFailed,
+                format!("config commit refused without any change: {e}"),
+            ));
+        }
+    };
+    let mut working = _cfg_guard.current_config();
 
     use zeroclaw_config::sections::Section;
     let Some(section_enum) = Section::from_key(&section) else {
@@ -993,11 +929,6 @@ pub async fn handle_section_select(
 
     let (fields_prefix, created) = match section_enum {
         Section::ModelProviders | Section::TtsProviders | Section::TranscriptionProviders => {
-            // Two-tier typed-family path: outer bucket is the family
-            // (`model_providers.<type>` etc.), inner key is the alias the
-            // operator named. `create_map_key` is idempotent so re-selecting
-            // an existing type/alias is a no-op for the bucket and just
-            // returns the form prefix for the alias.
             let family = section_enum.as_str();
             let created = working
                 .create_map_key(&format!("{family}.{key}"), &alias)
@@ -1034,13 +965,6 @@ pub async fn handle_section_select(
                 Ok(c) => c,
                 Err(resp) => return resp,
             };
-            // The per-channel-type struct's `enabled` field defaults to
-            // `false` for paste-safety (don't fire a listener on a
-            // half-pasted block). For wizard-driven creation the operator
-            // has just consciously added the alias, so flip
-            // the new entry's `enabled` to true. Re-selecting an existing
-            // alias is a no-op (created=false), so user-edited values are
-            // never trampled.
             if created {
                 let enabled_path = format!("channels.{key}.{alias}.enabled");
                 if let Err(e) = working.set_prop_persistent(&enabled_path, "true") {
@@ -1059,21 +983,16 @@ pub async fn handle_section_select(
         }
         Section::Agents
         | Section::PeerGroups
+        | Section::DecisionModels
         | Section::Cron
         | Section::McpServers
         | Section::McpBundles
         | Section::KnowledgeBundles
         | Section::SkillBundles
         | Section::RiskProfiles
-        | Section::RuntimeProfiles => {
-            // OneTierAliasMap: the URL path key IS the alias. One
-            // `create_map_key_checked("<section>", &key)` call works for every
-            // operator-named HashMap section; create_map_key is
-            // idempotent, so selecting an existing alias just returns
-            // the form prefix without modifying anything. Routing through the
-            // shared guarded boundary refuses the reserved `default` agent here
-            // too (this is the second operator create surface alongside
-            // `handle_map_key`), and delegates unchanged for every other section.
+        | Section::RuntimeProfiles
+        | Section::ModelRoutes
+        | Section::EmbeddingRoutes => {
             let section_key = section_enum.as_str();
             let created = match zeroclaw_config::alias_refs::create_map_key_checked(
                 &mut working,
@@ -1118,20 +1037,19 @@ pub async fn handle_section_select(
                         .with_path(section_key),
                     );
                 }
-                if let Err(err) =
-                    zeroclaw_config::schema::ensure_bootstrap_files(&workspace_dir).await
+                if let Err(err) = zeroclaw_runtime::agent::personality::seed_default_personality(
+                    &working,
+                    &key,
+                    &workspace_dir,
+                )
+                .await
                 {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": key, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "agent workspace scaffolded but bootstrap files seed failed (continuing)");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"agent": key, "workspace": workspace_dir.display().to_string(), "err": err.to_string()})), "agent workspace scaffolded but personality seed failed (continuing)");
                 }
             }
             (format!("{section_key}.{key}"), created)
         }
         Section::Storage => {
-            // Two-tier typed-family (`storage.<kind>.<alias>`) — same
-            // shape and selection flow as model_providers / tts_providers /
-            // transcription_providers. Outer bucket is the storage kind
-            // (sqlite, postgres, qdrant, markdown, lucid); inner key is
-            // the operator-named alias.
             let created = working
                 .create_map_key(&format!("storage.{key}"), &alias)
                 .map_err(|msg| {
@@ -1154,7 +1072,9 @@ pub async fn handle_section_select(
             // Set memory.backend to the picked key. Fields_prefix points at
             // `memory` so the form renders the whole memory section
             // (the active backend's specific fields show up there).
-            if let Err(e) = working.set_prop_persistent("memory.backend", &key) {
+            let selection_changed = working.memory.backend != key;
+            if selection_changed && let Err(e) = working.set_prop_persistent("memory.backend", &key)
+            {
                 return error_response(
                     ConfigApiError::new(
                         ConfigApiCode::ValidationFailed,
@@ -1163,11 +1083,17 @@ pub async fn handle_section_select(
                     .with_path("memory.backend"),
                 );
             }
-            mark_section_completed(&mut working, "memory");
-            ("memory".to_string(), true)
+            let completion_changed = mark_section_completed(&mut working, "memory");
+            (
+                "memory".to_string(),
+                selection_changed || completion_changed,
+            )
         }
         Section::Tunnel => {
-            if let Err(e) = working.set_prop_persistent("tunnel.tunnel_provider", &key) {
+            let selection_changed = working.tunnel.tunnel_provider != key;
+            if selection_changed
+                && let Err(e) = working.set_prop_persistent("tunnel.tunnel_provider", &key)
+            {
                 return error_response(
                     ConfigApiError::new(
                         ConfigApiCode::ValidationFailed,
@@ -1176,14 +1102,14 @@ pub async fn handle_section_select(
                     .with_path("tunnel.tunnel_provider"),
                 );
             }
-            let prefix = if key == "none" {
-                "tunnel".to_string()
+            let (prefix, defaults_changed) = if key == "none" {
+                ("tunnel".to_string(), false)
             } else {
                 let p = format!("tunnel.{key}");
-                working.init_defaults(Some(&p));
-                p
+                let initialized = working.init_defaults(Some(&p));
+                (p, !initialized.is_empty())
             };
-            (prefix, true)
+            (prefix, selection_changed || defaults_changed)
         }
         Section::Hardware | Section::Mcp | Section::Skills | Section::QuickstartState => {
             return error_response(
@@ -1204,13 +1130,66 @@ pub async fn handle_section_select(
         working.mark_dirty(&fields_prefix);
     }
 
-    if let Err(e) = working.save_dirty().await {
-        return error_response(ConfigApiError::new(
-            ConfigApiCode::ReloadFailed,
-            format!("save after select failed: {e}"),
-        ));
+    if working.dirty_paths.is_empty() {
+        let drifted = match section_enum {
+            Section::Memory | Section::Tunnel => match try_compute_drift(&working).await {
+                Ok(drifted) => drifted,
+                Err(error) => return error_response(error),
+            },
+            _ => Vec::new(),
+        };
+        let tunnel_prefix =
+            (section_enum == Section::Tunnel && key != "none").then(|| format!("tunnel.{key}."));
+        let conflict_paths: Vec<String> = drifted
+            .into_iter()
+            .filter(|drift| match section_enum {
+                Section::Memory => drift.path == "memory.backend",
+                Section::Tunnel => {
+                    drift.path == "tunnel.tunnel_provider"
+                        || tunnel_prefix
+                            .as_deref()
+                            .is_some_and(|prefix| drift.path.starts_with(prefix))
+                }
+                _ => false,
+            })
+            .map(|drift| drift.path)
+            .collect();
+        if !conflict_paths.is_empty() {
+            return error_response(ConfigApiError::new(
+                ConfigApiCode::ConfigChangedExternally,
+                format!(
+                    "on-disk config has drifted from in-memory state on {} path(s) required by this selection: {}. Reload the config or GET /api/config/drift to inspect first.",
+                    conflict_paths.len(),
+                    conflict_paths.join(", "),
+                ),
+            ));
+        }
+        return axum::Json(SelectItemResponse {
+            fields_prefix,
+            created,
+        })
+        .into_response();
     }
-    *state.config.write() = working;
+
+    // Selecting an existing item writes nothing; creating one writes the
+    // new item's fields. Authorized before the save either way.
+    let before = state.config.read().clone();
+    let mut writes = crate::principal_gate::ConfigWriteSet::by_effect(
+        &before,
+        &working,
+        working.dirty_paths.iter().map(String::as_str),
+    );
+    if created {
+        writes = writes.with(fields_prefix.clone(), zeroclaw_api::grants::Verb::Create);
+    }
+    let authorization =
+        match crate::principal_gate::authorize_config_write(&principal, writes, &_cfg_guard) {
+            Ok(authorization) => authorization,
+            Err(denied) => return denied.into_response(),
+        };
+    if let Err(e) = persist_and_swap(&state, authorization, working, _cfg_guard).await {
+        return e;
+    }
 
     axum::Json(SelectItemResponse {
         fields_prefix,
@@ -1223,13 +1202,145 @@ pub async fn handle_section_select(
 mod tests {
     use super::*;
 
-    /// Regression guard: every alias-bearing map the handler exposes must
-    /// be reachable from `Config::get_map_keys` using the kebab-case path
-    /// `build_agent_options` passes. Snake_case silently returns `None` →
-    /// empty Vec → dashboard renders "No X configured yet" when X exists.
-    /// This test drives the same code the gateway runs and would have
-    /// caught the original bug. Adding a new alias-bearing field requires
-    /// adding it here too.
+    const DEV_CONFIG_TEMPLATE: &str = include_str!("../../../dev/config.template.toml");
+    const DEV_HARNESS_TEMPLATE: &str = include_str!("../../../dev/config.harness-test.toml");
+
+    #[test]
+    fn models_query_uses_hailo_alias_for_catalog_resolution() {
+        let query = ModelsQuery {
+            model_provider: "hailo_ollama".to_string(),
+            alias: Some("edge".to_string()),
+        };
+        assert_eq!(query.catalog_provider_ref(), "hailo_ollama.edge");
+    }
+
+    #[test]
+    fn models_query_uses_configured_alias_for_every_provider_family() {
+        // Every provider family's configured alias must reach the exact-profile
+        // catalog path, not just hailo_ollama: `model_catalog_with_config_result`
+        // resolves any `<family>.<alias>` dotted reference generically.
+        let query = ModelsQuery {
+            model_provider: "openai".to_string(),
+            alias: Some("edge".to_string()),
+        };
+        assert_eq!(query.catalog_provider_ref(), "openai.edge");
+    }
+
+    #[test]
+    fn models_query_falls_back_to_bare_family_without_an_alias() {
+        let query = ModelsQuery {
+            model_provider: "openai".to_string(),
+            alias: None,
+        };
+        assert_eq!(query.catalog_provider_ref(), "openai");
+    }
+
+    fn parse_dev_template(raw: &str, name: &str) -> zeroclaw_config::schema::Config {
+        toml::from_str(raw).unwrap_or_else(|err| panic!("{name} must parse as schema V3: {err}"))
+    }
+
+    fn assert_common_dev_template_contract(cfg: &zeroclaw_config::schema::Config) {
+        assert_eq!(cfg.schema_version, 3);
+
+        let provider = cfg
+            .providers
+            .models
+            .ollama
+            .get("default")
+            .expect("Ollama default provider must exist");
+        assert_eq!(provider.base.model.as_deref(), Some("llama3.2"));
+        assert_eq!(
+            provider.base.uri.as_deref(),
+            Some("http://host.docker.internal:11434")
+        );
+        assert_eq!(provider.base.api_key, None);
+        assert_eq!(provider.base.temperature, Some(0.7));
+
+        let agent = cfg.agents.get("default").expect("default agent must exist");
+        assert!(agent.enabled);
+        assert_eq!(agent.model_provider.as_str(), "ollama.default");
+        assert_eq!(agent.risk_profile.as_str(), "default");
+        assert_eq!(agent.runtime_profile.as_str(), "default");
+        assert_eq!(
+            cfg.agent_workspace_dir("default"),
+            std::path::PathBuf::from("/zeroclaw-data/workspace")
+        );
+
+        let risk = cfg
+            .risk_profiles
+            .get("default")
+            .expect("default risk profile must exist");
+        assert_eq!(
+            risk.level,
+            zeroclaw_config::autonomy::AutonomyLevel::Supervised
+        );
+        assert!(cfg.runtime_profile_for_agent("default").is_some());
+
+        let status = derive_section_status(cfg);
+        assert!(!status.needs_quickstart, "missing: {:?}", status.missing);
+        assert_eq!(status.reason, "has_dispatchable_agent");
+
+        assert_eq!(cfg.gateway.port, 42617);
+        assert_eq!(cfg.gateway.host, "[::]");
+        assert!(cfg.gateway.allow_public_bind);
+        assert!(!cfg.gateway.require_pairing);
+    }
+
+    #[test]
+    fn dev_config_template_preserves_dispatch_contract() {
+        let cfg = parse_dev_template(DEV_CONFIG_TEMPLATE, "dev/config.template.toml");
+        assert_common_dev_template_contract(&cfg);
+
+        assert_eq!(
+            cfg.gateway.web_dist_dir.as_deref(),
+            Some("/usr/share/zeroclawlabs/web/dist")
+        );
+        assert!(!cfg.cost.enabled);
+        assert_eq!(cfg.cost.daily_limit_usd, 10.0);
+        assert_eq!(cfg.cost.monthly_limit_usd, 100.0);
+        assert_eq!(cfg.cost.warn_at_percent, 80);
+        assert!(!cfg.cost.allow_override);
+    }
+
+    #[test]
+    fn dev_harness_template_preserves_runtime_contract() {
+        let cfg = parse_dev_template(DEV_HARNESS_TEMPLATE, "dev/config.harness-test.toml");
+        assert_common_dev_template_contract(&cfg);
+
+        let runtime = cfg
+            .runtime_profile_for_agent("default")
+            .expect("harness agent must resolve its runtime profile");
+        assert_eq!(runtime.max_tool_iterations, 50);
+        assert_eq!(runtime.max_tool_result_chars, Some(50_000));
+        assert_eq!(runtime.max_context_tokens, Some(32_000));
+        assert!(!runtime.context_compression.enabled);
+        assert_eq!(runtime.context_compression.tool_result_retrim_chars, 2_000);
+        assert_eq!(
+            cfg.risk_profiles["default"].auto_approve,
+            [
+                "file_read",
+                "file_write",
+                "file_edit",
+                "memory_recall",
+                "memory_store",
+                "web_search_tool",
+                "web_fetch",
+                "calculator",
+                "glob_search",
+                "content_search",
+                "image_info",
+                "git_operations",
+            ]
+        );
+
+        assert_eq!(cfg.memory.backend, "sqlite");
+        assert!(cfg.memory.auto_save);
+        assert!(cfg.memory.hygiene_enabled);
+        assert_eq!(cfg.memory.archive_after_days, 7);
+        assert_eq!(cfg.memory.purge_after_days, 30);
+        assert_eq!(cfg.memory.embedding_provider, "none");
+    }
+
     #[test]
     fn build_agent_options_returns_every_configured_alias() {
         let mut cfg = zeroclaw_config::schema::Config::default();
@@ -1403,11 +1514,56 @@ mod tests {
         zeroclaw_config::schema::Config::default()
     }
 
+    #[tokio::test]
+    async fn agent_section_creation_reserves_url_key_through_cleanup() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config.save().await.unwrap();
+        let disk_before = std::fs::read(&config.config_path).unwrap();
+        let workspace = config.agent_workspace_dir("recreated");
+        let state = section_test_state(config);
+        let mut cleanup = state.agent_lifecycle.begin_delete("recreated").unwrap();
+        cleanup.commit_destructive_mutation();
+        let path = || {
+            axum::extract::Path(SectionItemPath {
+                section: "agents".into(),
+                key: "recreated".into(),
+            })
+        };
+        let body = || {
+            Some(axum::Json(SectionSelectBody {
+                alias: Some("other".into()),
+            }))
+        };
+        let response = handle_section_select(State(state.clone()), None, path(), body()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(!state.config.read().agents.contains_key("recreated"));
+        assert_eq!(
+            std::fs::read(&state.config.read().config_path).unwrap(),
+            disk_before
+        );
+        assert!(!workspace.exists());
+        drop(cleanup);
+        let response = handle_section_select(State(state.clone()), None, path(), body()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(state.config.read().agents.contains_key("recreated"));
+        assert!(!state.config.read().agents.contains_key("other"));
+        assert!(workspace.exists());
+    }
+
     fn section_test_state(config: zeroclaw_config::schema::Config) -> AppState {
         let memory: std::sync::Arc<dyn zeroclaw_api::memory_traits::Memory> =
             std::sync::Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let state_authority = zeroclaw_runtime::LiveConfigAuthority::new(config);
         AppState {
-            config: std::sync::Arc::new(parking_lot::RwLock::new(config)),
+            config: state_authority.live_handle(),
+            config_authority: state_authority.clone(),
+            agent_lifecycle: state_authority.agent_lifecycle(),
             model_provider: std::sync::Arc::new(crate::UnconfiguredModelProvider),
             model: "test-model".to_string(),
             temperature: None,
@@ -1420,10 +1576,10 @@ mod tests {
                 ),
             ),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
                 false,
                 &[],
+                zeroclaw_config::pairing::PairingCodePolicy::default(),
             )),
             trust_forwarded_headers: false,
             rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100)),
@@ -1444,18 +1600,18 @@ mod tests {
             nextcloud_talk: std::collections::HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: std::collections::HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: std::collections::HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: std::sync::Arc::new(zeroclaw_runtime::observability::NoopObserver),
             tools_registry: std::sync::Arc::new(Vec::new()),
+            tools_registry_by_agent: std::sync::Arc::new(std::collections::HashMap::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
             event_buffer: std::sync::Arc::new(crate::sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             reload_tx: None,
             node_registry: std::sync::Arc::new(crate::nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: crate::nodes::mdns::MdnsPeerRegistry::default(),
             path_prefix: String::new(),
             web_dist_dir: None,
             session_backend: None,
@@ -1474,6 +1630,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            sop_driver_handles: None,
         }
     }
 
@@ -1528,14 +1685,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn handle_sections_emits_stable_group_key_with_english_fallback() {
+        use http_body_util::BodyExt;
+
+        let response = handle_sections(State(section_test_state(empty_cfg()))).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let result: ConfigSectionsResult = serde_json::from_slice(&body).unwrap();
+        let cron = result
+            .sections
+            .iter()
+            .find(|section| section.key == "cron")
+            .expect("schema-derived response should include cron");
+        assert_eq!(cron.group, "Agent");
+        assert_eq!(cron.group_key, "agent");
+    }
+
     #[test]
     fn channels_select_initializes_subsection_so_set_prop_works() {
-        // Regression for the channels init/set flow: after
-        // handle_section_select for channels/matrix, the in-memory config
-        // must have channels.matrix.<alias> so a subsequent set_prop on
-        // channels.matrix.* succeeds rather than bailing "Unknown property".
-        // Uses create_map_key directly (the synchronous core of the select
-        // endpoint) to keep the test free of HTTP machinery.
         let mut cfg = empty_cfg();
         assert!(cfg.channels.matrix.is_empty(), "fresh config: matrix unset");
 
@@ -1697,13 +1866,6 @@ mod tests {
         assert_eq!(items[0].badge.as_deref(), Some("active"));
     }
 
-    /// Regression for zeroclaw-labs/zeroclaw#7876: on a fresh config
-    /// every option-backed tunnel provider must appear alongside the
-    /// synthetic `none` entry — the picker sources providers from
-    /// `TunnelConfig::nested_option_entries()` rather than
-    /// `schema_walk_picker` / `map_key_sections()` (which only see
-    /// HashMap-typed sub-sections and therefore return zero providers
-    /// when every `Option<Tunnel>` is `None`).
     #[test]
     fn tunnel_picker_surfaces_all_option_backed_providers_on_fresh_config() {
         let cfg = empty_cfg();
@@ -1726,17 +1888,9 @@ mod tests {
         }
     }
 
-    /// When a tunnel provider is configured, its picker entry is badged
-    /// `active` and the rest stay unbadged.
     #[test]
     fn tunnel_picker_marks_active_provider_from_configured_section() {
         let mut cfg = empty_cfg();
-        // Persist `tailscale` as the active provider. The Option<T> field
-        // stays None — only `tunnel.tunnel_provider` is what marks
-        // "active" in the picker. The provider is statically known from
-        // the schema regardless of the Option being Some/None.
-        // Set the active-provider field directly; the picker reads it via
-        // get_prop. Avoids writing the developer's real config in the test.
         cfg.tunnel.tunnel_provider = "tailscale".to_string();
         let items = tunnel_provider_picker(&cfg);
         let active: Vec<&str> = items
@@ -1755,10 +1909,6 @@ mod tests {
         );
     }
 
-    /// When an `Option<Tunnel>` is `Some(_)`, its picker entry is badged
-    /// `configured` (independent of `tunnel.tunnel_provider`). This is
-    /// the parallel of `schema_walk_picker`'s HashMap "configured" badge
-    /// — same UX cue, sourced from the schema's `is_some()` snapshot.
     #[test]
     fn tunnel_picker_badges_present_option_fields_as_configured() {
         let mut cfg = empty_cfg();
@@ -1800,7 +1950,7 @@ mod tests {
 
         let response = handle_section_select(
             State(state.clone()),
-            axum::http::HeaderMap::new(),
+            None,
             axum::extract::Path(SectionItemPath {
                 section: "tunnel".to_string(),
                 key: "cloudflare".to_string(),
@@ -1812,6 +1962,21 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let cfg = state.config.read().clone();
         assert_eq!(cfg.tunnel.tunnel_provider, "cloudflare");
+        assert!(
+            state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+        let raw = tokio::fs::read_to_string(&cfg.config_path).await.unwrap();
+        let disk_value: toml::Value = toml::from_str(&raw).unwrap();
+        assert_eq!(
+            disk_value
+                .get("tunnel")
+                .and_then(|value| value.get("tunnel_provider"))
+                .and_then(toml::Value::as_str),
+            Some(cfg.tunnel.tunnel_provider.as_str()),
+            "section selection must persist and publish the selected provider"
+        );
         let items = tunnel_provider_picker(&cfg);
         let cloudflare = items
             .iter()
@@ -1820,11 +1985,439 @@ mod tests {
         assert_eq!(cloudflare.badge.as_deref(), Some("active"));
     }
 
-    /// Empty OneTierAliasMap section yields zero picker items. No
-    /// closed-kind catalog applies for these sections — only operator-defined
-    /// aliases populate the picker. Section wire keys are kebab-case
-    /// because the Configurable derive runs each field name through
-    /// `snake_to_kebab` when registering map-key paths.
+    #[tokio::test]
+    async fn existing_section_selection_without_changes_skips_reload() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        cfg.create_map_key("providers.models.anthropic", "default")
+            .expect("seed model provider alias");
+        cfg.save().await.expect("seed disk config");
+        let disk_before = tokio::fs::read(&config_path)
+            .await
+            .expect("read seed config");
+        let state = section_test_state(cfg);
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            None,
+            axum::extract::Path(SectionItemPath {
+                section: "providers.models".to_string(),
+                key: "anthropic".to_string(),
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json response");
+        assert_eq!(json["fields_prefix"], "providers.models.anthropic.default");
+        assert_eq!(json["created"], false);
+
+        assert_eq!(tokio::fs::read(&config_path).await.unwrap(), disk_before);
+        let live_after = state.config.read().clone();
+        let live_before_value = toml::Value::try_from(&live_before).unwrap();
+        let live_after_value = toml::Value::try_from(&live_after).unwrap();
+        assert_eq!(
+            live_after_value, live_before_value,
+            "an existing selection must not replace the live snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_memory_and_tunnel_selections_skip_reload() {
+        use http_body_util::BodyExt;
+
+        let memory_tmp = tempfile::tempdir().expect("memory tempdir");
+        let memory_path = memory_tmp.path().join("config.toml");
+        let mut memory_cfg = zeroclaw_config::schema::Config {
+            config_path: memory_path.clone(),
+            ..Default::default()
+        };
+        memory_cfg.memory.backend = "sqlite".to_string();
+        memory_cfg
+            .onboard_state
+            .completed_sections
+            .push("memory".to_string());
+        memory_cfg.save().await.expect("seed memory config");
+        let memory_disk_before = tokio::fs::read(&memory_path)
+            .await
+            .expect("read seed memory config");
+        let memory_state = section_test_state(memory_cfg);
+        let memory_live_before = memory_state.config.read().clone();
+
+        let memory_response = handle_section_select(
+            State(memory_state.clone()),
+            None,
+            axum::extract::Path(SectionItemPath {
+                section: "memory".to_string(),
+                key: "sqlite".to_string(),
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(memory_response.status(), axum::http::StatusCode::OK);
+        let memory_body = memory_response
+            .into_body()
+            .collect()
+            .await
+            .expect("memory response body")
+            .to_bytes();
+        let memory_json: serde_json::Value =
+            serde_json::from_slice(&memory_body).expect("memory json response");
+        assert_eq!(memory_json["fields_prefix"], "memory");
+        assert_eq!(memory_json["created"], false);
+        assert_eq!(
+            tokio::fs::read(&memory_path).await.unwrap(),
+            memory_disk_before
+        );
+        assert_eq!(
+            toml::Value::try_from(&*memory_state.config.read()).unwrap(),
+            toml::Value::try_from(&memory_live_before).unwrap(),
+            "an unchanged memory selection must not replace the live snapshot"
+        );
+        assert!(
+            !memory_state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+
+        let tunnel_tmp = tempfile::tempdir().expect("tunnel tempdir");
+        let tunnel_path = tunnel_tmp.path().join("config.toml");
+        let mut tunnel_cfg = zeroclaw_config::schema::Config {
+            config_path: tunnel_path.clone(),
+            ..Default::default()
+        };
+        tunnel_cfg.tunnel.tunnel_provider = "cloudflare".to_string();
+        tunnel_cfg.tunnel.cloudflare = Some(Default::default());
+        tunnel_cfg.save().await.expect("seed tunnel config");
+        let tunnel_disk_before = tokio::fs::read(&tunnel_path)
+            .await
+            .expect("read seed tunnel config");
+        let tunnel_state = section_test_state(tunnel_cfg);
+        let tunnel_live_before = tunnel_state.config.read().clone();
+
+        let tunnel_response = handle_section_select(
+            State(tunnel_state.clone()),
+            None,
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "cloudflare".to_string(),
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(tunnel_response.status(), axum::http::StatusCode::OK);
+        let tunnel_body = tunnel_response
+            .into_body()
+            .collect()
+            .await
+            .expect("tunnel response body")
+            .to_bytes();
+        let tunnel_json: serde_json::Value =
+            serde_json::from_slice(&tunnel_body).expect("tunnel json response");
+        assert_eq!(tunnel_json["fields_prefix"], "tunnel.cloudflare");
+        assert_eq!(tunnel_json["created"], false);
+        assert_eq!(
+            tokio::fs::read(&tunnel_path).await.unwrap(),
+            tunnel_disk_before
+        );
+        assert_eq!(
+            toml::Value::try_from(&*tunnel_state.config.read()).unwrap(),
+            toml::Value::try_from(&tunnel_live_before).unwrap(),
+            "an unchanged tunnel selection must not replace the live snapshot"
+        );
+        assert!(
+            !tunnel_state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_memory_selection_rejects_disk_drift() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().expect("memory tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut live_cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        live_cfg.memory.backend = "sqlite".to_string();
+        live_cfg
+            .onboard_state
+            .completed_sections
+            .push("memory".to_string());
+        live_cfg.save().await.expect("seed live memory config");
+        let state = section_test_state(live_cfg);
+
+        let mut disk_cfg = state.config.read().clone();
+        disk_cfg.memory.backend = "postgres".to_string();
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external memory drift");
+        let disk_before = tokio::fs::read(&config_path)
+            .await
+            .expect("read drifted memory config");
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            None,
+            axum::extract::Path(SectionItemPath {
+                section: "memory".to_string(),
+                key: "sqlite".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("memory response body")
+            .to_bytes();
+        let error: ConfigApiError = serde_json::from_slice(&body).expect("memory error response");
+        assert_eq!(error.code, ConfigApiCode::ConfigChangedExternally);
+        assert_eq!(tokio::fs::read(&config_path).await.unwrap(), disk_before);
+        assert_eq!(
+            toml::Value::try_from(&*state.config.read()).unwrap(),
+            toml::Value::try_from(&live_before).unwrap(),
+            "a rejected memory selection must preserve the live snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_tunnel_selection_rejects_default_disk_drift() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().expect("tunnel tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let mut live_cfg = zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        live_cfg.tunnel.tunnel_provider = "tailscale".to_string();
+        live_cfg.tunnel.tailscale = Some(Default::default());
+        live_cfg.save().await.expect("seed live tunnel config");
+        let state = section_test_state(live_cfg);
+
+        let mut disk_cfg = state.config.read().clone();
+        disk_cfg
+            .tunnel
+            .tailscale
+            .as_mut()
+            .expect("tailscale defaults")
+            .funnel = true;
+        disk_cfg
+            .force_save()
+            .await
+            .expect("write intentional external tunnel drift");
+        let disk_before = tokio::fs::read(&config_path)
+            .await
+            .expect("read drifted tunnel config");
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            None,
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "tailscale".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("tunnel response body")
+            .to_bytes();
+        let error: ConfigApiError = serde_json::from_slice(&body).expect("tunnel error response");
+        assert_eq!(error.code, ConfigApiCode::ConfigChangedExternally);
+        assert_eq!(tokio::fs::read(&config_path).await.unwrap(), disk_before);
+        assert_eq!(
+            toml::Value::try_from(&*state.config.read()).unwrap(),
+            toml::Value::try_from(&live_before).unwrap(),
+            "a rejected tunnel selection must preserve the live snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_memory_and_tunnel_selections_reject_uninspectable_config() {
+        use http_body_util::BodyExt;
+
+        for (section, key) in [("memory", "sqlite"), ("tunnel", "cloudflare")] {
+            for malformed in [false, true] {
+                let tmp = tempfile::tempdir().expect("section tempdir");
+                let config_path = tmp.path().join("config.toml");
+                let mut live_cfg = zeroclaw_config::schema::Config {
+                    config_path: config_path.clone(),
+                    ..Default::default()
+                };
+                if section == "memory" {
+                    live_cfg.memory.backend = key.to_string();
+                    live_cfg
+                        .onboard_state
+                        .completed_sections
+                        .push(section.to_string());
+                } else {
+                    live_cfg.tunnel.tunnel_provider = key.to_string();
+                    live_cfg.tunnel.cloudflare = Some(Default::default());
+                }
+
+                let malformed_contents = b"[memory\nbackend = \"sqlite\"";
+                if malformed {
+                    tokio::fs::write(&config_path, malformed_contents)
+                        .await
+                        .expect("write malformed config");
+                } else {
+                    std::fs::create_dir(&config_path).expect("create unreadable config path");
+                }
+
+                let state = section_test_state(live_cfg);
+                let live_before = state.config.read().clone();
+                let response = handle_section_select(
+                    State(state.clone()),
+                    None,
+                    axum::extract::Path(SectionItemPath {
+                        section: section.to_string(),
+                        key: key.to_string(),
+                    }),
+                    None,
+                )
+                .await;
+
+                assert_eq!(
+                    response.status(),
+                    axum::http::StatusCode::CONFLICT,
+                    "{section} must reject an {} canonical config",
+                    if malformed { "malformed" } else { "unreadable" }
+                );
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("section response body")
+                    .to_bytes();
+                let error: ConfigApiError =
+                    serde_json::from_slice(&body).expect("section error response");
+                assert_eq!(error.code, ConfigApiCode::ConfigChangedExternally);
+                if malformed {
+                    assert_eq!(
+                        tokio::fs::read(&config_path).await.unwrap(),
+                        malformed_contents
+                    );
+                } else {
+                    assert!(config_path.is_dir());
+                }
+                assert_eq!(
+                    toml::Value::try_from(&*state.config.read()).unwrap(),
+                    toml::Value::try_from(&live_before).unwrap(),
+                    "a rejected {section} selection must preserve the live snapshot"
+                );
+                assert!(
+                    !state
+                        .pending_reload
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn section_select_snapshot_read_failure_stops_before_save() {
+        use http_body_util::BodyExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::create_dir_all(&config_path).unwrap();
+        let state = section_test_state(zeroclaw_config::schema::Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        });
+        let live_before = state.config.read().clone();
+
+        let response = handle_section_select(
+            State(state.clone()),
+            None,
+            axum::extract::Path(SectionItemPath {
+                section: "tunnel".to_string(),
+                key: "cloudflare".to_string(),
+            }),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("snapshot failure response body")
+            .to_bytes();
+        let error: ConfigApiError =
+            serde_json::from_slice(&body).expect("snapshot failure response");
+        assert_eq!(error.code, ConfigApiCode::ReloadFailed);
+        assert!(
+            error
+                .message
+                .contains("failed to snapshot existing config before save"),
+            "the handler must reject the unreadable snapshot before attempting a save: {}",
+            error.message
+        );
+        assert!(
+            config_path.is_dir(),
+            "snapshot admission failure must retain the prior disk state"
+        );
+        assert_eq!(
+            toml::Value::try_from(&*state.config.read()).unwrap(),
+            toml::Value::try_from(&live_before).unwrap(),
+            "snapshot admission failure must not publish the working snapshot"
+        );
+        assert!(
+            !state
+                .pending_reload
+                .load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
+
     #[test]
     fn one_tier_alias_map_picker_is_empty_for_unconfigured_section() {
         let cfg = empty_cfg();
@@ -1846,10 +2439,6 @@ mod tests {
         }
     }
 
-    /// After `create_map_key("<kebab-section>", "<alias>")`, the picker
-    /// surfaces the alias as a `configured` entry. Same shape applies
-    /// to every OneTierAliasMap section — the picker is generic over
-    /// the prefix.
     #[test]
     fn one_tier_alias_map_picker_surfaces_created_aliases() {
         let cases: &[(&str, &str)] = &[
@@ -1880,14 +2469,6 @@ mod tests {
         }
     }
 
-    /// Exhaustive picker dispatch: every [`Section`] variant must
-    /// resolve through `picker_items_for` without panic. DirectForm
-    /// sections (Workspace, Hardware, Mcp) return the
-    /// `PickerDispatch::DirectForm` sentinel; every other section
-    /// returns at least zero items. Loops over the wizard order plus
-    /// every explorer-only variant — adding a new Section variant
-    /// fails to compile until it gets a routing arm in
-    /// `picker_items_for`.
     #[test]
     fn picker_dispatch_covers_every_section_variant() {
         use zeroclaw_config::sections::Section;
@@ -1934,11 +2515,6 @@ mod tests {
         }
     }
 
-    /// Storage is `[storage.<kind>.<alias>]` — two-tier typed-family
-    /// shape, served by the storage picker. The picker
-    /// surfaces the 5 storage kinds (sqlite, postgres, qdrant,
-    /// markdown, lucid) regardless of which aliases exist, and badges
-    /// the kind `created` once any alias under it is created.
     #[test]
     fn storage_picker_lists_all_kinds_and_marks_created() {
         let cfg = empty_cfg();

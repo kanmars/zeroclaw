@@ -1,24 +1,4 @@
 //! Integration catalog — schema-driven, single-loop.
-//!
-//! Every entry comes from a schema-side source:
-//! - Channels: `ChannelsConfig::channels()` (each multi-instance V3
-//!   channel field surfaces as one `ChannelInfo` entry; name and desc
-//!   strings live in `channels()` itself, not in this file).
-//! - Toggle integrations: `Config::integration_descriptors()` (per-struct
-//!   `#[integration(...)]` attribute on `BrowserConfig` /
-//!   `GoogleWorkspaceConfig`, plus an inline descriptor for `cron` whose
-//!   `active` reflects whether any job is configured — cron is now a
-//!   `HashMap<String, CronJobDecl>` with no enable toggle struct).
-//! - AI providers: `zeroclaw_providers::list_providers()` (each
-//!   `ProviderInfo` row carries `display_name`, `description`, and a
-//!   `ProviderActivation` strategy).
-//! - Always-on built-in tools: `crate::tools::BUILTIN_TOOL_INTEGRATIONS`.
-//! - Platforms: `super::platform::PLATFORMS` (compile-time `cfg!` facts).
-//!
-//! No string literal naming a channel, vendor, tool, or platform appears
-//! in this file's production path. Adding a new integration of any kind
-//! is one row in the corresponding schema source — the registry picks
-//! it up automatically.
 
 use super::platform::PLATFORMS;
 use super::{IntegrationCategory, IntegrationEntry, IntegrationStatus};
@@ -48,13 +28,6 @@ fn parse_category(label: &str) -> IntegrationCategory {
     }
 }
 
-/// Compute an AI-model integration's status from typed-family slot
-/// occupancy. The registry never branches on a provider name — the
-/// canonical slot list (`for_each_model_provider_slot!`) is the single
-/// source of truth, and a slot is "active" iff at least one alias is
-/// configured under it. Regional variants and OAuth modes that used to
-/// drive richer activation predicates are now folded onto the parent
-/// typed slot, so per-row activation enums are unnecessary.
 fn evaluate_model_provider_activation(
     config: &Config,
     info: &zeroclaw_providers::ModelProviderInfo,
@@ -67,15 +40,6 @@ fn evaluate_model_provider_activation(
     )
 }
 
-/// Returns the integration catalog computed against `config`.
-///
-/// Single-loop, schema-driven. Every per-row decision lives on the
-/// schema-side source; this function just concatenates the iterators.
-///
-/// Channel discovery walks `ChannelsConfig::channels()` which always
-/// returns all known channel types; each `ChannelInfo` carries name,
-/// desc, and a configured flag.  Multi-instance V3 channels are
-/// reported active when any alias is configured.
 pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
     let channels = config
         .channels
@@ -86,6 +50,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             description: info.desc.to_string(),
             category: IntegrationCategory::Chat,
             status: bool_to_status(info.configured),
+            key: Some(info.config_key.to_string()),
         });
 
     let toggles = config.integration_descriptors().into_iter().map(|d| {
@@ -95,6 +60,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             description: d.description.to_string(),
             category,
             status: bool_to_status(d.active),
+            key: None,
         }
     });
 
@@ -107,6 +73,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
                 description: String::new(),
                 category: IntegrationCategory::AiModel,
                 status,
+                key: Some(info.name.to_string()),
             }
         });
 
@@ -117,6 +84,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
             description: (*desc).to_string(),
             category: IntegrationCategory::ToolsAutomation,
             status: IntegrationStatus::Active,
+            key: None,
         });
 
     let platforms = PLATFORMS.iter().map(|(name, available)| IntegrationEntry {
@@ -124,6 +92,7 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
         description: String::new(),
         category: IntegrationCategory::Platform,
         status: bool_to_status(*available),
+        key: None,
     });
 
     channels
@@ -138,7 +107,9 @@ pub fn all_integrations(config: &Config) -> Vec<IntegrationEntry> {
 mod tests {
     use super::*;
     use zeroclaw_config::schema::Config;
-    use zeroclaw_config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
+    use zeroclaw_config::schema::{
+        IMessageConfig, MatrixConfig, MatrixStreamMode, StreamMode, TelegramConfig,
+    };
     use zeroclaw_config::traits::ChannelConfig;
 
     #[test]
@@ -178,13 +149,6 @@ mod tests {
 
     #[test]
     fn channel_entries_carry_per_field_metadata_from_schema() {
-        // Schema-driven contract: every channel registered through
-        // `ChannelsConfig::channels()` surfaces as a Chat entry whose
-        // display_name and description come from the channel's
-        // `ChannelConfig::name()` / `desc()` methods — no override
-        // table lives here. V3 channels are HashMap<alias, XConfig>
-        // (one entry per channel type at the registry level), so the
-        // count must equal the number of (handle, _) pairs returned.
         let config = Config::default();
         let entries = all_integrations(&config);
         let channel_count = entries
@@ -217,7 +181,75 @@ mod tests {
                 "channel {:?} missing description text",
                 info.name,
             );
+            assert_eq!(
+                entry.key.as_deref(),
+                Some(info.config_key),
+                "channel {:?} entry must carry its schema config map key",
+                info.name,
+            );
         }
+    }
+
+    #[test]
+    fn config_backed_entries_resolve_through_their_map_key_contract() {
+        let config = Config::default();
+        for entry in all_integrations(&config).iter().filter(|entry| {
+            matches!(
+                entry.category,
+                IntegrationCategory::Chat | IntegrationCategory::AiModel
+            )
+        }) {
+            let key = entry
+                .key
+                .as_deref()
+                .unwrap_or_else(|| panic!("config-backed entry {:?} has no key", entry.name));
+            let path = match entry.category {
+                IntegrationCategory::Chat => format!("channels.{key}"),
+                IntegrationCategory::AiModel => format!("providers.models.{key}"),
+                _ => unreachable!(),
+            };
+            assert!(
+                config.get_map_keys(&path).is_some(),
+                "config-backed entry {:?} must resolve through map path `{path}`",
+                entry.name,
+            );
+        }
+    }
+
+    #[test]
+    fn ai_model_entries_carry_provider_family_key() {
+        let config = Config::default();
+        let entries = all_integrations(&config);
+        for info in zeroclaw_providers::list_model_providers() {
+            let entry = entries
+                .iter()
+                .find(|e| e.category == IntegrationCategory::AiModel && e.name == info.display_name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "AI-model entry for {:?} (display {:?}) must exist",
+                        info.name, info.display_name,
+                    )
+                });
+            assert_eq!(
+                entry.key.as_deref(),
+                Some(info.name),
+                "AI-model entry {:?} must carry the provider family key, not a display-name slug",
+                info.display_name,
+            );
+        }
+    }
+
+    #[test]
+    fn zai_entry_key_survives_display_name_slug_mismatch() {
+        // Regression: the Z.AI display name slugifies to
+        // `z-ai`, but the config slot is `providers.models.zai`.
+        let config = Config::default();
+        let entries = all_integrations(&config);
+        let zai = entries
+            .iter()
+            .find(|e| e.category == IntegrationCategory::AiModel && e.key.as_deref() == Some("zai"))
+            .expect("Z.AI registry entry with family key `zai`");
+        assert_eq!(zai.name, "Z.AI");
     }
 
     #[test]
@@ -231,14 +263,18 @@ mod tests {
                 api_base_url: zeroclaw_config::schema::TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1000,
+                multi_message_delay_ms: 800,
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
+                passive_group_context: false,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: 120,
                 excluded_tools: vec![],
                 reply_min_interval_secs: 0,
                 reply_queue_depth_max: 0,
+                debounce_ms: None,
             },
         );
         let entries = all_integrations(&config);
@@ -296,9 +332,14 @@ mod tests {
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
-                stream_mode: zeroclaw_config::schema::StreamMode::default(),
+                stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+                stream_tool_arguments: Vec::new(),
                 recovery_key: None,
                 password: None,
                 mention_only: false,
@@ -339,11 +380,23 @@ mod tests {
         entry.status
     }
 
+    /// Build a config with an explicit `[browser]` flag pair so the four
+    /// combinations below never depend on which flag happens to default
+    /// to `true`.
+    fn browser_config(enabled: bool, automation_enabled: bool) -> Config {
+        let mut config = Config::default();
+        config.browser.enabled = enabled;
+        config.browser.automation_enabled = automation_enabled;
+        config
+    }
+
     #[test]
     fn browser_active_in_default_config() {
-        // BrowserConfig::default() has enabled=true, so the toggle
-        // should be Active in the unconfigured registry.
+        // BrowserConfig::default() has enabled=true, so `browser_open` is
+        // registered and the toggle is Active in the unconfigured registry
+        // even though full automation is off.
         let config = Config::default();
+        assert!(config.browser.enabled && !config.browser.automation_enabled);
         assert!(matches!(
             toggle_status(&config, |n| n == "Browser"),
             IntegrationStatus::Active
@@ -352,12 +405,58 @@ mod tests {
 
     #[test]
     fn browser_available_when_disabled() {
-        let mut config = Config::default();
-        config.browser.enabled = false;
+        // Both flags off: the runtime registers neither `browser_open` nor
+        // `browser`, so nothing about this section is live.
+        let config = browser_config(false, false);
         assert!(matches!(
             toggle_status(&config, |n| n == "Browser"),
             IntegrationStatus::Available
         ));
+    }
+
+    #[test]
+    fn browser_active_when_only_automation_enabled() {
+        // `browser_open` is off but the full automation tool is registered.
+        // Reporting Available here would hide a live Chrome/Chromium
+        // surface from the operator.
+        let config = browser_config(false, true);
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn browser_active_when_both_flags_enabled() {
+        let config = browser_config(true, true);
+        assert!(matches!(
+            toggle_status(&config, |n| n == "Browser"),
+            IntegrationStatus::Active
+        ));
+    }
+
+    /// The descriptor's status must track the same predicate the schema
+    /// exposes, across every flag combination — the registry reads
+    /// `integration_descriptor()`, so a drift between the two would show
+    /// operators a status the runtime does not honour.
+    #[test]
+    fn browser_status_matches_schema_predicate_for_all_flag_combinations() {
+        for (enabled, automation_enabled) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let config = browser_config(enabled, automation_enabled);
+            let expected = if config.browser.integration_active() {
+                IntegrationStatus::Active
+            } else {
+                IntegrationStatus::Available
+            };
+            let actual = toggle_status(&config, |n| n == "Browser");
+            assert_eq!(
+                actual, expected,
+                "browser status mismatch for enabled={enabled}, \
+                 automation_enabled={automation_enabled}"
+            );
+        }
     }
 
     #[test]
@@ -443,16 +542,6 @@ mod tests {
 
     #[test]
     fn populated_typed_slot_activates_corresponding_ai_integration() {
-        // PR-branch typed-family layout: regional variants are folded
-        // onto the parent canonical slot (e.g. minimax-cn → minimax with
-        // a typed `endpoint` enum on the alias entry). Activation is
-        // therefore "any alias under the canonical slot" — a one-call
-        // `contains_model_provider_type` check that drops the V2-era
-        // `FallbackKeyMatches` predicate scaffolding.
-        //
-        // Drives every entry of `list_model_providers()` so adding a
-        // new family later (one row in `for_each_model_provider_slot!`
-        // + one display_name row here) is automatically covered.
         for info in zeroclaw_providers::list_model_providers() {
             let mut config = Config::default();
             assert!(

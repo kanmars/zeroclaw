@@ -6,34 +6,51 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolResult};
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronUpdateTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — risk profile gate for command updates.
     agent_alias: String,
 }
 
 impl CronUpdateTool {
+    pub fn new_with_runtime(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            runtime,
+            agent_alias: agent_alias.into(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn new(
         config: Arc<Config>,
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
     ) -> Self {
-        Self {
-            config,
-            security,
-            agent_alias: agent_alias.into(),
-        }
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        Self::new_with_runtime(config, security, agent_alias, runtime)
     }
 
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
         if !self.security.can_act() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(format!(
                     "Security policy: read-only mode, cannot perform '{action}'"
                 )),
@@ -43,7 +60,7 @@ impl CronUpdateTool {
         if self.security.is_rate_limited() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
             });
         }
@@ -51,7 +68,7 @@ impl CronUpdateTool {
         if !self.security.record_action() {
             return Some(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("Rate limit exceeded: action budget exhausted".to_string()),
             });
         }
@@ -67,7 +84,7 @@ impl Tool for CronUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)"
+        "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.). Accepts job name or ID — no need to call cron_list first."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -76,7 +93,7 @@ impl Tool for CronUpdateTool {
             "properties": {
                 "job_id": {
                     "type": "string",
-                    "description": "ID of the cron job to update, as returned by cron_add or cron_list"
+                    "description": "ID or name of the cron job to update. Accepts either the UUID returned by cron_add/cron_list or the human-readable job name (case-insensitive). No need to call cron_list first."
                 },
                 "patch": {
                     "type": "object",
@@ -92,7 +109,7 @@ impl Tool for CronUpdateTool {
                         },
                         "command": {
                             "type": "string",
-                            "description": "New shell command (for shell jobs)"
+                            "description": "New shell command for shell jobs, or agent prompt for agent jobs"
                         },
                         "prompt": {
                             "type": "string",
@@ -115,6 +132,11 @@ impl Tool for CronUpdateTool {
                         "delete_after_run": {
                             "type": "boolean",
                             "description": "If true, delete the job automatically after its first successful run"
+                        },
+                        "uses_memory": {
+                            "type": "boolean",
+                            "description": "If true (default), recall and inject memory context before agent job runs. Set to false for stateless digest/report jobs.",
+                            "default": true
                         },
                         // NOTE: oneOf is correct for OpenAI-compatible APIs (including OpenRouter).
                         // Gemini does not support oneOf in tool schemas; if Gemini native tool calling
@@ -164,8 +186,8 @@ impl Tool for CronUpdateTool {
                                 },
                                 "channel": {
                                     "type": "string",
-                                    "enum": cron::CRON_DELIVERY_SCHEMA_CHANNELS,
-                                    "description": "Channel type to deliver output to"
+                                    "pattern": cron::cron_delivery_channel_pattern(),
+                                    "description": "Channel to deliver output to. Use '<type>.<alias>' (e.g. 'telegram.work'); a bare type resolves only while that type has one configured instance. Supported types: telegram, discord, slack, mattermost, matrix, qq, whatsapp, webhook, lark, feishu, dingtalk, wechat, signal, email. Unlike cron_add, this patch is never filled in from the current conversation."
                                 },
                                 "to": {
                                     "type": "string",
@@ -197,28 +219,41 @@ impl Tool for CronUpdateTool {
         if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
 
-        let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
+        let raw_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
             Some(v) if !v.trim().is_empty() => v,
             _ => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'job_id' parameter".to_string()),
                 });
             }
         };
+
+        let job_id_owned =
+            match cron::resolve_job_id_or_name(&self.config, raw_id, &self.agent_alias) {
+                Ok(id) => id,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            };
+        let job_id = job_id_owned.as_str();
 
         let patch_val = match args.get("patch") {
             Some(v) => v.clone(),
             None => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some("Missing 'patch' parameter".to_string()),
                 });
             }
@@ -229,7 +264,7 @@ impl Tool for CronUpdateTool {
             Err(error) => {
                 return Ok(ToolResult {
                     success: false,
-                    output: String::new(),
+                    output: ToolOutput::default(),
                     error: Some(error),
                 });
             }
@@ -243,21 +278,23 @@ impl Tool for CronUpdateTool {
             return Ok(blocked);
         }
 
-        match cron::update_shell_job_with_approval(
+        match cron::update_shell_job_with_runtime(
             &self.config,
-            &self.agent_alias,
+            self.runtime.as_ref(),
+            &self.security,
+            Some(self.agent_alias.as_str()),
             job_id,
             patch,
             approved,
         ) {
             Ok(job) => Ok(ToolResult {
                 success: true,
-                output: serde_json::to_string_pretty(&cron_job_output(&job)?)?,
+                output: serde_json::to_string_pretty(&cron_job_output(&job)?)?.into(),
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
-                output: String::new(),
+                output: ToolOutput::default(),
                 error: Some(e.to_string()),
             }),
         }
@@ -395,6 +432,47 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn command_update_uses_injected_runtime_dialect() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["*".into()];
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(crate::platform::NativeRuntime::with_shell("pwsh".into()));
+        let tool =
+            CronUpdateTool::new_with_runtime(cfg.clone(), test_security(&cfg), TEST_AGENT, runtime);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "command": "ac blocked.txt value" },
+                "approved": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(cron::get_job(&cfg, &job.id).unwrap().command, "echo ok");
     }
 
     #[tokio::test]
@@ -550,6 +628,11 @@ mod tests {
                 "patch schema missing field: {field}"
             );
         }
+        assert_eq!(
+            patch_props["command"]["description"].as_str(),
+            Some("New shell command for shell jobs, or agent prompt for agent jobs"),
+            "command description must document the agent-job compatibility mapping"
+        );
 
         // patch.schedule is a oneOf with exactly 3 variants: cron, at, every
         let one_of = schema["properties"]["patch"]["properties"]["schedule"]["oneOf"]
@@ -630,14 +713,28 @@ mod tests {
             "at description should require explicit Z or offset: {at_description}"
         );
 
-        // patch.delivery.channel enum covers all supported channels
-        let channel_enum = schema["properties"]["patch"]["properties"]["delivery"]["properties"]
-            ["channel"]["enum"]
-            .as_array()
-            .expect("patch.delivery.channel must have an enum");
-        let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
-        assert_eq!(channel_strs.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
-        assert!(channel_strs.contains(&"dingtalk"));
+        // patch.delivery.channel admits every supported type AND the composite key.
+        // cron_update is the case that needs the alias form: this patch is never
+        // filled in from the conversation, so a composite key is the only
+        // unambiguous way to name one instance in a multi-instance setup.
+        let pattern = schema["properties"]["patch"]["properties"]["delivery"]["properties"]
+            ["channel"]["pattern"]
+            .as_str()
+            .expect("patch.delivery.channel must declare a pattern")
+            .to_string();
+        let channel = regex::Regex::new(&pattern).expect("channel pattern must compile");
+        for supported in cron::CRON_DELIVERY_SCHEMA_CHANNELS {
+            assert!(channel.is_match(supported), "{supported} must be valid");
+        }
+        assert!(channel.is_match("dingtalk"));
+        assert!(channel.is_match("wechat"));
+        assert!(channel.is_match("signal"));
+        assert!(channel.is_match("email"));
+        assert!(
+            channel.is_match("telegram.work"),
+            "cron_update must accept the aliased form its description recommends"
+        );
+        assert!(!channel.is_match("sms"));
 
         // patch.delivery exposes thread_id so the webhook channel can route callbacks
         // back to the originating conversation.
@@ -671,25 +768,24 @@ mod tests {
         let add_schema = add_tool.parameters_schema();
         let update_schema = update_tool.parameters_schema();
 
-        let add_channels: Vec<&str> = add_schema["properties"]["delivery"]["properties"]["channel"]
-            ["enum"]
-            .as_array()
-            .expect("cron_add delivery.channel must have an enum")
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect();
-        let update_channels: Vec<&str> =
+        let add_pattern = add_schema["properties"]["delivery"]["properties"]["channel"]["pattern"]
+            .as_str()
+            .expect("cron_add delivery.channel must declare a pattern");
+        let update_pattern =
             update_schema["properties"]["patch"]["properties"]["delivery"]["properties"]["channel"]
-                ["enum"]
-                .as_array()
-                .expect("cron_update patch.delivery.channel must have an enum")
-                .iter()
-                .filter_map(|value| value.as_str())
-                .collect();
+                ["pattern"]
+                .as_str()
+                .expect("cron_update patch.delivery.channel must declare a pattern");
 
-        assert_eq!(add_channels, update_channels);
-        assert_eq!(add_channels.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
-        assert!(add_channels.contains(&"dingtalk"));
+        // Both tools must describe the same channel surface, or a value the model
+        // learns from one becomes invalid in the other.
+        assert_eq!(add_pattern, update_pattern);
+        let channel = regex::Regex::new(update_pattern).expect("channel pattern must compile");
+        for supported in cron::CRON_DELIVERY_SCHEMA_CHANNELS {
+            assert!(channel.is_match(supported), "{supported} must be valid");
+        }
+        assert!(channel.is_match("telegram.work"));
+        assert!(channel.is_match("dingtalk"));
     }
 
     #[tokio::test]
@@ -752,6 +848,7 @@ mod tests {
             None,
             false,
             Some(vec!["file_read".into()]),
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
@@ -773,6 +870,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_patch_on_agent_job_updates_prompt_without_shell_policy() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Supervised;
+        risk_profile.allowed_commands = vec!["echo".into()];
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_agent_job(
+            &cfg,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "old prompt",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "command": "curl https://example.com" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let updated = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(updated.prompt.as_deref(), Some("curl https://example.com"));
+        assert_eq!(
+            updated.command, "",
+            "agent jobs must not persist patch.command on the unused command column"
+        );
+    }
+
+    #[tokio::test]
     async fn updates_agent_allowed_tools() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -790,6 +937,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .unwrap();
         let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
@@ -806,6 +954,94 @@ mod tests {
         assert_eq!(
             cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
             Some(vec!["file_read".into(), "web_search".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_job_name_without_prior_cron_list() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        cron::add_shell_job(
+            &cfg,
+            TEST_AGENT,
+            Some("morning_briefing".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 7 * * 1-5".into(),
+                tz: None,
+            },
+            "echo ok",
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": "morning_briefing",
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("\"enabled\": false"));
+    }
+
+    #[tokio::test]
+    async fn errors_on_unknown_name() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": "no_such_job",
+                "patch": { "enabled": false }
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("no_such_job"),);
+    }
+
+    /// A job owned by someone else. An agent job needs no risk profile for its
+    /// owner, which keeps the fixture to the ownership boundary.
+    fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
+        cron::add_agent_job(
+            cfg,
+            "other-agent",
+            Some("secret_job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "read the other agent's inbox",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cannot_update_another_agents_job_by_id() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let theirs = other_agents_job(&cfg);
+
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+        let result = tool
+            .execute(json!({"job_id": theirs.id, "patch": {"enabled": false}}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            cron::get_job(&cfg, &theirs.id).unwrap().enabled,
+            "other agent's job must be untouched"
         );
     }
 }

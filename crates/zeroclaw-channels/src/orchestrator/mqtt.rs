@@ -1,7 +1,6 @@
 //! MQTT → SOP event fan-in listener.
-//!
 //! This is NOT a `Channel` trait implementor — it routes MQTT messages
-//! to the SOP engine via `dispatch_sop_event`, not to the chat loop.
+//! to the SOP engine via `dispatch_untrusted_fan_in`, not to the chat loop.
 
 use std::sync::{Arc, Mutex};
 
@@ -10,18 +9,18 @@ use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport};
 
 use zeroclaw_config::schema::MqttConfig;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::{dispatch_sop_event, process_headless_results};
-use zeroclaw_runtime::sop::engine::{SopEngine, now_iso8601};
-use zeroclaw_runtime::sop::types::{SopEvent, SopTriggerSource};
+use zeroclaw_runtime::sop::dispatch::SopIngress;
+use zeroclaw_runtime::sop::engine::SopEngine;
+use zeroclaw_runtime::sop::types::SopTriggerSource;
 
 /// Run the MQTT SOP listener loop.
-///
 /// Subscribes to configured topics and dispatches incoming publishes
 /// to the SOP engine. Blocks until disconnected or cancelled.
 pub async fn run_mqtt_sop_listener(
     config: &MqttConfig,
     engine: Arc<Mutex<SopEngine>>,
     audit: Arc<SopAuditLogger>,
+    driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 ) -> Result<()> {
     config.validate()?;
 
@@ -70,18 +69,20 @@ pub async fn run_mqtt_sop_listener(
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(msg))) => {
-                let topic = msg.topic.clone();
-                let payload = String::from_utf8_lossy(&msg.payload).to_string();
-
-                let event = SopEvent {
-                    source: SopTriggerSource::Mqtt,
-                    topic: Some(topic),
-                    payload: Some(payload),
-                    timestamp: now_iso8601(),
-                };
-
-                let results = dispatch_sop_event(&engine, &audit, event).await;
-                process_headless_results(&results);
+                let payload_raw = String::from_utf8_lossy(&msg.payload);
+                let mut ingress = SopIngress::new(Some(&engine), Some(audit.as_ref()));
+                if let Some(sink) = driver_sink.as_ref() {
+                    ingress = ingress.with_driver_sink(sink);
+                }
+                ingress
+                    .dispatch(
+                        SopTriggerSource::Mqtt,
+                        Some(&msg.topic),
+                        Some(&payload_raw),
+                        None,
+                        None,
+                    )
+                    .await;
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 zeroclaw_runtime::health::mark_component_ok("mqtt");

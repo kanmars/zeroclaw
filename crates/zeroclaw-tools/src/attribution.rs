@@ -2,13 +2,8 @@
 //! crate. Each invocation surfaces `Role::Tool(ToolKind::*)` and uses
 //! the tool's `name()` as its alias so log emissions can attribute
 //! tool activity with the same `<kind>.<alias>` composite the rest of
-//! the runtime uses for channels, providers, and memory.
-//!
-//! Add a new line here whenever a new `impl Tool for FooTool` lands in
-//! this crate; `Tool: Attributable` is a hard supertrait, so the
-//! compiler will refuse to build without the matching impl.
 
-use zeroclaw_api::attribution::ToolKind;
+use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
 use zeroclaw_api::tool_attribution;
 
 use crate::ask_user::AskUserTool;
@@ -35,6 +30,7 @@ use crate::file_upload::FileUploadTool;
 use crate::file_upload_bundle::FileUploadBundleTool;
 use crate::file_write::FileWriteTool;
 use crate::gemini_cli::GeminiCliTool;
+use crate::git_forge::GitForgeTool;
 use crate::git_operations::GitOperationsTool;
 use crate::glob_search::GlobSearchTool;
 use crate::google_workspace::GoogleWorkspaceTool;
@@ -58,7 +54,6 @@ use crate::microsoft365::Microsoft365Tool;
 use crate::model_routing_config::ModelRoutingConfigTool;
 use crate::notion_tool::NotionTool;
 use crate::opencode_cli::OpenCodeCliTool;
-use crate::pdf_read::PdfReadTool;
 use crate::pipeline::PipelineTool;
 use crate::poll::PollTool;
 use crate::project_intel::ProjectIntelTool;
@@ -67,6 +62,7 @@ use crate::pushover::PushoverTool;
 use crate::reaction::ReactionTool;
 use crate::report_template_tool::ReportTemplateTool;
 use crate::screenshot::ScreenshotTool;
+use crate::send_via::SendViaTool;
 use crate::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,
     SessionsListTool, SessionsSendTool,
@@ -102,6 +98,7 @@ tool_attribution!(FileUploadBundleTool, ToolKind::Plugin);
 tool_attribution!(FileWriteTool, ToolKind::Plugin);
 tool_attribution!(GeminiCliTool, ToolKind::Plugin);
 tool_attribution!(GitOperationsTool, ToolKind::Shell);
+tool_attribution!(GitForgeTool, ToolKind::Plugin);
 tool_attribution!(GlobSearchTool, ToolKind::Search);
 tool_attribution!(GoogleWorkspaceTool, ToolKind::Plugin);
 tool_attribution!(HardwareBoardInfoTool, ToolKind::Plugin);
@@ -114,7 +111,7 @@ tool_attribution!(JiraTool, ToolKind::Plugin);
 tool_attribution!(KnowledgeTool, ToolKind::Plugin);
 tool_attribution!(LinkedInTool, ToolKind::Plugin);
 tool_attribution!(LlmTaskTool, ToolKind::Plugin);
-tool_attribution!(McpToolWrapper, ToolKind::Plugin);
+tool_attribution!(McpToolWrapper, ToolKind::Plugin, ToolProvenance::Extension);
 tool_attribution!(MemoryExportTool, ToolKind::Memory);
 tool_attribution!(MemoryForgetTool, ToolKind::Memory);
 tool_attribution!(MemoryPurgeTool, ToolKind::Memory);
@@ -124,7 +121,6 @@ tool_attribution!(Microsoft365Tool, ToolKind::Plugin);
 tool_attribution!(ModelRoutingConfigTool, ToolKind::Plugin);
 tool_attribution!(NotionTool, ToolKind::Plugin);
 tool_attribution!(OpenCodeCliTool, ToolKind::Plugin);
-tool_attribution!(PdfReadTool, ToolKind::Plugin);
 tool_attribution!(PipelineTool, ToolKind::Plugin);
 tool_attribution!(PollTool, ToolKind::Wait);
 tool_attribution!(ProjectIntelTool, ToolKind::Plugin);
@@ -133,6 +129,7 @@ tool_attribution!(PushoverTool, ToolKind::Plugin);
 tool_attribution!(ReactionTool, ToolKind::Plugin);
 tool_attribution!(ReportTemplateTool, ToolKind::Plugin);
 tool_attribution!(ScreenshotTool, ToolKind::Plugin);
+tool_attribution!(SendViaTool, ToolKind::Plugin);
 tool_attribution!(SessionDeleteTool, ToolKind::Plugin);
 tool_attribution!(SessionResetTool, ToolKind::Plugin);
 tool_attribution!(SessionsCurrentTool, ToolKind::Plugin);
@@ -144,3 +141,65 @@ tool_attribution!(ToolSearchTool, ToolKind::Search);
 tool_attribution!(WeatherTool, ToolKind::Plugin);
 tool_attribution!(WebFetchTool, ToolKind::FetchUrl);
 tool_attribution!(WebSearchTool, ToolKind::Search);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::calculator::CalculatorTool;
+    use zeroclaw_api::attribution::{Attributable, Role, ToolProvenance};
+
+    #[test]
+    fn macro_sets_role_to_tool_kind() {
+        let tool = CalculatorTool;
+        assert_eq!(tool.role(), Role::Tool(ToolKind::Plugin));
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Native);
+        assert_eq!(tool.alias(), "calculator");
+    }
+
+    #[test]
+    fn attributable_via_arc_matches_inner() {
+        let inner = CalculatorTool;
+        let arc: Arc<CalculatorTool> = Arc::new(inner);
+        assert_eq!(arc.alias(), "calculator");
+        assert_eq!(arc.role(), Role::Tool(ToolKind::Plugin));
+        assert_eq!(arc.tool_provenance(), ToolProvenance::Native);
+    }
+
+    #[test]
+    fn mcp_wrapper_is_an_extension_even_when_its_role_is_plugin() {
+        let registry = tokio::runtime::Runtime::new()
+            .expect("test runtime")
+            .block_on(crate::mcp_client::McpRegistry::connect_all(&[]))
+            .expect("empty registry");
+        let tool = McpToolWrapper::new(
+            "mcp__shell".to_string(),
+            crate::mcp_protocol::McpToolDef {
+                name: "shell".to_string(),
+                description: None,
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            Arc::new(registry),
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        );
+        assert_eq!(tool.role(), Role::Tool(ToolKind::Plugin));
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
+    }
+
+    #[test]
+    fn tool_name_has_no_dot_separator() {
+        let tool = CalculatorTool;
+        assert!(
+            !tool.alias().contains('.'),
+            "alias `{}` must not contain `.` — would break `<kind>.<alias>` composite parsing",
+            tool.alias()
+        );
+    }
+
+    #[test]
+    fn tool_name_is_nonempty() {
+        let tool = CalculatorTool;
+        assert!(!tool.alias().is_empty());
+    }
+}

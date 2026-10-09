@@ -14,10 +14,11 @@ Download the latest Windows release zip, extract `zeroclaw.exe`, and put it on y
 
 From a PowerShell prompt:
 
+<!-- >>> generated:windows-prebuilt-powershell by `cargo generate installers` - do not edit <<< -->
 ```powershell
-# Idempotent: re-running this block is a no-op when zeroclaw is already
-# installed at the latest release and on the user PATH. After a release
-# bumps, the version check fails and the install side runs again.
+# Installation and PATH setup are idempotent. If zeroclaw is already at the
+# latest release and on the user PATH, those steps are skipped; Quickstart
+# still runs at the end.
 $ver = (Invoke-RestMethod 'https://api.github.com/repos/zeroclaw-labs/zeroclaw/releases/latest').tag_name.TrimStart('v')
 $dst = "$env:USERPROFILE\.zeroclaw\bin"
 $exe = "$dst\zeroclaw.exe"
@@ -33,9 +34,10 @@ if ($current -ne $ver) {
     Expand-Archive -Force -Path "$env:TEMP\zeroclaw.zip" -DestinationPath $dst
 }
 
-$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$environment = [Environment]
+$userPath = $environment::GetEnvironmentVariable('Path', 'User')
 if (($userPath -split ';') -notcontains $dst) {
-    [Environment]::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
+    $environment::SetEnvironmentVariable('Path', "$dst;$userPath", 'User')
 }
 if (($env:Path -split ';') -notcontains $dst) {
     $env:Path = "$dst;$env:Path"
@@ -43,8 +45,11 @@ if (($env:Path -split ';') -notcontains $dst) {
 
 & $exe quickstart
 ```
+<!-- >>> end generated:windows-prebuilt-powershell <<< -->
 
-The zip ships a self-contained binary, with no Rust toolchain, no Visual Studio Build Tools needed.
+For the stable behavior shared by the Windows prebuilt and source routes, see the [canonical installation paths](../getting-started/quickstart.md#install). Release availability and the PowerShell download block remain documented here because they depend on live GitHub assets.
+
+The prebuilt zip is self-contained; Visual Studio Build Tools are required only when building from source.
 
 After install, verify:
 
@@ -64,8 +69,9 @@ Flags:
 |---|---|
 | `--prebuilt` | Download prebuilt binary from GitHub Releases (fastest once reached; current script still checks for `cargo` first) |
 | `--minimal`  | Build core only (no channels, no hardware) |
-| `--standard` | Build with common channels (Telegram, Discord, Slack, Matrix) |
-| `--full`     | Build everything |
+| `--dist`     | Build the lean release distribution feature set |
+| `--default`  | Build with Cargo's default feature set |
+| `--all`      | Build with every registered feature |
 
 > ⚠️ **Known issue (current).** `setup.bat --prebuilt` still checks for `cargo` before it reaches the prebuilt branch, so Option 2 does not honor a no-Rust promise. If you don't have a Rust toolchain, use **Option 1** above.
 >
@@ -82,12 +88,25 @@ cargo install --locked --path .
 zeroclaw quickstart
 ```
 
-### Option 4: Scoop (currently stale)
+### Native runtime shell
 
-> ⚠️ **The Scoop manifest in the repo is pinned to v0.5.9** (23 patch releases behind master). Until a release-time CI hook bumps it, prefer Option 1 or 3. If you do use Scoop and hit issues, please open a PR against `dist/scoop/zeroclaw.json`.
+When `[runtime].shell` is omitted, Windows selects the first available
+interpreter in this order: `pwsh`, `powershell`, then `cmd.exe`. To preserve
+the legacy `cmd.exe` behavior explicitly, set:
 
+```toml
+[runtime]
+shell = "cmd"
 ```
-scoop install zeroclaw     # currently installs an older release; see warning above
+
+An explicit `pwsh` or `powershell` value is never replaced by an automatic
+fallback if that interpreter is unavailable.
+
+### Option 4: Scoop
+
+```cmd
+scoop bucket add zeroclaw https://github.com/zeroclaw-labs/scoop-zeroclaw
+scoop install zeroclaw
 zeroclaw quickstart
 ```
 
@@ -196,7 +215,9 @@ zeroclaw service logs
 
 > **About `--service-init`.** The CLI exposes a `--service-init [auto|systemd|openrc]` flag for cross-platform consistency, but on Windows it is a no-op; the scheduled-task path is always used.
 
-Logs go to `%USERPROFILE%\.zeroclaw\logs\` (specifically, `<config_dir>/logs/` where `<config_dir>` defaults to `%USERPROFILE%\.zeroclaw\`). The scheduled-task wrapper itself, however, lives next to the config file at `%USERPROFILE%\.zeroclaw\zeroclaw-daemon.cmd`. Only the daemon output files (`daemon.stdout.log` / `daemon.stderr.log`) are written under `logs\`.
+Logs go to `%USERPROFILE%\.zeroclaw\logs\` (specifically, `<config_dir>/logs/` where `<config_dir>` defaults to `%USERPROFILE%\.zeroclaw\`). The task runs the ZeroClaw binary directly through an internal runner, which keeps each `daemon.stdout.log` and `daemon.stderr.log` file within 8 MiB while retaining recent output. To replace an existing task, including an older `.cmd` wrapper or this direct runner, first run `schtasks /Change /TN "ZeroClaw Daemon" /Disable`, reboot Windows, then run `zeroclaw service install`. Installation refuses to replace a task in any state except Disabled because Task Scheduler's Ready state does not prove that its processes exited; `zeroclaw service stop` alone is insufficient. The installer checks that the task is Disabled but cannot verify that Windows rebooted, so complete that step before reinstalling. The old wrapper file may remain but is no longer used. The runner restricts the config root and log files to the task account and rejects reparse-point paths, so existing paths owned by another account must be corrected before the task can start. Literal `%` signs in executable or config paths are unsupported because Task Scheduler expands them in action paths.
+
+Windows currently attaches an empty console window to this interactive scheduled task. Leave it open while the service runs; closing it may stop the runner and daemon. Background launch without that window is tracked in [#10991](https://github.com/zeroclaw-labs/zeroclaw/issues/10991).
 
 > **Server / multi-user installs.** Native Windows Service / LocalSystem support is on the roadmap but not yet implemented. For now, on a server box, install ZeroClaw under the account that the agent should run as; the scheduled-task path will start it on that user's login. If you need it to start before any user logs in, use **Task Scheduler → ZeroClaw Daemon → Properties → General → "Run whether user is logged on or not."**
 
@@ -220,8 +241,8 @@ zeroclaw service restart
 
 ### Scoop
 
-```
-scoop update zeroclaw       # subject to the staleness caveat above
+```cmd
+scoop update zeroclaw
 zeroclaw service restart
 ```
 

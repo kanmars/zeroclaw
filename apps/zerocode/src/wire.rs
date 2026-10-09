@@ -1,21 +1,20 @@
 //! Hand-maintained mirrors for every type that crosses the JSON-RPC
 //! wire between `zerocode` and the ZeroClaw daemon.
-//!
-//! These mirrors exist so `apps/zerocode/Cargo.toml` carries zero
-//! `zeroclaw-*` crate dependencies. The TUI talks JSON-RPC
-//! to whatever daemon is at the configured address; the wire shape is
-//! the contract, not a shared Rust type.
-//!
-//! Some mirrors here are unused by the running TUI today — they
-//! exist to lock the wire contract for every type the daemon emits
-//! so that adding a new use-site in the TUI doesn't have to re-derive
-//! the shape from scratch and risk drift.
-#![allow(dead_code)]
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+// ── Initialize shapes ───────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandDescriptor {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+}
 
 // ── Doctor result shapes ────────────────────────────────────────
 
@@ -48,6 +47,11 @@ pub struct DoctorSummary {
 pub struct DoctorRunResult {
     pub results: Vec<DoctorResultEntry>,
     pub summary: DoctorSummary,
+    /// Resolved active log persistence path from the daemon, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out_phase: Option<String>,
 }
 
 #[cfg(test)]
@@ -89,7 +93,34 @@ pub struct ModelProviderChoice {
 pub struct ChannelQuickStart {
     pub channel_type: String,
     pub alias: String,
-    pub token: Option<String>,
+    /// Schema-keyed fields from `quickstart/fields`. ZeroCode's initialize
+    /// handshake rejects daemon package-version mismatches before this wire
+    /// shape can be submitted.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub fields: HashMap<String, String>,
+}
+
+#[cfg(test)]
+mod quickstart_wire_tests {
+    use super::*;
+
+    #[test]
+    fn channel_quickstart_wire_shape_matches_runtime_contract() {
+        let channel = ChannelQuickStart {
+            channel_type: "telegram".into(),
+            alias: "ops".into(),
+            fields: HashMap::from([("bot_token".into(), "123:ABC".into())]),
+        };
+
+        assert_eq!(
+            serde_json::to_value(channel).expect("serialize channel"),
+            serde_json::json!({
+                "channel_type": "telegram",
+                "alias": "ops",
+                "fields": { "bot_token": "123:ABC" }
+            })
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -146,111 +177,6 @@ pub enum MemoryBackendKind {
     Qdrant,
     Markdown,
     Lucid,
-}
-
-// ── Quickstart state / step / surface ──────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub struct QuickstartState {
-    pub quickstart_completed: bool,
-    pub agents: Vec<String>,
-    pub risk_profiles: Vec<String>,
-    pub runtime_profiles: Vec<String>,
-    pub model_providers: Vec<String>,
-    pub channels: Vec<String>,
-    #[serde(default)]
-    pub unassigned_channels: Vec<String>,
-    pub storage: Vec<String>,
-    #[serde(default)]
-    pub model_provider_types: Vec<QuickstartTypeOption>,
-    #[serde(default)]
-    pub channel_types: Vec<QuickstartTypeOption>,
-    #[serde(default)]
-    pub risk_presets: Vec<QuickstartPresetMirror>,
-    #[serde(default)]
-    pub runtime_presets: Vec<QuickstartPresetMirror>,
-    #[serde(default)]
-    pub memory_kinds: Vec<String>,
-    #[serde(default)]
-    pub personality_files: Vec<String>,
-}
-
-/// Wire view of `zeroclaw_config::presets::RiskPreset` / `RuntimePreset`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct QuickstartPresetMirror {
-    pub preset_name: String,
-    pub label: String,
-    pub help: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub struct QuickstartTypeOption {
-    pub kind: String,
-    pub display_name: String,
-    #[serde(default)]
-    pub local: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Surface {
-    Web,
-    Tui,
-    Cli,
-    Test,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum QuickstartStep {
-    ModelProvider,
-    RiskProfile,
-    RuntimeProfile,
-    Memory,
-    Channels,
-    PeerGroups,
-    Agent,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub struct QuickstartError {
-    pub step: QuickstartStep,
-    pub field: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub struct AppliedAgent {
-    pub alias: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldSection {
-    ModelProvider,
-    Channel,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub struct FieldDescriptor {
-    pub key: String,
-    pub label: String,
-    #[serde(default)]
-    pub help: String,
-    pub kind: PropKind,
-    #[serde(default)]
-    pub is_secret: bool,
-    #[serde(default)]
-    pub enum_variants: Option<Vec<String>>,
-    #[serde(default)]
-    pub required: bool,
-    #[serde(default)]
-    pub default: Option<String>,
 }
 
 // ── Config explorer wire shapes ────────────────────────────────
@@ -432,35 +358,273 @@ pub struct FsEntry {
     pub mtime: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsListDirRequest {
-    pub path: String,
-    #[serde(default)]
-    pub show_hidden: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsStatResult {
-    pub name: String,
-    pub full_path: String,
-    pub is_dir: bool,
-    pub is_hidden: bool,
-    pub size: u64,
-    pub mtime: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FsStatError {
-    pub path: String,
-    pub code: String,
-    pub message: String,
-}
-
 // ── Misc passthrough shapes ────────────────────────────────────
 
-/// Opaque value envelope. Some RPC responses (logs subscription,
-/// raw JSON-RPC notifications) carry arbitrary payloads — the TUI
-/// just forwards them.
-pub type RawValue = Value;
+/// Params for an inbound `elicitation/create` request from the
+/// daemon. The TUI receives this, surfaces the form to the user,
+/// and responds through the JSON-RPC transport.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ElicitationRequestParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    pub message: String,
+    #[serde(rename = "requestedSchema")]
+    pub requested_schema: Value,
+}
+
+/// A single option as parsed from the `oneOf` / `anyOf` schema. The
+/// `const` field carries the wire id (`choice-<idx>`) and the
+/// `title` field carries the human-readable label.
+#[derive(Debug, Clone)]
+pub struct ElicitationChoice {
+    pub title: String,
+}
+
+/// Parsed shape of an inbound `requestedSchema` payload. Either
+/// single-select (`Single`) or multi-select (`Multi`). The TUI uses
+/// this to decide which modal to render. Unknown / malformed schemas
+/// fall through as `None`.
+#[derive(Debug, Clone)]
+pub enum ElicitationShape {
+    Single {
+        choices: Vec<ElicitationChoice>,
+    },
+    Multi {
+        choices: Vec<ElicitationChoice>,
+        min_items: usize,
+        max_items: usize,
+    },
+}
+
+impl ElicitationShape {
+    /// Best-effort decoder. The daemon always emits the
+    /// `single_select_schema` / `multi_select_schema` shape from
+    /// `zeroclaw-api`, so a return of `None` means a future schema
+    /// shape we don't yet render — the TUI auto-cancels in that case.
+    pub fn from_schema(schema: &Value) -> Option<Self> {
+        let properties = schema.get("properties")?.as_object()?;
+        let prop_schema = properties.values().next()?;
+
+        // Multi-select: `type: array` with `items.anyOf`.
+        if prop_schema.get("type").and_then(Value::as_str) == Some("array") {
+            let items = prop_schema.get("items")?;
+            let any_of = items.get("anyOf")?.as_array()?;
+            let choices = parse_choice_options(any_of);
+            let min_items = prop_schema
+                .get("minItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(1) as usize;
+            let max_items = prop_schema
+                .get("maxItems")
+                .and_then(Value::as_u64)
+                .unwrap_or(choices.len() as u64) as usize;
+            return Some(Self::Multi {
+                choices,
+                min_items,
+                max_items,
+            });
+        }
+
+        // Single-select: `type: string` with `oneOf`.
+        if prop_schema.get("type").and_then(Value::as_str) == Some("string") {
+            let one_of = prop_schema.get("oneOf")?.as_array()?;
+            let choices = parse_choice_options(one_of);
+            if choices.is_empty() {
+                return None;
+            }
+            return Some(Self::Single { choices });
+        }
+
+        None
+    }
+}
+
+fn parse_choice_options(items: &[Value]) -> Vec<ElicitationChoice> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let const_id = item.get("const")?.as_str()?.to_string();
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or(&const_id)
+                .to_string();
+            Some(ElicitationChoice { title })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod elicitation_wire_tests {
+    use super::*;
+
+    #[test]
+    fn request_params_round_trips_canonical_shape() {
+        let raw = serde_json::json!({
+            "sessionId": "sess-1",
+            "mode": "form",
+            "message": "Pick one",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "choice": {
+                        "type": "string",
+                        "oneOf": [
+                            { "const": "choice-0", "title": "Apple" },
+                            { "const": "choice-1", "title": "Banana" }
+                        ]
+                    }
+                },
+                "required": ["choice"]
+            }
+        });
+        let params: ElicitationRequestParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(params.session_id, "sess-1");
+        assert_eq!(params.message, "Pick one");
+    }
+
+    #[test]
+    fn shape_decodes_single_select() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "choice": {
+                    "type": "string",
+                    "oneOf": [
+                        { "const": "choice-0", "title": "Apple" },
+                        { "const": "choice-1", "title": "Banana" }
+                    ]
+                }
+            }
+        });
+        let shape = ElicitationShape::from_schema(&schema).expect("single");
+        match shape {
+            ElicitationShape::Single { choices } => {
+                assert_eq!(choices.len(), 2);
+                assert_eq!(choices[0].title, "Apple");
+                assert_eq!(choices[1].title, "Banana");
+            }
+            other => panic!("expected Single, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_decodes_multi_select() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "choices": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "items": {
+                        "anyOf": [
+                            { "const": "choice-0", "title": "Red" },
+                            { "const": "choice-1", "title": "Green" },
+                            { "const": "choice-2", "title": "Blue" }
+                        ]
+                    }
+                }
+            }
+        });
+        let shape = ElicitationShape::from_schema(&schema).expect("multi");
+        match shape {
+            ElicitationShape::Multi {
+                choices,
+                min_items,
+                max_items,
+            } => {
+                assert_eq!(choices.len(), 3);
+                assert_eq!(min_items, 1);
+                assert_eq!(max_items, 2);
+                assert_eq!(choices[2].title, "Blue");
+            }
+            other => panic!("expected Multi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shape_returns_none_on_unknown_schema() {
+        let schema = serde_json::json!({ "type": "object", "properties": {} });
+        assert!(ElicitationShape::from_schema(&schema).is_none());
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPriority {
+    High,
+    #[default]
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanEntry {
+    pub content: String,
+    #[serde(default)]
+    pub status: PlanStatus,
+    #[serde(default)]
+    pub priority: PlanPriority,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "activeForm"
+    )]
+    pub active_form: Option<String>,
+}
+
+// ── TodoWrite plan wire tests ──────────────────────────────
+
+#[cfg(test)]
+mod plan_wire_tests {
+    use super::*;
+
+    #[test]
+    fn plan_entry_deserializes_daemon_shape() {
+        let raw = serde_json::json!({
+            "content": "Analyze codebase",
+            "status": "in_progress",
+            "priority": "high",
+            "activeForm": "Analyzing codebase"
+        });
+        let entry: PlanEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(entry.content, "Analyze codebase");
+        assert_eq!(entry.status, PlanStatus::InProgress);
+        assert_eq!(entry.priority, PlanPriority::High);
+        assert_eq!(entry.active_form.as_deref(), Some("Analyzing codebase"));
+    }
+
+    #[test]
+    fn plan_entry_defaults_missing_optionals() {
+        let raw = serde_json::json!({ "content": "x", "status": "pending" });
+        let entry: PlanEntry = serde_json::from_value(raw).unwrap();
+        assert_eq!(entry.priority, PlanPriority::Medium);
+        assert_eq!(entry.active_form, None);
+    }
+
+    #[test]
+    fn plan_entry_round_trips() {
+        let entry = PlanEntry {
+            content: "y".to_string(),
+            status: PlanStatus::Completed,
+            priority: PlanPriority::Low,
+            active_form: None,
+        };
+        let v = serde_json::to_value(&entry).unwrap();
+        assert_eq!(v["status"], "completed");
+        assert_eq!(v["priority"], "low");
+        assert!(v.get("activeForm").is_none());
+        let back: PlanEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back, entry);
+    }
+}

@@ -1,30 +1,16 @@
 //! Cross-agent path-walk variant for Markdown-backed agents.
-//!
-//! The generic [`AgentScopedMemory`](crate::agent_scoped::AgentScopedMemory)
-//! relies on the inner backend filtering rows by `agent_id` at the
-//! storage layer. Markdown has no shared store: each agent's
-//! attribution IS its on-disk path
-//! (`<install>/agents/<alias>/workspace/MEMORY.md` plus
-//! `memory/YYYY-MM-DD.md`). Cross-agent recall therefore composes
-//! multiple `MarkdownMemory` instances rather than filtering rows.
-//!
-//! `AgentScopedMarkdownMemory` holds the bound agent's
-//! `MarkdownMemory` plus a peer set of `(alias, MarkdownMemory)` pairs
-//! resolved at construction from the `read_memory_from` allowlist.
-//! Stores go to the bound agent only; recalls union across all peers
-//! and stamp each merged entry's `key` with a `[<alias>] ` prefix so
-//! callers can attribute the row.
 
-use super::markdown::MarkdownMemory;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashSet;
+use std::sync::Arc;
 
-/// Resolved Markdown-backed peer entry: the sibling agent's alias plus
-/// a `MarkdownMemory` pointed at that sibling's workspace dir.
 pub struct MarkdownPeer {
     pub alias: String,
-    pub memory: MarkdownMemory,
+    pub memory: Arc<dyn Memory>,
+    /// `None` exposes every category; `Some` exposes exact category names.
+    pub allowed_categories: Option<HashSet<String>>,
 }
 
 /// Composed Markdown memory for one agent: own backend plus the
@@ -36,7 +22,7 @@ pub struct AgentScopedMarkdownMemory {
     own_alias: String,
     /// The bound agent's MarkdownMemory pointing at
     /// `<install>/agents/<own_alias>/workspace/`.
-    own: MarkdownMemory,
+    own: Arc<dyn Memory>,
     /// Resolved sibling agents this wrapper recalls from. Empty means
     /// jailed — the agent only sees its own rows. Same-backend
     /// invariant: every peer here is also Markdown-backed (the
@@ -48,7 +34,7 @@ pub struct AgentScopedMarkdownMemory {
 impl AgentScopedMarkdownMemory {
     pub fn new(
         own_alias: impl Into<String>,
-        own: MarkdownMemory,
+        own: Arc<dyn Memory>,
         peers: Vec<MarkdownPeer>,
     ) -> Self {
         Self {
@@ -58,11 +44,6 @@ impl AgentScopedMarkdownMemory {
         }
     }
 
-    /// Stamp `[<alias>] ` onto each entry's `key` so a merged recall
-    /// makes attribution visible in logs / prompts that surface the key
-    /// verbatim, and populate `agent_alias` + `agent_id` so the
-    /// dashboard renders Markdown rows with the same per-agent chip
-    /// the SQL backends emit via JOIN.
     fn attribute(alias: &str, mut entries: Vec<MemoryEntry>) -> Vec<MemoryEntry> {
         for entry in &mut entries {
             entry.key = format!("[{alias}] {}", entry.key);
@@ -83,6 +64,50 @@ impl AgentScopedMarkdownMemory {
         }
         entries
     }
+
+    fn filter_peer_entries(
+        categories: Option<&HashSet<String>>,
+        entries: Vec<MemoryEntry>,
+    ) -> Vec<MemoryEntry> {
+        entries
+            .into_iter()
+            .filter(|entry| {
+                categories.is_none_or(|allowed| allowed.contains(&entry.category.to_string()))
+            })
+            .collect()
+    }
+
+    async fn recall_peer_with_category_refill(
+        peer: &MarkdownPeer,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let rows = peer
+                .memory
+                .recall(query, fetch_limit, session_id, since, until)
+                .await?;
+            let backend_may_have_more = rows.len() >= fetch_limit;
+            let filtered = Self::filter_peer_entries(peer.allowed_categories.as_ref(), rows);
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+            fetch_limit = next_fetch_limit;
+        }
+    }
 }
 
 #[async_trait]
@@ -94,11 +119,6 @@ impl Memory for AgentScopedMarkdownMemory {
     }
 
     async fn health_check(&self) -> bool {
-        // The bound agent's own MarkdownMemory is the canonical health
-        // signal; peer-dir failures are logged at recall time, not
-        // surfaced as a failed health check (a missing peer dir means
-        // the operator has not yet created that sibling agent — the
-        // current agent is still healthy).
         self.own.health_check().await
     }
 
@@ -159,10 +179,10 @@ impl Memory for AgentScopedMarkdownMemory {
                 .await?,
         );
         for peer in &self.peers {
-            match peer
-                .memory
-                .recall(query, limit, session_id, since, until)
-                .await
+            match Self::recall_peer_with_category_refill(
+                peer, query, limit, session_id, since, until,
+            )
+            .await
             {
                 Ok(rows) => merged.extend(Self::attribute(&peer.alias, rows)),
                 Err(error) => ::zeroclaw_log::record!(
@@ -212,10 +232,10 @@ impl Memory for AgentScopedMarkdownMemory {
             if !allowed_agent_ids.contains(&peer.alias.as_str()) {
                 continue;
             }
-            match peer
-                .memory
-                .recall(query, limit, session_id, since, until)
-                .await
+            match Self::recall_peer_with_category_refill(
+                peer, query, limit, session_id, since, until,
+            )
+            .await
             {
                 Ok(rows) => merged.extend(Self::attribute(&peer.alias, rows)),
                 Err(error) => ::zeroclaw_log::record!(
@@ -277,6 +297,7 @@ impl ::zeroclaw_api::attribution::Attributable for AgentScopedMarkdownMemory {
 
 #[cfg(test)]
 mod tests {
+    use super::super::markdown::MarkdownMemory;
     use super::*;
     use tempfile::TempDir;
 
@@ -288,16 +309,135 @@ mod tests {
         (tmp, mem)
     }
 
+    struct NamespacedTestMemory {
+        entries: Vec<MemoryEntry>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NamespacedTestMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "namespaced-test"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for NamespacedTestMemory {
+        fn name(&self) -> &str {
+            "namespaced-test"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            Ok(self.entries.iter().take(limit).cloned().collect())
+        }
+
+        async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
+            Ok(self.entries.iter().find(|entry| entry.key == key).cloned())
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            Ok(self.entries.clone())
+        }
+
+        async fn forget(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+
+    fn namespaced_entry(key: &str, namespace: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: key.into(),
+            key: key.into(),
+            content: "needle".into(),
+            category: MemoryCategory::Custom("family".into()),
+            timestamp: "2026-08-24T00:00:00Z".into(),
+            session_id: None,
+            score: Some(1.0),
+            namespace: namespace.into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            principal_id: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn store_writes_only_to_own_backend() {
         let (_tmp_a, own) = make_md("alpha-ws");
         let (_tmp_b, peer_mem) = make_md("beta-ws");
         let scoped = AgentScopedMarkdownMemory::new(
             "alpha",
-            own,
+            Arc::new(own),
             vec![MarkdownPeer {
                 alias: "beta".into(),
-                memory: peer_mem,
+                memory: Arc::new(peer_mem),
+                allowed_categories: None,
             }],
         );
 
@@ -333,10 +473,11 @@ mod tests {
 
         let scoped = AgentScopedMarkdownMemory::new(
             "alpha",
-            own,
+            Arc::new(own),
             vec![MarkdownPeer {
                 alias: "beta".into(),
-                memory: peer_mem,
+                memory: Arc::new(peer_mem),
+                allowed_categories: None,
             }],
         );
 
@@ -360,6 +501,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_filters_peer_rows_to_exact_grant_categories() {
+        let (_tmp_a, own) = make_md("alpha-ws");
+        let (_tmp_b, peer_mem) = make_md("beta-ws");
+        peer_mem
+            .store("allowed", "beta core", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        peer_mem
+            .store("blocked", "beta daily", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let scoped = AgentScopedMarkdownMemory::new(
+            "alpha",
+            Arc::new(own),
+            vec![MarkdownPeer {
+                alias: "beta".into(),
+                memory: Arc::new(peer_mem),
+                allowed_categories: Some(["core".to_string()].into_iter().collect()),
+            }],
+        );
+
+        let allowed = scoped.recall("core", 10, None, None, None).await.unwrap();
+        assert!(
+            allowed
+                .iter()
+                .any(|entry| entry.content.contains("beta core"))
+        );
+
+        let blocked = scoped.recall("daily", 10, None, None, None).await.unwrap();
+        assert!(
+            !blocked
+                .iter()
+                .any(|entry| entry.content.contains("beta daily"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_refills_peer_rows_after_denied_matches_consume_limit() {
+        let (_tmp_a, own) = make_md("alpha-ws");
+        let (_tmp_b, peer_mem) = make_md("beta-ws");
+
+        for idx in 0..12 {
+            peer_mem
+                .store(
+                    &format!("denied-{idx}"),
+                    "needle denied row",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        peer_mem
+            .store("allowed", "needle allowed row", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let scoped = AgentScopedMarkdownMemory::new(
+            "alpha",
+            Arc::new(own),
+            vec![MarkdownPeer {
+                alias: "beta".into(),
+                memory: Arc::new(peer_mem),
+                allowed_categories: Some(["daily".to_string()].into_iter().collect()),
+            }],
+        );
+
+        let results = scoped.recall("needle", 1, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("needle allowed row"));
+    }
+
+    #[tokio::test]
+    async fn namespaced_recall_refills_markdown_peer_rows() {
+        let own = NamespacedTestMemory {
+            entries: Vec::new(),
+        };
+        let peer = NamespacedTestMemory {
+            entries: vec![
+                namespaced_entry("peer-other", "other"),
+                namespaced_entry("peer-wanted", "wanted"),
+            ],
+        };
+        let scoped = AgentScopedMarkdownMemory::new(
+            "alpha",
+            Arc::new(own),
+            vec![MarkdownPeer {
+                alias: "beta".into(),
+                memory: Arc::new(peer),
+                allowed_categories: None,
+            }],
+        );
+
+        for query in ["needle", "*"] {
+            let results = scoped
+                .recall_namespaced("wanted", query, 1, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1, "query={query}");
+            assert_eq!(results[0].key, "[beta] peer-wanted", "query={query}");
+        }
+    }
+
+    #[tokio::test]
     async fn recall_for_agents_filters_to_alias_intersection() {
         let (_tmp_a, own) = make_md("alpha-ws");
         let (_tmp_b, peer_mem) = make_md("beta-ws");
@@ -371,10 +617,11 @@ mod tests {
 
         let scoped = AgentScopedMarkdownMemory::new(
             "alpha",
-            own,
+            Arc::new(own),
             vec![MarkdownPeer {
                 alias: "beta".into(),
-                memory: peer_mem,
+                memory: Arc::new(peer_mem),
+                allowed_categories: None,
             }],
         );
 
@@ -410,7 +657,7 @@ mod tests {
     #[tokio::test]
     async fn list_and_get_stamp_agent_alias_for_dashboard_parity() {
         let (_tmp, own) = make_md("alpha-ws");
-        let scoped = AgentScopedMarkdownMemory::new("alpha", own, vec![]);
+        let scoped = AgentScopedMarkdownMemory::new("alpha", Arc::new(own), vec![]);
 
         scoped
             .store("note", "preferences", MemoryCategory::Core, None)
@@ -455,10 +702,11 @@ mod tests {
             .unwrap();
         let scoped = AgentScopedMarkdownMemory::new(
             "alpha",
-            own,
+            Arc::new(own),
             vec![MarkdownPeer {
                 alias: "beta".into(),
-                memory: peer_mem,
+                memory: Arc::new(peer_mem),
+                allowed_categories: None,
             }],
         );
         scoped

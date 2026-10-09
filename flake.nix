@@ -11,6 +11,10 @@
   outputs = { flake-utils, fenix, nixpkgs, ... }:
     let
       nixosModule = { pkgs, ... }: {
+        # These evaluation-only hosts have no physical root disk or bootloader.
+        boot.loader.grub.enable = false;
+        fileSystems."/" = { device = "none"; fsType = "tmpfs"; };
+        system.stateVersion = "26.05";
         nixpkgs.overlays = [ fenix.overlays.default ];
         environment.systemPackages = [
           (pkgs.fenix.stable.withComponents [
@@ -41,29 +45,42 @@
           inherit nixpkgs system;
         };
         # >>> generated:flake-packages by `cargo generate installers` - do not edit <<<
-        # Default feature set: canonical Dist (all channels, no heavyweight).
-        # Override with `packages.zeroclaw.override { features = [ ... ]; }`.
-        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-amqp" "channel-bluesky" "channel-clawdtalk" "channel-dingtalk" "channel-discord" "channel-email" "channel-imessage" "channel-irc" "channel-lark" "channel-linq" "channel-mattermost" "channel-mochat" "channel-mqtt" "channel-nextcloud" "channel-notion" "channel-qq" "channel-reddit" "channel-signal" "channel-slack" "channel-telegram" "channel-twitch" "channel-twitter" "channel-voice-call" "channel-wati" "channel-webhook" "channel-wecom" "channel-wecom-ws" "channel-whatsapp-cloud" "gateway" "observability-prometheus" "schema-export" ];
-        buildZeroclaw = { pname, cargoPkg, features ? zeroclawDefaultFeatures }:
+        # Default feature sets: zeroclaw uses canonical lean Dist,
+        # zerocode uses its own package features (currently empty).
+        # Override per-package, e.g. `packages.zeroclaw.override { features = [ ... ]; }`.
+        zeroclawDefaultFeatures = [ "acp-bridge" "agent-runtime" "channel-acp-server" "channel-discord" "channel-email" "channel-filesystem" "channel-git" "channel-lark" "channel-matrix" "channel-telegram" "channel-webhook" "gateway" "observability-prometheus" "schema-export" "whatsapp-web" ];
+        zerocodeDefaultFeatures = [  ];
+        buildZeroclaw = { pname, cargoPkg, features }:
           (pkgs.makeRustPlatform {
             cargo = rustToolchain;
             rustc = rustToolchain;
           }).buildRustPackage {
             inherit pname;
-            version = "0.8.1";
+            version = "0.8.5";
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              outputHashes = builtins.fromJSON (builtins.readFile ./nix/hashes.json);
+            };
             cargoBuildFlags =
               [ "-p" cargoPkg "--no-default-features" ]
               ++ pkgs.lib.optionals (features != [])
                 [ "--features" (pkgs.lib.concatStringsSep "," features) ];
             doCheck = false;
+            buildInputs = [ pkgs.stdenv.cc.cc ];
+            meta = { mainProgram = pname; };
           };
         # >>> end generated:flake-packages <<<
+        webPkgs = pkgs.callPackage ./nix/web.nix { inherit rustToolchain; };
       in {
-        packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclawlabs"; };
-        packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; };
-        packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclawlabs"; };
+        packages.zeroclaw = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
+        packages.zerocode = buildZeroclaw { pname = "zerocode"; cargoPkg = "zerocode"; features = zerocodeDefaultFeatures; };
+        packages.default = buildZeroclaw { pname = "zeroclaw"; cargoPkg = "zeroclaw"; features = zeroclawDefaultFeatures; };
+        # Web dashboard bundle (see nix/web.nix). Kept outside the
+        # `generated:flake-packages` block so `cargo generate installers`
+        # does not clobber it.
+        packages.zeroclaw-web = webPkgs.zeroclawWeb;
+        packages.zeroclaw-openapi-spec = webPkgs.openapiSpec;
         checks = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nixos-module-eval = pkgs.writeText "zeroclaw-nixos-module-eval" (
             builtins.toJSON nixosModuleEvalTests
@@ -73,6 +90,8 @@
           packages = [
             rustToolchain
             pkgs.rust-analyzer
+            pkgs.nix-prefetch-git
+            pkgs.jq
           ];
         };
       }) // {

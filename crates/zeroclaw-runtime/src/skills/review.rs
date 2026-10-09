@@ -1,13 +1,3 @@
-// Background skill review fork — post-turn hook that wakes a forked agent
-// loop in a restricted toolset to decide whether the just-finished
-// conversation should change the installed skill library.
-//
-// Inspired by hermes-agent's `_spawn_background_review` pattern (see
-// nousresearch/hermes-agent at run_agent.py). ZeroClaw differs in that the
-// fork runs inline (no background thread — Rust async lets us await it on
-// the same task), targets the agentskills.io `SKILL.md` format directly,
-// and writes through dedicated `skill_manage`/`skill_view` tools.
-
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -29,19 +19,12 @@ task_local! {
     static SKILL_REVIEW_ACTIVE: ();
 }
 
-/// Decide whether to fire the review fork, and run it if so.
-///
-/// Gating (in this order):
-/// 1. `config.enabled == true`
-/// 2. Not already inside a review (recursion guard)
-/// 3. History accumulated at least `nudge_interval_iterations` tool-result messages
-///
-/// The "failed_slugs" list is passed as a *hint* in the review prompt so the
-/// fork can spend its budget where the user just got hurt — but failure is NOT
-/// the trigger condition. Routine improvements (user corrections, novel
-/// techniques) happen on successful sessions too.
 #[allow(clippy::too_many_arguments)]
 pub async fn maybe_run_skill_review(
+    // Full config, for resolving the configured `vision_model_provider`'s
+    // alias-specific options on the review fork's vision route. `None` on
+    // configless (test) paths; the production caller (`run`) threads `Some`.
+    full_config: Option<&zeroclaw_config::schema::Config>,
     workspace_dir: PathBuf,
     config: SkillImprovementConfig,
     allow_scripts: bool,
@@ -54,8 +37,9 @@ pub async fn maybe_run_skill_review(
     multimodal: &MultimodalConfig,
     pacing: &PacingConfig,
     max_tool_result_chars: usize,
-    max_context_tokens: usize,
+    context_token_budget: usize,
     cancellation_token: Option<&CancellationToken>,
+    agent_alias: Option<&str>,
 ) {
     if !config.enabled {
         return;
@@ -82,24 +66,69 @@ pub async fn maybe_run_skill_review(
         return;
     }
 
-    let tools: Vec<Box<dyn Tool>> =
-        build_review_tools(workspace_dir.clone(), config.clone(), allow_scripts);
+    let review_tools = build_review_tools(workspace_dir.clone(), config.clone(), allow_scripts);
+    // Seal the fixed 3-tool review harness through the one assembly seam so the
+    // engine receives a `ScopedToolRegistry` like every other turn path. The
+    // policy is `SecurityPolicy::default()` (no allow/deny lists), which makes
+    // `assemble`'s built-in filter a provable identity over the harness tools -
+    // the review sub-turn still sees exactly those 3 tools (`skills_list`,
+    // `skill_view`, `skill_manage`), reproducing today's unfiltered behavior. A
+    // real agent policy (`for_agent`) is deliberately NOT used: it could drop a
+    // skill tool and would only be probably-neutral. Every assembly divergence
+    // is off (no peripherals, no MCP, no skills, no memory strip), so `config` /
+    // `agent_alias` are never read beyond satisfying the signature.
+    let review_default_config = zeroclaw_config::schema::Config::default();
+    let review_config_ref = full_config.unwrap_or(&review_default_config);
+    let review_alias = agent_alias.unwrap_or("default");
+    let review_security = Arc::new(zeroclaw_config::policy::SecurityPolicy::default());
+    let assembled_review =
+        crate::tools::scoped::ScopedToolRegistry::assemble(crate::tools::scoped::ScopedAssembly {
+            config: review_config_ref,
+            agent_alias: review_alias,
+            security: &review_security,
+            built: crate::tools::AllToolsResult::from_prebuilt_tools(review_tools),
+            skills: &[],
+            runtime: Arc::new(crate::platform::NativeRuntime::new()),
+            caller_allowed: None,
+            connect_mcp: false,
+            connect_peripherals: false,
+            exclude_memory: false,
+            acp_delivery: false,
+            list_deferred_mcp_specs: false,
+            emit_assembly_logs: false,
+            mcp_registry: None,
+        })
+        .await;
+    let tools = assembled_review.registry;
     let review_input = build_review_input(&failed_slugs);
 
     let mut review_history = history;
-    let fork_start_len = review_history.len();
     review_history.push(ChatMessage::user(&review_input));
 
     let receipts: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    // The review fork owns a fresh transcript: no prior trim ran, so no
+    // crumb exists and none can outlive this scoped loop.
+    let mut fork_crumb_present = false;
+
+    // The tool loop can compact/trim `review_history` in place (hard-cap and
+    // reported-budget trimming both shrink the history vec during the loop).
+    // A slice taken from a pre-loop length would then be out of range, so we
+    // capture the fork's appended messages into a separate, append-only vec
+    // instead of slicing `review_history` after the fact.
+    let mut fork_messages: Vec<ChatMessage> = Vec::new();
 
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                served_route_sink: None,
+                sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {
                         model_provider: provider,
                         provider_name,
                         model: model_name,
+                        dispatch_model: model_name,
                         temperature: Some(0.3),
                     },
                     crate::agent::loop_::ResolvedIo {
@@ -109,10 +138,18 @@ pub async fn maybe_run_skill_review(
                         silent: true,
                         approval: None,
                         multimodal_config: multimodal,
+                        config: full_config,
                         hooks: None,
                         activated_tools: None,
                         model_switch_callback: None,
                         receipt_generator: None,
+                        // `None` on purpose: the review loop's latest user
+                        // message is the runtime-synthesized review prompt,
+                        // never a user-authored marker, so the gate takes no
+                        // branch here and any marker-shaped tool-result echo
+                        // fails closed to the placeholder degrade instead of
+                        // probing the filesystem.
+                        security: None,
                     },
                     crate::agent::loop_::ResolvedRuntimeKnobs {
                         max_tool_iterations: config.max_review_iterations as usize,
@@ -124,11 +161,29 @@ pub async fn maybe_run_skill_review(
                         parallel_tools: false,
                         // sequential for the mutation-capable fork
                         max_tool_result_chars,
-                        context_token_budget: max_context_tokens,
+                        context_limits: full_config.zip(agent_alias).map_or_else(
+                            || {
+                                zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                                    context_token_budget,
+                                )
+                            },
+                            |(config, alias)| {
+                                config.resolved_context_limits_for_route(
+                                    alias,
+                                    provider_name,
+                                    model_name,
+                                )
+                            },
+                        ),
+                        context_limits_resolver: None,
                         knobs: &crate::agent::loop_::LoopKnobs::default(),
                     },
                 ),
                 history: &mut review_history,
+                // The review fork owns a fresh transcript: no prior trim ran,
+                // so no crumb exists and none can outlive this scoped loop.
+                history_has_trim_breadcrumb: &mut fork_crumb_present,
+                injected_memory_preamble: &mut None,
                 // no human in the loop here
                 channel_name: "skill_review",
                 channel_reply_target: None,
@@ -139,11 +194,15 @@ pub async fn maybe_run_skill_review(
                 collected_receipts: Some(&receipts),
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+                new_messages_out: Some(&mut fork_messages),
                 image_cache: None,
-                // Phase 1: stamp Internal/Trusted. Real per-transport
-                // stamping is PR C (RFC #6971 §4).
-                ingress: zeroclaw_api::ingress::IngressContext::internal(),
+                // Phase 1: stamp Internal/Trusted. Per-transport
+                // stamping lands in a later phase.
+                memory: None,
+                ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
+                agent_alias,
+                parent_agent_alias: None,
+                turn_id: &turn_id,
             })
             .await
         })
@@ -151,8 +210,7 @@ pub async fn maybe_run_skill_review(
 
     match result {
         Ok(final_text) => {
-            let summary =
-                summarize_actions(&receipts, &review_history[fork_start_len..], &final_text);
+            let summary = summarize_actions(&receipts, &fork_messages, &final_text);
             if !summary.is_empty() {
                 println!(
                     "{}",
@@ -214,12 +272,6 @@ fn count_tool_iterations(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| m.role == "tool").count()
 }
 
-/// Convert the review's tool receipts + final text into a one-line summary
-/// for the user. Returns "" if the fork did nothing notable.
-///
-/// `fork_history` must contain only messages produced by the review fork
-/// itself (not the parent turn), so that the fallback scan does not pick up
-/// tool results from the user's main turn.
 fn summarize_actions(
     receipts: &Mutex<Vec<String>>,
     fork_history: &[ChatMessage],
