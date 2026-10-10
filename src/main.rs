@@ -954,8 +954,6 @@ mod skills;
 #[cfg(feature = "agent-runtime")]
 mod sop;
 #[cfg(feature = "agent-runtime")]
-mod time_display;
-#[cfg(feature = "agent-runtime")]
 mod tools;
 #[cfg(feature = "agent-runtime")]
 mod trust;

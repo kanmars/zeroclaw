@@ -78,7 +78,6 @@ ZeroClaw v0.8.5 is a security, connectivity, and operator-experience release spa
 
 - Config get/set accepts snake_case field names (#6837 schema family); `max_image_turns` added to `MultimodalConfig`; lean default channel bundle (#6904).
 - Registry-driven installer: `--apps` flag, a sectioned interactive picker that shows all features with defaults pre-checked, and apps discovered from `apps/*/`.
-- **Providers/Agents — `max_context_window` inheritance (kanmars fork)**: New `max_context_window: Option<usize>` field on `ModelProviderConfig` documents the model's context capacity in tokens. `agent.max_context_tokens` is now `Option<usize>` (was `usize` defaulting to 32000) — when unset it inherits from the resolved model's `max_context_window`, falling back to `DEFAULT_MAX_CONTEXT_TOKENS` (32K). Explicit values continue to take precedence. Fixes silent 32K cap that caused unnecessary context_compression cycles on long-context models (DeepSeek-V4 1M, Claude 200K, GPT-4o 128K). Backward compatible — configs not touching either field continue to get 32K.
 - **CLI — build-time metadata in `--version` and `--help` (kanmars fork)**: `zeroclaw --version` shows build time, git commit, and rustc version (sourced from `build.rs` env vars `ZEROCLAW_BUILD_TIME`, `ZEROCLAW_GIT_COMMIT`, `ZEROCLAW_RUSTC_VERSION`). Subcommand `--help` `about` line appends `(built <time>)` for traceability.
 
 ## Bug Fixes

@@ -874,14 +874,6 @@ pub enum AuthMode {
     OAuth,
 }
 
-/// Fallback `max_context_tokens` budget when neither the agent nor its resolved
-/// model provides an explicit value. Conservative 32K matches the historical
-/// default of `AliasedAgentConfig::max_context_tokens` before this field became
-/// optional. Operators wanting to take advantage of long-context models should
-/// set `max_context_window` on the model provider (preferred) or
-/// `max_context_tokens` on the agent.
-pub const DEFAULT_MAX_CONTEXT_TOKENS: usize = 32_000;
-
 /// Prompt-cache entry lifetime to request for this provider's Anthropic
 /// cache markers. `"5m"` is the API default; `"1h"` extends the cache
 /// entry lifetime to one hour so a pause longer than five minutes does
@@ -981,24 +973,6 @@ pub struct ModelProviderConfig {
     #[tab(Model)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// Maximum context window of this model in tokens, as documented by the provider.
-    /// Used as the default for `agent.max_context_tokens` when the agent does not
-    /// override. `None` (default) means ZeroClaw has no model-side hint, falls back
-    /// to `DEFAULT_MAX_CONTEXT_TOKENS` (32K) unless the agent overrides.
-    ///
-    /// This is the model's INPUT capacity (history + system prompt + user message),
-    /// distinct from `max_tokens` above which is the OUTPUT generation cap.
-    ///
-    /// Common values (operator must check provider docs):
-    ///   - DeepSeek-V4-Pro / V4-Flash: 1_000_000
-    ///   - Claude 3.5/4 Sonnet / Opus: 200_000
-    ///   - GPT-4o / GPT-4-Turbo: 128_000
-    ///   - Qwen3.6 series (dashscope coding plan): 1_000_000
-    ///   - Kimi-K2.5 / K2.6: 262_144
-    ///   - Moonshot-Kimi-K2-Instruct: 131_072
-    #[tab(Model)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_context_window: Option<usize>,
     /// ModelProvider-specific quirk: fold the system prompt into the first user message instead of sending a separate system role. Only needed for models that reject (or mishandle) a standalone system role, e.g. certain older Mistral variants.
     #[tab(Advanced)]
     #[serde(default, skip_serializing_if = "is_false")]
@@ -4423,7 +4397,6 @@ impl AliasedAgentConfig {
             && !self.risk_profile.trim().is_empty()
             && !self.runtime_profile.trim().is_empty()
     }
-
 }
 
 /// One `[channels.<type>.<alias>]` block, with the owning agent (if any)
