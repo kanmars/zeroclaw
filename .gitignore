@@ -127,3 +127,7 @@ target/openapi.json
 /v[0-9]*.toml
 .worktrees/
 .zero-to-5/
+
+# Agent workflow artifacts (Sisyphus/OMO plans, notepads, session state)
+.omo/
+.sisyphus/
